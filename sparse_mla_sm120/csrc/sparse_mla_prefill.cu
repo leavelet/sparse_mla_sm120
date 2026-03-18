@@ -29,10 +29,10 @@ static constexpr int ACC_TILES = N_V_CHUNKS * NT_PER_WARP_XV;
 // KV entry in smem: nope FP8 (512B) + scales F32 (16B) = 528B (no rope)
 static constexpr int KV_SMEM_STRIDE = D_NOPE + NUM_SCALES * sizeof(float);  // 528
 
-// Q nope stride: 512/4=128, 128%32=0 → all rows hit same bank! Pad to 528.
-static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;  // 528 (16B padding per row)
-// V transpose stride: BI=64, 64/4=16, need padding too
-static constexpr int V_TRANS_STRIDE = BI + 4;  // 68 (4B padding per row)
+// Padded strides to avoid smem bank conflicts (need stride/4 coprime with 32)
+static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;  // 528: 132%32=4 ✓
+static constexpr int V_TRANS_STRIDE = BI + 4;       // 68:  17%32=17 ✓
+static constexpr int W_FP8_STRIDE = BI + 4;         // 68:  17%32=17 ✓ (was 64: 16%32=16 → 2-way conflict)
 
 __device__ __forceinline__ void bar_arrive(int id, int cnt) {
     asm volatile("barrier.cta.arrive %0, %1;\n" :: "r"(id), "r"(cnt) : "memory");
@@ -93,7 +93,7 @@ sparse_mla_prefill_mma_kernel(
     float*   reduce_buf = (float*)sp;    sp += N_MATH_WARPS * HPB * 4;
     float*   m_smem     = (float*)sp;    sp += HPB * 4;
     float*   l_smem     = (float*)sp;    sp += HPB * 4;
-    uint8_t* w_fp8      = (uint8_t*)sp;  sp += HPB * BI;
+    uint8_t* w_fp8      = (uint8_t*)sp;  sp += HPB * W_FP8_STRIDE;
     float*   w_head_sc  = (float*)sp;    sp += HPB * 4;
     uint8_t* v_trans    = (uint8_t*)sp;  sp += V_CHUNK * V_TRANS_STRIDE;
     uint8_t* kv_bufs[2] = {kv_buf0, kv_buf1};
@@ -283,8 +283,8 @@ sparse_mla_prefill_mma_kernel(
                  __nv_fp8_e4m3 f01(fmaxf(-FP8_MAX,fminf(FP8_MAX,ws01*si0)));
                  __nv_fp8_e4m3 f10(fmaxf(-FP8_MAX,fminf(FP8_MAX,ws10*si1)));
                  __nv_fp8_e4m3 f11(fmaxf(-FP8_MAX,fminf(FP8_MAX,ws11*si1)));
-                 w_fp8[gid*BI+e0i]=f00.__x;w_fp8[gid*BI+e1i]=f01.__x;
-                 w_fp8[(gid+8)*BI+e0i]=f10.__x;w_fp8[(gid+8)*BI+e1i]=f11.__x;}
+                 w_fp8[gid*W_FP8_STRIDE+e0i]=f00.__x;w_fp8[gid*W_FP8_STRIDE+e1i]=f01.__x;
+                 w_fp8[(gid+8)*W_FP8_STRIDE+e0i]=f10.__x;w_fp8[(gid+8)*W_FP8_STRIDE+e1i]=f11.__x;}
                 // V transpose from smem (stride=528, nope part only)
                 for(int idx=threadIdx.x;idx<V_CHUNK*BI;idx+=MATH_THREADS){
                     int d=idx/BI,e=idx%BI;
@@ -297,7 +297,7 @@ sparse_mla_prefill_mma_kernel(
                     #pragma unroll
                     for(int kstep=0;kstep<BI/32;kstep++){
                         int ko=kstep*32; uint32_t a0,a1,a2,a3,b0,b1;
-                        load_A_fp8(a0,a1,a2,a3,w_fp8,BI,ko,lane);
+                        load_A_fp8(a0,a1,a2,a3,w_fp8,W_FP8_STRIDE,ko,lane);
                         load_B_fp8(b0,b1,v_trans,V_TRANS_STRIDE,nl,ko,lane);
                         MmaFp8Result r=mma_fp8_m16n8k32(a0,a1,a2,a3,b0,b1,xv[0],xv[1],xv[2],xv[3]);
                         xv[0]=r.d0;xv[1]=r.d1;xv[2]=r.d2;xv[3]=r.d3;}
@@ -340,7 +340,7 @@ void sparse_mla_prefill_launch(
     size_t smem_bytes = HPB*Q_NOPE_STRIDE + HPB*NUM_SCALES*4 + HPB*D_ROPE*2
                       + 2*BI*KV_SMEM_STRIDE
                       + N_MATH_WARPS*HPB*4 + HPB*4 + HPB*4
-                      + HPB*BI + HPB*4 + V_CHUNK*V_TRANS_STRIDE;
+                      + HPB*W_FP8_STRIDE + HPB*4 + V_CHUNK*V_TRANS_STRIDE;
 
     dim3 grid(num_tokens * REPLICATE_H);
     dim3 block(BLOCK_THREADS);
