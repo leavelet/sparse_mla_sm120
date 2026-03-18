@@ -47,11 +47,20 @@ static constexpr int TOTAL_KV_CHUNKS = BI * CHUNKS_PER_KV_ENTRY;          // 211
 // ── KV cache layout ─────────────────────────────────────────────────────
 static constexpr int KV_ROPE_BYTE_OFFSET = D_NOPE + NUM_SCALES * sizeof(float); // 528
 
+// ── Output staging (reuses kv_bufs after main loop for coalesced global writes) ──
+// Padded stride: D_NOPE=512 bf16 → stride/4=256, 256%32=0 → 32-way conflict!
+// Pad to 520: stride_bytes=1040, 1040/4=260, 260%32=4 → 4-way. 16B-aligned (1040%16=0).
+static constexpr int OUT_STAGING_STRIDE = D_NOPE + 8;    // 520 bf16 elements
+static constexpr int OUT_VEC = 8;                          // bf16 per uint4 store
+static constexpr int OUT_TILES_PER_HEAD = D_NOPE / OUT_VEC; // 64
+static constexpr size_t OUT_STAGING_BYTES = HPB * OUT_STAGING_STRIDE * sizeof(bf16); // 16640
+
 // ── Smem layout: constexpr offsets from base ────────────────────────────
 static constexpr size_t SMEM_Q_NOPE     = HPB * Q_NOPE_STRIDE;
 static constexpr size_t SMEM_Q_SC       = HPB * NUM_SCALES * sizeof(float);
 static constexpr size_t SMEM_Q_ROPE     = HPB * D_ROPE * sizeof(bf16);
 static constexpr size_t SMEM_KV_BUF     = BI * KV_SMEM_STRIDE;
+static_assert(OUT_STAGING_BYTES <= SMEM_KV_BUF, "staging must fit in one kv_buf");
 static constexpr size_t SMEM_REDUCE     = N_MATH_WARPS * HPB * sizeof(float);
 static constexpr size_t SMEM_SUM_REDUCE = N_MATH_WARPS * HPB * sizeof(float);
 static constexpr size_t SMEM_M          = HPB * sizeof(float);
@@ -550,21 +559,37 @@ sparse_mla_prefill_kernel(
                 bar_sync_t<0, BLOCK_THREADS>();
         }
 
+        // ── Coalesced output via smem staging ───────────────────
+        // Reuse kv_bufs[0] as staging buffer (IO warps are done)
+        bf16* staging = reinterpret_cast<bf16*>(sm.kv_bufs[0]);
+
+        float il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
+        float il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
+
+        // Step 1: scatter acc_o → staging[head][dim] (bf16_2 writes, padded stride)
         #pragma unroll
         for (int t = 0; t < ACC_TILES; t++) {
             constexpr int _NT8 = NT_PER_WARP_XV * 8;
             int c = t / NT_PER_WARP_XV, lnt = t % NT_PER_WARP_XV;
-            int vb = c * V_CHUNK + mwarp * _NT8 + lnt * 8;
-            int h0 = h_start + gid, h1 = h_start + gid + 8;
-            int d0 = vb + tid * 2, d1 = d0 + 1;
-            float il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
-            float il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
-            size_t b0 = (size_t)s_i * NUM_HEADS * D_NOPE + (size_t)h0 * D_NOPE;
-            size_t b1 = (size_t)s_i * NUM_HEADS * D_NOPE + (size_t)h1 * D_NOPE;
-            output[b0 + d0] = __float2bfloat16(acc_o[t][0] * il0);
-            output[b0 + d1] = __float2bfloat16(acc_o[t][1] * il0);
-            output[b1 + d0] = __float2bfloat16(acc_o[t][2] * il1);
-            output[b1 + d1] = __float2bfloat16(acc_o[t][3] * il1);
+            int d0 = c * V_CHUNK + mwarp * _NT8 + lnt * 8 + tid * 2;
+            *reinterpret_cast<bf16_2*>(&staging[gid * OUT_STAGING_STRIDE + d0]) =
+                __floats2bfloat162_rn(acc_o[t][0] * il0, acc_o[t][1] * il0);
+            *reinterpret_cast<bf16_2*>(&staging[(gid + 8) * OUT_STAGING_STRIDE + d0]) =
+                __floats2bfloat162_rn(acc_o[t][2] * il1, acc_o[t][3] * il1);
+        }
+        bar_sync_t<2, MATH_THREADS>();
+
+        // Step 2: coalesced 128-bit writes from staging → global
+        {
+            const size_t out_base = (size_t)s_i * NUM_HEADS * D_NOPE + (size_t)h_start * D_NOPE;
+            for (int idx = threadIdx.x; idx < HPB * OUT_TILES_PER_HEAD; idx += MATH_THREADS) {
+                int h = idx / OUT_TILES_PER_HEAD;
+                int d8 = idx - h * OUT_TILES_PER_HEAD;
+                uint4 val = *reinterpret_cast<const uint4*>(
+                    &staging[h * OUT_STAGING_STRIDE + d8 * OUT_VEC]);
+                *reinterpret_cast<uint4*>(
+                    &output[out_base + h * D_NOPE + d8 * OUT_VEC]) = val;
+            }
         }
     }
 }
@@ -797,25 +822,41 @@ sparse_mla_prefill_mg_kernel(
                 bar_sync_t<0, BLOCK_THREADS>();
         }
 
+        // ── Coalesced output via smem staging ───────────────────
+        bf16* staging = reinterpret_cast<bf16*>(sm.kv_bufs[0]);
+
         #pragma unroll
         for (int g = 0; g < MG_N_HG; g++) {
             float* g_l = sm.l_smem + g * HPB;
             int g_h_base = h_start + g * HPB;
+            float il0=(g_l[gid]>0.f)?(1.f/g_l[gid]):0.f;
+            float il1=(g_l[gid+8]>0.f)?(1.f/g_l[gid+8]):0.f;
+
             #pragma unroll
             for (int t = 0; t < ACC_TILES; t++) {
                 constexpr int _NT8 = NT_PER_WARP_XV * 8;
                 int c=t/NT_PER_WARP_XV, lnt=t%NT_PER_WARP_XV;
-                int vb=c*V_CHUNK+mwarp*_NT8+lnt*8;
-                int h0=g_h_base+gid, h1=g_h_base+gid+8, d0=vb+tid*2, d1=d0+1;
-                float il0=(g_l[gid]>0.f)?(1.f/g_l[gid]):0.f;
-                float il1=(g_l[gid+8]>0.f)?(1.f/g_l[gid+8]):0.f;
-                size_t b0=(size_t)s_i*NUM_HEADS*D_NOPE+(size_t)h0*D_NOPE;
-                size_t b1=(size_t)s_i*NUM_HEADS*D_NOPE+(size_t)h1*D_NOPE;
-                output[b0+d0]=__float2bfloat16(acc_o[g][t][0]*il0);
-                output[b0+d1]=__float2bfloat16(acc_o[g][t][1]*il0);
-                output[b1+d0]=__float2bfloat16(acc_o[g][t][2]*il1);
-                output[b1+d1]=__float2bfloat16(acc_o[g][t][3]*il1);
+                int d0=c*V_CHUNK+mwarp*_NT8+lnt*8+tid*2;
+                *reinterpret_cast<bf16_2*>(&staging[gid*OUT_STAGING_STRIDE+d0]) =
+                    __floats2bfloat162_rn(acc_o[g][t][0]*il0, acc_o[g][t][1]*il0);
+                *reinterpret_cast<bf16_2*>(&staging[(gid+8)*OUT_STAGING_STRIDE+d0]) =
+                    __floats2bfloat162_rn(acc_o[g][t][2]*il1, acc_o[g][t][3]*il1);
             }
+            bar_sync_t<2, MATH_THREADS>();
+
+            {
+                const size_t out_base = (size_t)s_i*NUM_HEADS*D_NOPE + (size_t)g_h_base*D_NOPE;
+                for (int idx = threadIdx.x; idx < HPB * OUT_TILES_PER_HEAD; idx += MATH_THREADS) {
+                    int h = idx / OUT_TILES_PER_HEAD;
+                    int d8 = idx - h * OUT_TILES_PER_HEAD;
+                    uint4 val = *reinterpret_cast<const uint4*>(
+                        &staging[h*OUT_STAGING_STRIDE + d8*OUT_VEC]);
+                    *reinterpret_cast<uint4*>(
+                        &output[out_base + h*D_NOPE + d8*OUT_VEC]) = val;
+                }
+            }
+            if (g < MG_N_HG - 1)
+                bar_sync_t<2, MATH_THREADS>();
         }
     }
 }
