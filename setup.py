@@ -16,7 +16,7 @@ extra_compile_args = {
     "nvcc": [
         "-O3",
         "-std=c++17",
-        "-gencode=arch=compute_120,code=sm_120",
+        "-gencode=arch=compute_120a,code=sm_120a",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
