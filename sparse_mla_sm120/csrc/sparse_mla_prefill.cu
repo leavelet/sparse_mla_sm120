@@ -5,43 +5,49 @@
 #include <torch/extension.h>
 
 // ============================================================================
-// Sparse MLA Prefill Kernel — Optimized for SM120a
+// Sparse MLA Prefill Kernels — Optimized for SM120a
 //
-// Key optimizations vs v1:
-//   - Batched XV scale computation (all 4 V chunks in one 2-barrier pass)
-//   - Separate sum_reduce_buf eliminates 1 softmax barrier/tile
-//   - All tile sizes are constexpr for full compile-time unrolling
-//   - cp.async with L2 prefetch hints
-//   - 11 barriers/tile (vs 25 in v1): 4 softmax + 4 XV ready + 3 XV done
-//
-// Architecture: 12 warps (384 threads) = 8 math + 4 IO
-//   Math: setmaxnreg 200, warps 0-7
-//   IO:   setmaxnreg 32,  warps 8-11
-//   Barriers: 0 = data ready, 1 = buf consumed, 2 = math internal
-//   Double-buffered KV: 2 × 64 × 528 = 66 KB
-//   Total smem: ~87 KB < 100 KB
+// All tile sizes, smem layout offsets, loop bounds, and barrier parameters
+// are constexpr. The compiler can resolve every address offset and loop
+// trip count at compile time.
 // ============================================================================
 
+// ── Tile geometry (all constexpr) ───────────────────────────────────────
 static constexpr int HPB = 16;
-static constexpr int BI = 64;
-static constexpr int NI = TOPK / BI;  // 32
-static constexpr int N_MATH_WARPS = 8;
-static constexpr int N_IO_WARPS = 4;
-static constexpr int N_TOTAL_WARPS = N_MATH_WARPS + N_IO_WARPS;
-static constexpr int BLOCK_THREADS = N_TOTAL_WARPS * 32;
-static constexpr int MATH_THREADS = N_MATH_WARPS * 32;
-static constexpr int IO_THREADS = N_IO_WARPS * 32;
-static constexpr int V_CHUNK = 128;
-static constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;
-static constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / N_MATH_WARPS;
-static constexpr int ACC_TILES = N_V_CHUNKS * NT_PER_WARP_XV;
+static constexpr int BI  = 64;
+static constexpr int NI  = TOPK / BI;                           // 32
+static constexpr int N_MATH_WARPS  = 8;
+static constexpr int N_IO_WARPS    = 4;
+static constexpr int N_TOTAL_WARPS = N_MATH_WARPS + N_IO_WARPS; // 12
+static constexpr int BLOCK_THREADS = N_TOTAL_WARPS * 32;        // 384
+static constexpr int MATH_THREADS  = N_MATH_WARPS * 32;         // 256
+static constexpr int IO_THREADS    = N_IO_WARPS * 32;           // 128
 
-static constexpr int KV_SMEM_STRIDE = D_NOPE + NUM_SCALES * sizeof(float);  // 528
-static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;   // 528: stride/4=132, 132%32=4
-static constexpr int V_TRANS_STRIDE = BI + 16;       // 80:  16B-aligned for ldmatrix, 80/4=20, 20%32=20
-static constexpr int W_FP8_STRIDE = BI + 16;         // 80:  16B-aligned for ldmatrix
+static constexpr int V_CHUNK        = 128;
+static constexpr int N_V_CHUNKS     = D_NOPE / V_CHUNK;                    // 4
+static constexpr int ENTRIES_PER_WARP = BI / N_MATH_WARPS;                 // 8
+static constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / N_MATH_WARPS;         // 2
+static constexpr int ACC_TILES      = N_V_CHUNKS * NT_PER_WARP_XV;        // 8
+static constexpr int N_ROPE_CHUNKS  = D_ROPE / 16;                        // 4
+static constexpr int XV_KSTEPS      = BI / 32;                            // 2
+static constexpr int QK_NOPE_KSTEPS = QUANT_TILE / 32;                    // 4
 
-// Smem sizes (all constexpr)
+// ── Smem strides (padded for bank-conflict avoidance + ldmatrix alignment) ──
+static constexpr int KV_SMEM_STRIDE = D_NOPE + NUM_SCALES * sizeof(float); // 528
+static constexpr int Q_NOPE_STRIDE  = D_NOPE + 16;    // 528: stride/4=132, 132%32=4
+static constexpr int V_TRANS_STRIDE = BI + 16;         // 80: 16B-aligned, 80/4=20, 20%32=20
+static constexpr int W_FP8_STRIDE   = BI + 16;         // 80: 16B-aligned
+
+// ── KV gather constants ─────────────────────────────────────────────────
+static constexpr int CP_BYTES = 16;
+static constexpr int CHUNKS_PER_KV_ENTRY = KV_SMEM_STRIDE / CP_BYTES;     // 33
+static_assert(KV_SMEM_STRIDE % CP_BYTES == 0, "stride must be 16B-aligned");
+static constexpr int TOTAL_KV_CHUNKS = BI * CHUNKS_PER_KV_ENTRY;          // 2112
+
+// ── KV cache layout ─────────────────────────────────────────────────────
+static constexpr int KV_ROPE_BYTE_OFFSET = D_NOPE + NUM_SCALES * sizeof(float); // 528
+
+// ── Smem layout: constexpr offsets from base ────────────────────────────
 static constexpr size_t SMEM_Q_NOPE     = HPB * Q_NOPE_STRIDE;
 static constexpr size_t SMEM_Q_SC       = HPB * NUM_SCALES * sizeof(float);
 static constexpr size_t SMEM_Q_ROPE     = HPB * D_ROPE * sizeof(bf16);
@@ -53,16 +59,56 @@ static constexpr size_t SMEM_L          = HPB * sizeof(float);
 static constexpr size_t SMEM_W_SC_ALL   = N_V_CHUNKS * HPB * sizeof(float);
 static constexpr size_t SMEM_W_FP8      = HPB * W_FP8_STRIDE;
 static constexpr size_t SMEM_V_TRANS    = V_CHUNK * V_TRANS_STRIDE;
-static constexpr size_t SMEM_TOTAL      = SMEM_Q_NOPE + SMEM_Q_SC + SMEM_Q_ROPE
-                                        + 2 * SMEM_KV_BUF + SMEM_REDUCE + SMEM_SUM_REDUCE
-                                        + SMEM_M + SMEM_L + SMEM_W_SC_ALL
-                                        + SMEM_W_FP8 + SMEM_V_TRANS;
 
-__device__ __forceinline__ void bar_arrive(int id, int cnt) {
-    asm volatile("barrier.cta.arrive %0, %1;\n" :: "r"(id), "r"(cnt) : "memory");
+// Single-group kernel smem offsets
+namespace sg {
+    static constexpr size_t OFF_Q_NOPE    = 0;
+    static constexpr size_t OFF_Q_SC      = OFF_Q_NOPE    + SMEM_Q_NOPE;
+    static constexpr size_t OFF_Q_ROPE    = OFF_Q_SC      + SMEM_Q_SC;
+    static constexpr size_t OFF_KV0       = OFF_Q_ROPE    + SMEM_Q_ROPE;
+    static constexpr size_t OFF_KV1       = OFF_KV0       + SMEM_KV_BUF;
+    static constexpr size_t OFF_REDUCE    = OFF_KV1       + SMEM_KV_BUF;
+    static constexpr size_t OFF_SUM_RED   = OFF_REDUCE    + SMEM_REDUCE;
+    static constexpr size_t OFF_M         = OFF_SUM_RED   + SMEM_SUM_REDUCE;
+    static constexpr size_t OFF_L         = OFF_M         + SMEM_M;
+    static constexpr size_t OFF_W_SC_ALL  = OFF_L         + SMEM_L;
+    static constexpr size_t OFF_W_FP8     = OFF_W_SC_ALL  + SMEM_W_SC_ALL;
+    static constexpr size_t OFF_V_TRANS   = OFF_W_FP8     + SMEM_W_FP8;
+    static constexpr size_t TOTAL         = OFF_V_TRANS   + SMEM_V_TRANS;
 }
-__device__ __forceinline__ void bar_sync(int id, int cnt) {
-    asm volatile("barrier.cta.sync %0, %1;\n" :: "r"(id), "r"(cnt) : "memory");
+
+// Multi-group kernel smem offsets (N_HG=2)
+static constexpr int MG_N_HG = 2;
+static constexpr int MG_HEADS_PER_CTA = MG_N_HG * HPB;  // 32
+
+namespace mg {
+    static constexpr size_t OFF_Q_NOPE0   = 0;
+    static constexpr size_t OFF_Q_NOPE1   = OFF_Q_NOPE0   + SMEM_Q_NOPE;
+    static constexpr size_t OFF_Q_SC0     = OFF_Q_NOPE1   + SMEM_Q_NOPE;
+    static constexpr size_t OFF_Q_SC1     = OFF_Q_SC0     + SMEM_Q_SC;
+    static constexpr size_t OFF_KV0       = OFF_Q_SC1     + SMEM_Q_SC;
+    static constexpr size_t OFF_KV1       = OFF_KV0       + SMEM_KV_BUF;
+    static constexpr size_t OFF_REDUCE    = OFF_KV1       + SMEM_KV_BUF;
+    static constexpr size_t OFF_SUM_RED   = OFF_REDUCE    + SMEM_REDUCE;
+    static constexpr size_t OFF_M         = OFF_SUM_RED   + SMEM_SUM_REDUCE;
+    static constexpr size_t OFF_L         = OFF_M         + MG_N_HG * SMEM_M;
+    static constexpr size_t OFF_W_SC_ALL  = OFF_L         + MG_N_HG * SMEM_L;
+    static constexpr size_t OFF_W_FP8     = OFF_W_SC_ALL  + MG_N_HG * SMEM_W_SC_ALL;
+    static constexpr size_t OFF_V_TRANS   = OFF_W_FP8     + SMEM_W_FP8;
+    static constexpr size_t TOTAL         = OFF_V_TRANS   + SMEM_V_TRANS;
+}
+
+static_assert(sg::TOTAL < 100 * 1024, "SG smem exceeds 100 KB");
+static_assert(mg::TOTAL < 100 * 1024, "MG smem exceeds 100 KB");
+
+// ── Barrier helpers — ID as immediate, count as register ────────────────
+template <int ID, int CNT>
+__device__ __forceinline__ void bar_arrive_t() {
+    asm volatile("barrier.cta.arrive %0, %1;\n" :: "n"(ID), "r"(CNT) : "memory");
+}
+template <int ID, int CNT>
+__device__ __forceinline__ void bar_sync_t() {
+    asm volatile("barrier.cta.sync %0, %1;\n" :: "n"(ID), "r"(CNT) : "memory");
 }
 
 __device__ __forceinline__ void cp_async_16B_l2(void* smem_ptr, const void* gmem_ptr) {
@@ -72,9 +118,19 @@ __device__ __forceinline__ void cp_async_16B_l2(void* smem_ptr, const void* gmem
         :: "r"(addr), "l"(gmem_ptr));
 }
 
-// ============================================================================
-// Smem layout struct — all pointers derived from a single base
-// ============================================================================
+// ── V transpose helper ──────────────────────────────────────────────────
+__device__ __forceinline__ void transpose_v_chunk(
+    uint8_t* __restrict__ v_trans,
+    const uint8_t* __restrict__ kv_smem,
+    int v_off, int /*lane*/)
+{
+    for (int idx = threadIdx.x; idx < V_CHUNK * BI; idx += MATH_THREADS) {
+        int d = idx >> 6, e = idx & 63;
+        v_trans[d * V_TRANS_STRIDE + e] = kv_smem[e * KV_SMEM_STRIDE + v_off + d];
+    }
+}
+
+// ── Smem layout structs — constexpr offsets ─────────────────────────────
 struct PrefillSmem {
     uint8_t* q_nope_fp8;
     float*   q_nope_sc;
@@ -88,46 +144,73 @@ struct PrefillSmem {
     uint8_t* w_fp8;
     uint8_t* v_trans;
 
-    __device__ static PrefillSmem init(char* base) {
-        PrefillSmem s;
-        char* p = base;
-        s.q_nope_fp8    = (uint8_t*)p; p += SMEM_Q_NOPE;
-        s.q_nope_sc     = (float*)p;   p += SMEM_Q_SC;
-        s.q_rope        = (bf16*)p;    p += SMEM_Q_ROPE;
-        s.kv_bufs[0]    = (uint8_t*)p; p += SMEM_KV_BUF;
-        s.kv_bufs[1]    = (uint8_t*)p; p += SMEM_KV_BUF;
-        s.reduce_buf    = (float*)p;   p += SMEM_REDUCE;
-        s.sum_reduce_buf= (float*)p;   p += SMEM_SUM_REDUCE;
-        s.m_smem        = (float*)p;   p += SMEM_M;
-        s.l_smem        = (float*)p;   p += SMEM_L;
-        s.w_head_sc_all = (float*)p;   p += SMEM_W_SC_ALL;
-        s.w_fp8         = (uint8_t*)p; p += SMEM_W_FP8;
-        s.v_trans       = (uint8_t*)p;
-        return s;
+    __device__ static PrefillSmem init(char* b) {
+        return {
+            (uint8_t*)(b + sg::OFF_Q_NOPE),
+            (float*)  (b + sg::OFF_Q_SC),
+            (bf16*)   (b + sg::OFF_Q_ROPE),
+            {(uint8_t*)(b + sg::OFF_KV0), (uint8_t*)(b + sg::OFF_KV1)},
+            (float*)  (b + sg::OFF_REDUCE),
+            (float*)  (b + sg::OFF_SUM_RED),
+            (float*)  (b + sg::OFF_M),
+            (float*)  (b + sg::OFF_L),
+            (float*)  (b + sg::OFF_W_SC_ALL),
+            (uint8_t*)(b + sg::OFF_W_FP8),
+            (uint8_t*)(b + sg::OFF_V_TRANS),
+        };
     }
 };
 
-// ============================================================================
-// IO path: gather KV nope+scales into double buffer with L2 prefetch
-// ============================================================================
+struct PrefillSmemMG {
+    uint8_t* q_nope_fp8[MG_N_HG];
+    float*   q_nope_sc[MG_N_HG];
+    uint8_t* kv_bufs[2];
+    float*   reduce_buf;
+    float*   sum_reduce_buf;
+    float*   m_smem;
+    float*   l_smem;
+    float*   w_head_sc_all;
+    uint8_t* w_fp8;
+    uint8_t* v_trans;
+
+    __device__ static PrefillSmemMG init(char* b) {
+        PrefillSmemMG s;
+        s.q_nope_fp8[0] = (uint8_t*)(b + mg::OFF_Q_NOPE0);
+        s.q_nope_fp8[1] = (uint8_t*)(b + mg::OFF_Q_NOPE1);
+        s.q_nope_sc[0]  = (float*)  (b + mg::OFF_Q_SC0);
+        s.q_nope_sc[1]  = (float*)  (b + mg::OFF_Q_SC1);
+        s.kv_bufs[0]    = (uint8_t*)(b + mg::OFF_KV0);
+        s.kv_bufs[1]    = (uint8_t*)(b + mg::OFF_KV1);
+        s.reduce_buf    = (float*)  (b + mg::OFF_REDUCE);
+        s.sum_reduce_buf= (float*)  (b + mg::OFF_SUM_RED);
+        s.m_smem        = (float*)  (b + mg::OFF_M);
+        s.l_smem        = (float*)  (b + mg::OFF_L);
+        s.w_head_sc_all = (float*)  (b + mg::OFF_W_SC_ALL);
+        s.w_fp8         = (uint8_t*)(b + mg::OFF_W_FP8);
+        s.v_trans       = (uint8_t*)(b + mg::OFF_V_TRANS);
+        return s;
+    }
+    __device__ bf16* q_rope_staging() { return (bf16*)v_trans; }
+};
+
+// ── IO path: gather KV tile ─────────────────────────────────────────────
 __device__ __forceinline__ void io_gather_tile(
     uint8_t* dst, const int32_t* ib,
     const uint8_t* __restrict__ KV_cache, int io_tid)
 {
-    constexpr int TOT = BI * KV_SMEM_STRIDE;
-    for (int flat = io_tid * 16; flat < TOT; flat += IO_THREADS * 16) {
-        int bi = flat / KV_SMEM_STRIDE, bo = flat % KV_SMEM_STRIDE;
+    #pragma unroll 1
+    for (int c = io_tid; c < TOTAL_KV_CHUNKS; c += IO_THREADS) {
+        int bi = c / CHUNKS_PER_KV_ENTRY;
+        int bo = (c - bi * CHUNKS_PER_KV_ENTRY) * CP_BYTES;
         int idx = ib[bi]; idx = (idx >= 0) ? idx : 0;
-        if (bo + 16 <= KV_SMEM_STRIDE)
-            cp_async_16B_l2(dst + flat, KV_cache + (size_t)idx * KV_PACKED_BYTES + bo);
+        cp_async_16B_l2(dst + bi * KV_SMEM_STRIDE + bo,
+                        KV_cache + (size_t)idx * KV_PACKED_BYTES + bo);
     }
     cp_async_commit();
     cp_async_wait_all();
 }
 
-// ============================================================================
-// Math helpers
-// ============================================================================
+// ── Q quantization ──────────────────────────────────────────────────────
 __device__ __forceinline__ void quantize_q_to_smem(
     uint8_t* q_nope_fp8, float* q_nope_sc, bf16* q_rope,
     const bf16* q_base, float* reduce_buf)
@@ -139,18 +222,18 @@ __device__ __forceinline__ void quantize_q_to_smem(
     }
     for (int i = threadIdx.x; i < HPB * NUM_SCALES; i += MATH_THREADS)
         amax[i] = 0.f;
-    bar_sync(2, MATH_THREADS);
+    bar_sync_t<2, MATH_THREADS>();
 
     for (int idx = threadIdx.x; idx < HPB * D_NOPE; idx += MATH_THREADS) {
         int h = idx / D_NOPE, blk = (idx % D_NOPE) / QUANT_TILE;
         atomicMax(reinterpret_cast<int*>(&amax[h * NUM_SCALES + blk]),
                   __float_as_int(fabsf(__bfloat162float(q_base[h * DIM + idx % D_NOPE]))));
     }
-    bar_sync(2, MATH_THREADS);
+    bar_sync_t<2, MATH_THREADS>();
 
     for (int i = threadIdx.x; i < HPB * NUM_SCALES; i += MATH_THREADS)
         q_nope_sc[i] = fmaxf(amax[i], 1e-4f) / FP8_MAX;
-    bar_sync(2, MATH_THREADS);
+    bar_sync_t<2, MATH_THREADS>();
 
     for (int idx = threadIdx.x; idx < HPB * D_NOPE; idx += MATH_THREADS) {
         int h = idx / D_NOPE, d = idx % D_NOPE, blk = d / QUANT_TILE;
@@ -161,16 +244,17 @@ __device__ __forceinline__ void quantize_q_to_smem(
     }
 }
 
+// ── QK nope MMA ─────────────────────────────────────────────────────────
 __device__ __forceinline__ void compute_qk_nope(
     float qk[4], const uint8_t* q_nope_fp8, const float* q_nope_sc,
     const uint8_t* kv_smem, int qk_nb, int lane)
 {
-    int gid = lane >> 2, tid = lane & 3;
+    const int gid = lane >> 2, tid = lane & 3;
     #pragma unroll
     for (int blk = 0; blk < NUM_SCALES; blk++) {
         float ab[4] = {0.f, 0.f, 0.f, 0.f};
         #pragma unroll
-        for (int ks = 0; ks < QUANT_TILE / 32; ks++) {
+        for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
             int ko = blk * QUANT_TILE + ks * 32;
             uint32_t a0, a1, a2, a3, b0, b1;
             ldmatrix_load_A_fp8(a0, a1, a2, a3,
@@ -183,7 +267,7 @@ __device__ __forceinline__ void compute_qk_nope(
         }
         float qs0 = q_nope_sc[gid * NUM_SCALES + blk];
         float qs1 = q_nope_sc[(gid + 8) * NUM_SCALES + blk];
-        int e0 = qk_nb + tid * 2, e1 = qk_nb + tid * 2 + 1;
+        int e0 = qk_nb + tid * 2, e1 = e0 + 1;
         float k0 = reinterpret_cast<const float*>(kv_smem + e0 * KV_SMEM_STRIDE + D_NOPE)[blk];
         float k1 = reinterpret_cast<const float*>(kv_smem + e1 * KV_SMEM_STRIDE + D_NOPE)[blk];
         qk[0] += ab[0] * qs0 * k0; qk[1] += ab[1] * qs0 * k1;
@@ -191,10 +275,9 @@ __device__ __forceinline__ void compute_qk_nope(
     }
 }
 
-// Q rope MMA fragments preloaded to registers (16 uint32 = 16 regs per thread)
-static constexpr int N_ROPE_CHUNKS = D_ROPE / 16;  // 4
+// ── Q rope registers ────────────────────────────────────────────────────
 struct QRopeRegs {
-    uint32_t a[N_ROPE_CHUNKS][4];  // [k-chunk][a0,a1,a2,a3]
+    uint32_t a[N_ROPE_CHUNKS][4];
 };
 
 __device__ __forceinline__ QRopeRegs preload_q_rope_regs(
@@ -202,28 +285,25 @@ __device__ __forceinline__ QRopeRegs preload_q_rope_regs(
 {
     QRopeRegs regs;
     #pragma unroll
-    for (int ks = 0; ks < N_ROPE_CHUNKS; ks++) {
+    for (int ks = 0; ks < N_ROPE_CHUNKS; ks++)
         ldmatrix_load_A_bf16(regs.a[ks][0], regs.a[ks][1],
                               regs.a[ks][2], regs.a[ks][3],
                               q_rope_smem + ks * 16, D_ROPE, lane);
-    }
     return regs;
 }
 
 __device__ __forceinline__ void compute_qk_rope(
-    float qk[4], const QRopeRegs& q_rope_regs, const bf16* g_rope, int lane)
+    float qk[4], const QRopeRegs& qr, const bf16* g_rope, int lane)
 {
-    int tid = lane & 3;
+    const int tid = lane & 3;
     float ra[4] = {0.f, 0.f, 0.f, 0.f};
     #pragma unroll
     for (int ks = 0; ks < N_ROPE_CHUNKS; ks++) {
         int ko = ks * 16;
-        uint32_t b0, b1;
-        b0 = *reinterpret_cast<const uint32_t*>(g_rope + ko + tid * 2);
-        b1 = *reinterpret_cast<const uint32_t*>(g_rope + ko + 8 + tid * 2);
+        uint32_t b0 = *reinterpret_cast<const uint32_t*>(g_rope + ko + tid * 2);
+        uint32_t b1 = *reinterpret_cast<const uint32_t*>(g_rope + ko + 8 + tid * 2);
         MmaBf16Result r = mma_bf16_m16n8k16(
-            q_rope_regs.a[ks][0], q_rope_regs.a[ks][1],
-            q_rope_regs.a[ks][2], q_rope_regs.a[ks][3],
+            qr.a[ks][0], qr.a[ks][1], qr.a[ks][2], qr.a[ks][3],
             b0, b1, ra[0], ra[1], ra[2], ra[3]);
         ra[0] = r.d0; ra[1] = r.d1; ra[2] = r.d2; ra[3] = r.d3;
     }
@@ -231,8 +311,9 @@ __device__ __forceinline__ void compute_qk_rope(
 }
 
 // ============================================================================
-// Main prefill kernel
+// Single-group prefill kernel (num_heads <= 16, memory-bound, 88% BW)
 // ============================================================================
+template <int NUM_HEADS>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_kernel(
     const bf16* __restrict__ Q,
@@ -240,9 +321,9 @@ sparse_mla_prefill_kernel(
     const int32_t* __restrict__ indices,
     bf16* __restrict__ output,
     float sm_scale,
-    int num_heads, int num_tokens, int topk)
+    int num_tokens)
 {
-    const int REPLICATE_H = num_heads / HPB;
+    static constexpr int REPLICATE_H = NUM_HEADS / HPB;
     const int s_i = blockIdx.x / REPLICATE_H;
     const int h_start = (blockIdx.x % REPLICATE_H) * HPB;
     if (s_i >= num_tokens) return;
@@ -253,30 +334,24 @@ sparse_mla_prefill_kernel(
     extern __shared__ char smem_raw[];
     PrefillSmem sm = PrefillSmem::init(smem_raw);
 
-    // ================================================================
-    // IO PATH (warps 8-11)
-    // ================================================================
     if (wy == 2) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
 
         const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
-        const int32_t* idx_base = indices + (size_t)s_i * topk;
+        const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
         io_gather_tile(sm.kv_bufs[0], idx_base, KV_cache, io_tid);
-        bar_arrive(0, BLOCK_THREADS);
+        bar_arrive_t<0, BLOCK_THREADS>();
 
         for (int ni = 0; ni < NI; ni++) {
             if (ni + 1 < NI)
                 io_gather_tile(sm.kv_bufs[(ni + 1) & 1],
                                idx_base + (ni + 1) * BI, KV_cache, io_tid);
-            bar_sync(1, BLOCK_THREADS);
+            bar_sync_t<1, BLOCK_THREADS>();
             if (ni + 1 < NI)
-                bar_arrive(0, BLOCK_THREADS);
+                bar_arrive_t<0, BLOCK_THREADS>();
         }
 
-    // ================================================================
-    // MATH PATH (warps 0-7)
-    // ================================================================
     } else {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(200));
 
@@ -284,17 +359,13 @@ sparse_mla_prefill_kernel(
         const int mwarp = warp_rank;
         const int gid = lane >> 2, tid = lane & 3;
         const float sm_scale_log2e = sm_scale * LOG2E;
-        const bf16* q_base = Q + (size_t)s_i * num_heads * DIM + (size_t)h_start * DIM;
-        const int32_t* idx_base = indices + (size_t)s_i * topk;
+        const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * DIM + (size_t)h_start * DIM;
+        const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
-        // ---- Q quantization (one-time, 4 barriers) ----
         quantize_q_to_smem(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope,
                            q_base, sm.reduce_buf);
-
-        // Preload Q rope MMA fragments to registers (avoids smem reads in hot loop)
         QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
-        // Init softmax state
         for (int h = threadIdx.x; h < HPB; h += MATH_THREADS) {
             sm.m_smem[h] = -1e30f;
             sm.l_smem[h] = 0.f;
@@ -305,48 +376,38 @@ sparse_mla_prefill_kernel(
         for (int t = 0; t < ACC_TILES; t++)
             acc_o[t][0] = acc_o[t][1] = acc_o[t][2] = acc_o[t][3] = 0.f;
 
-        bar_sync(2, MATH_THREADS);
-        bar_sync(0, BLOCK_THREADS);  // wait for IO tile 0
+        bar_sync_t<2, MATH_THREADS>();
+        bar_sync_t<0, BLOCK_THREADS>();
 
-        // ---- Main loop over KV tiles ----
         for (int ni = 0; ni < NI; ni++) {
             uint8_t* kv_smem = sm.kv_bufs[ni & 1];
             const int32_t* ib = idx_base + ni * BI;
-            const int qk_nb = mwarp * 8;
+            const int qk_nb = mwarp * ENTRIES_PER_WARP;
 
-            // Init batched XV scales for this tile (overlaps with QK MMA below)
             for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = 0.f;
 
-            // ---- QK MMA nope (FP8) ----
             float qk[4] = {0.f, 0.f, 0.f, 0.f};
             compute_qk_nope(qk, sm.q_nope_fp8, sm.q_nope_sc, kv_smem, qk_nb, lane);
 
-            // ---- QK MMA rope (BF16, from global L1-cached) ----
             {
-                int ne = qk_nb + gid;
-                int entry_idx = ib[ne];
+                int entry_idx = ib[qk_nb + gid];
                 entry_idx = (entry_idx >= 0) ? entry_idx : 0;
                 const bf16* g_rope = reinterpret_cast<const bf16*>(
-                    KV_cache + (size_t)entry_idx * KV_PACKED_BYTES
-                    + D_NOPE + NUM_SCALES * sizeof(float));
+                    KV_cache + (size_t)entry_idx * KV_PACKED_BYTES + KV_ROPE_BYTE_OFFSET);
                 compute_qk_rope(qk, q_rope_regs, g_rope, lane);
             }
 
-            // ---- Mask invalid entries ----
             {
-                int e0 = qk_nb + tid * 2, e1 = qk_nb + tid * 2 + 1;
+                int e0 = qk_nb + tid * 2, e1 = e0 + 1;
                 if (ib[e0] < 0) { qk[0] = -1e30f; qk[2] = -1e30f; }
                 if (ib[e1] < 0) { qk[1] = -1e30f; qk[3] = -1e30f; }
             }
 
-            // ============================================================
-            // Online softmax (4 barriers, was 5)
-            // ============================================================
+            // ── Online softmax (4 barriers) ─────────────────────────
             float s[4] = { qk[0] * sm_scale_log2e, qk[1] * sm_scale_log2e,
                            qk[2] * sm_scale_log2e, qk[3] * sm_scale_log2e };
 
-            // Warp-level max reduce
             float lm0 = fmaxf(s[0], s[1]), lm1 = fmaxf(s[2], s[3]);
             lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff, lm0, 1));
             lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff, lm0, 2));
@@ -356,12 +417,12 @@ sparse_mla_prefill_kernel(
                 sm.reduce_buf[mwarp * HPB + gid] = lm0;
                 sm.reduce_buf[mwarp * HPB + gid + 8] = lm1;
             }
-
-            bar_sync(2, MATH_THREADS);  // BARRIER 1: local max ready
+            bar_sync_t<2, MATH_THREADS>();
 
             if (threadIdx.x < HPB) {
                 int h = threadIdx.x;
                 float old_m = sm.m_smem[h], tm = -1e30f;
+                #pragma unroll
                 for (int w = 0; w < N_MATH_WARPS; w++)
                     tm = fmaxf(tm, sm.reduce_buf[w * HPB + h]);
                 float nm = fmaxf(old_m, tm);
@@ -371,8 +432,7 @@ sparse_mla_prefill_kernel(
                 sm.reduce_buf[h] = alpha;
                 sm.reduce_buf[HPB + h] = nm;
             }
-
-            bar_sync(2, MATH_THREADS);  // BARRIER 2: alpha, nm ready
+            bar_sync_t<2, MATH_THREADS>();
 
             float alpha0 = sm.reduce_buf[gid], alpha1 = sm.reduce_buf[gid + 8];
             float nm0 = sm.reduce_buf[HPB + gid], nm1 = sm.reduce_buf[HPB + gid + 8];
@@ -386,7 +446,6 @@ sparse_mla_prefill_kernel(
             float w0 = exp2f(s[0] - nm0), w1 = exp2f(s[1] - nm0);
             float w2 = exp2f(s[2] - nm1), w3 = exp2f(s[3] - nm1);
 
-            // Write local sums to SEPARATE buffer (no conflict with alpha/nm)
             float ls0 = w0 + w1, ls1 = w2 + w3;
             ls0 += __shfl_xor_sync(0xffffffff, ls0, 1);
             ls0 += __shfl_xor_sync(0xffffffff, ls0, 2);
@@ -397,9 +456,8 @@ sparse_mla_prefill_kernel(
                 sm.sum_reduce_buf[mwarp * HPB + gid + 8] = ls1;
             }
 
-            // Batched XV scale computation: atomicMax for all 4 V chunks
             {
-                int e0i = qk_nb + tid * 2, e1i = qk_nb + tid * 2 + 1;
+                int e0i = qk_nb + tid * 2, e1i = e0i + 1;
                 #pragma unroll
                 for (int vc = 0; vc < N_V_CHUNKS; vc++) {
                     float vsc0 = reinterpret_cast<const float*>(
@@ -408,43 +466,35 @@ sparse_mla_prefill_kernel(
                         kv_smem + e1i * KV_SMEM_STRIDE + D_NOPE)[vc];
                     float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
                     float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
-                    atomicMax(reinterpret_cast<int*>(
-                        &sm.w_head_sc_all[vc * HPB + gid]),
+                    atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid]),
                         __float_as_int(fmaxf(fabsf(ws00), fabsf(ws01))));
-                    atomicMax(reinterpret_cast<int*>(
-                        &sm.w_head_sc_all[vc * HPB + gid + 8]),
+                    atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid + 8]),
                         __float_as_int(fmaxf(fabsf(ws10), fabsf(ws11))));
                 }
             }
+            bar_sync_t<2, MATH_THREADS>();
 
-            bar_sync(2, MATH_THREADS);  // BARRIER 3: sums + atomicMax done
-
-            // Reduce sums and normalize XV scales
             if (threadIdx.x < HPB) {
                 int h = threadIdx.x;
                 float ts = 0.f;
+                #pragma unroll
                 for (int w = 0; w < N_MATH_WARPS; w++)
                     ts += sm.sum_reduce_buf[w * HPB + h];
                 sm.l_smem[h] += ts;
             }
             for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
+            bar_sync_t<2, MATH_THREADS>();
 
-            bar_sync(2, MATH_THREADS);  // BARRIER 4: l_smem + all XV scales ready
-
-            // ============================================================
-            // XV MMA (4 V chunks × {quantize+transpose → barrier → MMA})
-            // Saves 3 barriers per V chunk vs v1 (scale already computed)
-            // ============================================================
+            // ── XV MMA ──────────────────────────────────────────────
             {
-                int e0i = qk_nb + tid * 2, e1i = qk_nb + tid * 2 + 1;
+                int e0i = qk_nb + tid * 2, e1i = e0i + 1;
 
                 #pragma unroll
                 for (int vc = 0; vc < N_V_CHUNKS; vc++) {
-                    int v_off = vc * V_CHUNK;
+                    const int v_off = vc * V_CHUNK;
                     float* vc_sc = sm.w_head_sc_all + vc * HPB;
 
-                    // Quantize softmax weights × V_scale to FP8
                     {
                         float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
                         float vsc0 = reinterpret_cast<const float*>(
@@ -463,23 +513,16 @@ sparse_mla_prefill_kernel(
                         sm.w_fp8[(gid + 8) * W_FP8_STRIDE + e1i] = f11.__x;
                     }
 
-                    // V transpose (KV nope region)
-                    for (int idx = threadIdx.x; idx < V_CHUNK * BI; idx += MATH_THREADS) {
-                        int d = idx / BI, e = idx % BI;
-                        sm.v_trans[d * V_TRANS_STRIDE + e] =
-                            kv_smem[e * KV_SMEM_STRIDE + v_off + d];
-                    }
+                    transpose_v_chunk(sm.v_trans, kv_smem, v_off, lane);
+                    bar_sync_t<2, MATH_THREADS>();
 
-                    bar_sync(2, MATH_THREADS);  // XV BARRIER A: w_fp8 + v_trans ready
-
-                    // XV MMA (FP8, ldmatrix loads)
                     #pragma unroll
                     for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
                         int ti = vc * NT_PER_WARP_XV + nt;
                         int nl = mwarp * (NT_PER_WARP_XV * 8) + nt * 8;
                         float xv[4] = {0.f, 0.f, 0.f, 0.f};
                         #pragma unroll
-                        for (int kstep = 0; kstep < BI / 32; kstep++) {
+                        for (int kstep = 0; kstep < XV_KSTEPS; kstep++) {
                             int ko = kstep * 32;
                             uint32_t a0, a1, a2, a3, b0, b1;
                             ldmatrix_load_A_fp8(a0, a1, a2, a3,
@@ -497,29 +540,27 @@ sparse_mla_prefill_kernel(
                         acc_o[ti][2] += xv[2] * sc1; acc_o[ti][3] += xv[3] * sc1;
                     }
 
-                    // Skip final barrier for last V chunk (no reuse conflict)
                     if (vc < N_V_CHUNKS - 1)
-                        bar_sync(2, MATH_THREADS);  // XV BARRIER B: MMA done
+                        bar_sync_t<2, MATH_THREADS>();
                 }
             }
 
-            // Signal IO: current buffer consumed
-            bar_arrive(1, BLOCK_THREADS);
+            bar_arrive_t<1, BLOCK_THREADS>();
             if (ni + 1 < NI)
-                bar_sync(0, BLOCK_THREADS);  // wait for next tile
+                bar_sync_t<0, BLOCK_THREADS>();
         }
 
-        // ---- Finalize: divide by sum ----
         #pragma unroll
         for (int t = 0; t < ACC_TILES; t++) {
+            constexpr int _NT8 = NT_PER_WARP_XV * 8;
             int c = t / NT_PER_WARP_XV, lnt = t % NT_PER_WARP_XV;
-            int vb = c * V_CHUNK + mwarp * (NT_PER_WARP_XV * 8) + lnt * 8;
+            int vb = c * V_CHUNK + mwarp * _NT8 + lnt * 8;
             int h0 = h_start + gid, h1 = h_start + gid + 8;
-            int d0 = vb + tid * 2, d1 = vb + tid * 2 + 1;
+            int d0 = vb + tid * 2, d1 = d0 + 1;
             float il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
             float il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
-            size_t b0 = (size_t)s_i * num_heads * D_NOPE + (size_t)h0 * D_NOPE;
-            size_t b1 = (size_t)s_i * num_heads * D_NOPE + (size_t)h1 * D_NOPE;
+            size_t b0 = (size_t)s_i * NUM_HEADS * D_NOPE + (size_t)h0 * D_NOPE;
+            size_t b1 = (size_t)s_i * NUM_HEADS * D_NOPE + (size_t)h1 * D_NOPE;
             output[b0 + d0] = __float2bfloat16(acc_o[t][0] * il0);
             output[b0 + d1] = __float2bfloat16(acc_o[t][1] * il0);
             output[b1 + d0] = __float2bfloat16(acc_o[t][2] * il1);
@@ -529,56 +570,9 @@ sparse_mla_prefill_kernel(
 }
 
 // ============================================================================
-// Multi-group prefill kernel — processes N_HG head groups per CTA
-// Shares KV tile across groups, cutting DRAM reads by N_HG×.
-// Phase 1: QK + softmax per group (sequential, sharing reduce_buf)
-// Phase 2: XV with shared V transpose, per-group w_fp8 quantize
+// Multi-group prefill kernel (num_heads > 16, e.g. 128)
 // ============================================================================
-static constexpr int MG_N_HG = 2;
-static constexpr int MG_HEADS_PER_CTA = MG_N_HG * HPB;  // 32
-
-static constexpr size_t MG_SMEM_TOTAL =
-    MG_N_HG * SMEM_Q_NOPE                      // per-group Q nope fp8
-    + MG_N_HG * SMEM_Q_SC                       // per-group Q scales
-    + 2 * SMEM_KV_BUF                           // shared double-buf KV
-    + SMEM_REDUCE + SMEM_SUM_REDUCE             // shared reduce bufs
-    + MG_N_HG * SMEM_M + MG_N_HG * SMEM_L      // per-group softmax state
-    + MG_N_HG * SMEM_W_SC_ALL                   // per-group XV scales
-    + SMEM_W_FP8 + SMEM_V_TRANS;                // shared XV buffers (v_trans also used as q_rope staging)
-
-static_assert(MG_SMEM_TOTAL < 100 * 1024, "Multi-group smem exceeds 100 KB");
-
-struct PrefillSmemMG {
-    uint8_t* q_nope_fp8[MG_N_HG];
-    float*   q_nope_sc[MG_N_HG];
-    uint8_t* kv_bufs[2];
-    float*   reduce_buf;
-    float*   sum_reduce_buf;
-    float*   m_smem;       // [MG_N_HG * HPB]
-    float*   l_smem;       // [MG_N_HG * HPB]
-    float*   w_head_sc_all; // [MG_N_HG * N_V_CHUNKS * HPB]
-    uint8_t* w_fp8;
-    uint8_t* v_trans;       // first 2KB overlapped as q_rope staging during init
-
-    __device__ static PrefillSmemMG init(char* base) {
-        PrefillSmemMG s;
-        char* p = base;
-        for (int g = 0; g < MG_N_HG; g++) { s.q_nope_fp8[g] = (uint8_t*)p; p += SMEM_Q_NOPE; }
-        for (int g = 0; g < MG_N_HG; g++) { s.q_nope_sc[g] = (float*)p; p += SMEM_Q_SC; }
-        s.kv_bufs[0]    = (uint8_t*)p; p += SMEM_KV_BUF;
-        s.kv_bufs[1]    = (uint8_t*)p; p += SMEM_KV_BUF;
-        s.reduce_buf    = (float*)p;   p += SMEM_REDUCE;
-        s.sum_reduce_buf= (float*)p;   p += SMEM_SUM_REDUCE;
-        s.m_smem        = (float*)p;   p += MG_N_HG * SMEM_M;
-        s.l_smem        = (float*)p;   p += MG_N_HG * SMEM_L;
-        s.w_head_sc_all = (float*)p;   p += MG_N_HG * SMEM_W_SC_ALL;
-        s.w_fp8         = (uint8_t*)p; p += SMEM_W_FP8;
-        s.v_trans       = (uint8_t*)p;
-        return s;
-    }
-    __device__ bf16* q_rope_staging() { return (bf16*)v_trans; }
-};
-
+template <int NUM_HEADS>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_mg_kernel(
     const bf16* __restrict__ Q,
@@ -586,9 +580,9 @@ sparse_mla_prefill_mg_kernel(
     const int32_t* __restrict__ indices,
     bf16* __restrict__ output,
     float sm_scale,
-    int num_heads, int num_tokens, int topk)
+    int num_tokens)
 {
-    const int REPLICATE_H = num_heads / MG_HEADS_PER_CTA;
+    static constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA;
     const int s_i = blockIdx.x / REPLICATE_H;
     const int h_start = (blockIdx.x % REPLICATE_H) * MG_HEADS_PER_CTA;
     if (s_i >= num_tokens) return;
@@ -602,16 +596,16 @@ sparse_mla_prefill_mg_kernel(
     if (wy == 2) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
         const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
-        const int32_t* idx_base = indices + (size_t)s_i * topk;
+        const int32_t* idx_base = indices + (size_t)s_i * TOPK;
         io_gather_tile(sm.kv_bufs[0], idx_base, KV_cache, io_tid);
-        bar_arrive(0, BLOCK_THREADS);
+        bar_arrive_t<0, BLOCK_THREADS>();
         for (int ni = 0; ni < NI; ni++) {
             if (ni + 1 < NI)
                 io_gather_tile(sm.kv_bufs[(ni + 1) & 1],
                                idx_base + (ni + 1) * BI, KV_cache, io_tid);
-            bar_sync(1, BLOCK_THREADS);
+            bar_sync_t<1, BLOCK_THREADS>();
             if (ni + 1 < NI)
-                bar_arrive(0, BLOCK_THREADS);
+                bar_arrive_t<0, BLOCK_THREADS>();
         }
     } else {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(200));
@@ -620,21 +614,20 @@ sparse_mla_prefill_mg_kernel(
         const int mwarp = warp_rank;
         const int gid = lane >> 2, tid = lane & 3;
         const float sm_scale_log2e = sm_scale * LOG2E;
-        const int32_t* idx_base = indices + (size_t)s_i * topk;
+        const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
-        // ---- Init: quantize Q and preload rope for all groups ----
         QRopeRegs q_rope_regs[MG_N_HG];
         float acc_o[MG_N_HG][ACC_TILES][4];
 
         #pragma unroll
         for (int g = 0; g < MG_N_HG; g++) {
-            const bf16* q_base_g = Q + (size_t)s_i * num_heads * DIM
+            const bf16* q_base_g = Q + (size_t)s_i * NUM_HEADS * DIM
                                      + (size_t)(h_start + g * HPB) * DIM;
             bf16* rope_staging = sm.q_rope_staging();
             quantize_q_to_smem(sm.q_nope_fp8[g], sm.q_nope_sc[g],
                                rope_staging, q_base_g, sm.reduce_buf);
             q_rope_regs[g] = preload_q_rope_regs(rope_staging, lane);
-            bar_sync(2, MATH_THREADS);
+            bar_sync_t<2, MATH_THREADS>();
 
             for (int h = threadIdx.x; h < HPB; h += MATH_THREADS) {
                 sm.m_smem[g * HPB + h] = -1e30f;
@@ -645,20 +638,17 @@ sparse_mla_prefill_mg_kernel(
                 acc_o[g][t][0] = acc_o[g][t][1] = acc_o[g][t][2] = acc_o[g][t][3] = 0.f;
         }
 
-        bar_sync(2, MATH_THREADS);
-        bar_sync(0, BLOCK_THREADS);
+        bar_sync_t<2, MATH_THREADS>();
+        bar_sync_t<0, BLOCK_THREADS>();
 
-        // ---- Main loop ----
         float weights[MG_N_HG][4];
 
         for (int ni = 0; ni < NI; ni++) {
             uint8_t* kv_smem = sm.kv_bufs[ni & 1];
             const int32_t* ib = idx_base + ni * BI;
-            const int qk_nb = mwarp * 8;
+            const int qk_nb = mwarp * ENTRIES_PER_WARP;
 
-            // ============================================================
-            // PHASE 1: QK + softmax for each group (sequential)
-            // ============================================================
+            // ── PHASE 1: QK + softmax per group ─────────────────────
             #pragma unroll
             for (int g = 0; g < MG_N_HG; g++) {
                 float* g_m = sm.m_smem + g * HPB;
@@ -672,39 +662,38 @@ sparse_mla_prefill_mg_kernel(
                 compute_qk_nope(qk, sm.q_nope_fp8[g], sm.q_nope_sc[g],
                                 kv_smem, qk_nb, lane);
                 {
-                    int ne = qk_nb + gid;
-                    int entry_idx = ib[ne];
+                    int entry_idx = ib[qk_nb + gid];
                     entry_idx = (entry_idx >= 0) ? entry_idx : 0;
                     const bf16* g_rope = reinterpret_cast<const bf16*>(
-                        KV_cache + (size_t)entry_idx * KV_PACKED_BYTES
-                        + D_NOPE + NUM_SCALES * sizeof(float));
+                        KV_cache + (size_t)entry_idx * KV_PACKED_BYTES + KV_ROPE_BYTE_OFFSET);
                     compute_qk_rope(qk, q_rope_regs[g], g_rope, lane);
                 }
                 {
-                    int e0 = qk_nb + tid * 2, e1 = qk_nb + tid * 2 + 1;
+                    int e0 = qk_nb + tid * 2, e1 = e0 + 1;
                     if (ib[e0] < 0) { qk[0] = -1e30f; qk[2] = -1e30f; }
                     if (ib[e1] < 0) { qk[1] = -1e30f; qk[3] = -1e30f; }
                 }
 
-                float s[4] = { qk[0]*sm_scale_log2e, qk[1]*sm_scale_log2e,
+                float sc[4] = { qk[0]*sm_scale_log2e, qk[1]*sm_scale_log2e,
                                 qk[2]*sm_scale_log2e, qk[3]*sm_scale_log2e };
-                float lm0 = fmaxf(s[0],s[1]), lm1 = fmaxf(s[2],s[3]);
+                float lm0 = fmaxf(sc[0],sc[1]), lm1 = fmaxf(sc[2],sc[3]);
                 lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff,lm0,1));
                 lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff,lm0,2));
                 lm1 = fmaxf(lm1, __shfl_xor_sync(0xffffffff,lm1,1));
                 lm1 = fmaxf(lm1, __shfl_xor_sync(0xffffffff,lm1,2));
                 if (tid==0) { sm.reduce_buf[mwarp*HPB+gid]=lm0; sm.reduce_buf[mwarp*HPB+gid+8]=lm1; }
-                bar_sync(2, MATH_THREADS);
+                bar_sync_t<2, MATH_THREADS>();
 
                 if (threadIdx.x < HPB) {
                     int h = threadIdx.x;
                     float old_m = g_m[h], tm = -1e30f;
+                    #pragma unroll
                     for (int w = 0; w < N_MATH_WARPS; w++) tm = fmaxf(tm, sm.reduce_buf[w*HPB+h]);
                     float nm = fmaxf(old_m, tm), alpha = exp2f(old_m - nm);
                     g_m[h] = nm; g_l[h] *= alpha;
                     sm.reduce_buf[h] = alpha; sm.reduce_buf[HPB+h] = nm;
                 }
-                bar_sync(2, MATH_THREADS);
+                bar_sync_t<2, MATH_THREADS>();
 
                 float alpha0 = sm.reduce_buf[gid], alpha1 = sm.reduce_buf[gid+8];
                 float nm0 = sm.reduce_buf[HPB+gid], nm1 = sm.reduce_buf[HPB+gid+8];
@@ -714,8 +703,8 @@ sparse_mla_prefill_mg_kernel(
                     acc_o[g][t][2]*=alpha1; acc_o[g][t][3]*=alpha1;
                 }
 
-                float w0=exp2f(s[0]-nm0), w1=exp2f(s[1]-nm0);
-                float w2=exp2f(s[2]-nm1), w3=exp2f(s[3]-nm1);
+                float w0=exp2f(sc[0]-nm0), w1=exp2f(sc[1]-nm0);
+                float w2=exp2f(sc[2]-nm1), w3=exp2f(sc[3]-nm1);
                 weights[g][0]=w0; weights[g][1]=w1; weights[g][2]=w2; weights[g][3]=w3;
 
                 float ls0=w0+w1, ls1=w2+w3;
@@ -724,7 +713,7 @@ sparse_mla_prefill_mg_kernel(
                 if (tid==0) { sm.sum_reduce_buf[mwarp*HPB+gid]=ls0; sm.sum_reduce_buf[mwarp*HPB+gid+8]=ls1; }
 
                 {
-                    int e0i=qk_nb+tid*2, e1i=qk_nb+tid*2+1;
+                    int e0i=qk_nb+tid*2, e1i=e0i+1;
                     #pragma unroll
                     for (int vc = 0; vc < N_V_CHUNKS; vc++) {
                         float vsc0 = reinterpret_cast<const float*>(kv_smem+e0i*KV_SMEM_STRIDE+D_NOPE)[vc];
@@ -735,34 +724,28 @@ sparse_mla_prefill_mg_kernel(
                             __float_as_int(fmaxf(fabsf(w2*vsc0),fabsf(w3*vsc1))));
                     }
                 }
-                bar_sync(2, MATH_THREADS);
+                bar_sync_t<2, MATH_THREADS>();
 
                 if (threadIdx.x < HPB) {
                     int h = threadIdx.x; float ts = 0.f;
+                    #pragma unroll
                     for (int w = 0; w < N_MATH_WARPS; w++) ts += sm.sum_reduce_buf[w*HPB+h];
                     g_l[h] += ts;
                 }
                 for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += MATH_THREADS)
                     g_wsc[i] = fmaxf(g_wsc[i], 1e-10f) / FP8_MAX;
-                bar_sync(2, MATH_THREADS);
-            } // end Phase 1 group loop
+                bar_sync_t<2, MATH_THREADS>();
+            }
 
-            // ============================================================
-            // PHASE 2: XV — shared V transpose, per-group w_fp8 + MMA
-            // ============================================================
+            // ── PHASE 2: XV — shared V transpose, per-group w_fp8 + MMA ──
             {
-                int e0i = qk_nb + tid * 2, e1i = qk_nb + tid * 2 + 1;
+                int e0i = qk_nb + tid * 2, e1i = e0i + 1;
 
                 #pragma unroll
                 for (int vc = 0; vc < N_V_CHUNKS; vc++) {
-                    int v_off = vc * V_CHUNK;
+                    const int v_off = vc * V_CHUNK;
 
-                    // V transpose (shared across all groups)
-                    for (int idx = threadIdx.x; idx < V_CHUNK * BI; idx += MATH_THREADS) {
-                        int d = idx / BI, e = idx % BI;
-                        sm.v_trans[d * V_TRANS_STRIDE + e] =
-                            kv_smem[e * KV_SMEM_STRIDE + v_off + d];
-                    }
+                    transpose_v_chunk(sm.v_trans, kv_smem, v_off, lane);
 
                     #pragma unroll
                     for (int g = 0; g < MG_N_HG; g++) {
@@ -771,10 +754,8 @@ sparse_mla_prefill_mg_kernel(
                         float gw2=weights[g][2], gw3=weights[g][3];
 
                         float si0=1.f/g_wsc[gid], si1=1.f/g_wsc[gid+8];
-                        float vsc0 = reinterpret_cast<const float*>(
-                            kv_smem+e0i*KV_SMEM_STRIDE+D_NOPE)[vc];
-                        float vsc1 = reinterpret_cast<const float*>(
-                            kv_smem+e1i*KV_SMEM_STRIDE+D_NOPE)[vc];
+                        float vsc0 = reinterpret_cast<const float*>(kv_smem+e0i*KV_SMEM_STRIDE+D_NOPE)[vc];
+                        float vsc1 = reinterpret_cast<const float*>(kv_smem+e1i*KV_SMEM_STRIDE+D_NOPE)[vc];
                         float ws00=gw0*vsc0, ws01=gw1*vsc1, ws10=gw2*vsc0, ws11=gw3*vsc1;
                         __nv_fp8_e4m3 f00(fmaxf(-FP8_MAX,fminf(FP8_MAX,ws00*si0)));
                         __nv_fp8_e4m3 f01(fmaxf(-FP8_MAX,fminf(FP8_MAX,ws01*si0)));
@@ -785,7 +766,7 @@ sparse_mla_prefill_mg_kernel(
                         sm.w_fp8[(gid+8)*W_FP8_STRIDE+e0i]=f10.__x;
                         sm.w_fp8[(gid+8)*W_FP8_STRIDE+e1i]=f11.__x;
 
-                        bar_sync(2, MATH_THREADS); // w_fp8 + v_trans ready
+                        bar_sync_t<2, MATH_THREADS>();
 
                         #pragma unroll
                         for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
@@ -793,7 +774,7 @@ sparse_mla_prefill_mg_kernel(
                             int nl=mwarp*(NT_PER_WARP_XV*8)+nt*8;
                             float xv[4]={0.f,0.f,0.f,0.f};
                             #pragma unroll
-                            for (int kstep=0; kstep<BI/32; kstep++) {
+                            for (int kstep=0; kstep<XV_KSTEPS; kstep++) {
                                 int ko=kstep*32; uint32_t a0,a1,a2,a3,b0,b1;
                                 ldmatrix_load_A_fp8(a0,a1,a2,a3, sm.w_fp8+ko, W_FP8_STRIDE, lane);
                                 ldmatrix_load_B_fp8(b0,b1, sm.v_trans+nl*V_TRANS_STRIDE+ko, V_TRANS_STRIDE, lane);
@@ -805,32 +786,31 @@ sparse_mla_prefill_mg_kernel(
                             acc_o[g][ti][2]+=xv[2]*sc1; acc_o[g][ti][3]+=xv[3]*sc1;
                         }
 
-                        bool is_very_last = (vc == N_V_CHUNKS-1) && (g == MG_N_HG-1);
-                        if (!is_very_last)
-                            bar_sync(2, MATH_THREADS); // MMA done, protect w_fp8/v_trans
-                    } // end group loop
-                } // end V chunk loop
+                        if (!((vc == N_V_CHUNKS-1) && (g == MG_N_HG-1)))
+                            bar_sync_t<2, MATH_THREADS>();
+                    }
+                }
             }
 
-            bar_arrive(1, BLOCK_THREADS);
+            bar_arrive_t<1, BLOCK_THREADS>();
             if (ni + 1 < NI)
-                bar_sync(0, BLOCK_THREADS);
-        } // end tile loop
+                bar_sync_t<0, BLOCK_THREADS>();
+        }
 
-        // ---- Finalize ----
         #pragma unroll
         for (int g = 0; g < MG_N_HG; g++) {
             float* g_l = sm.l_smem + g * HPB;
             int g_h_base = h_start + g * HPB;
             #pragma unroll
             for (int t = 0; t < ACC_TILES; t++) {
+                constexpr int _NT8 = NT_PER_WARP_XV * 8;
                 int c=t/NT_PER_WARP_XV, lnt=t%NT_PER_WARP_XV;
-                int vb=c*V_CHUNK+mwarp*(NT_PER_WARP_XV*8)+lnt*8;
-                int h0=g_h_base+gid, h1=g_h_base+gid+8, d0=vb+tid*2, d1=vb+tid*2+1;
+                int vb=c*V_CHUNK+mwarp*_NT8+lnt*8;
+                int h0=g_h_base+gid, h1=g_h_base+gid+8, d0=vb+tid*2, d1=d0+1;
                 float il0=(g_l[gid]>0.f)?(1.f/g_l[gid]):0.f;
                 float il1=(g_l[gid+8]>0.f)?(1.f/g_l[gid+8]):0.f;
-                size_t b0=(size_t)s_i*num_heads*D_NOPE+(size_t)h0*D_NOPE;
-                size_t b1=(size_t)s_i*num_heads*D_NOPE+(size_t)h1*D_NOPE;
+                size_t b0=(size_t)s_i*NUM_HEADS*D_NOPE+(size_t)h0*D_NOPE;
+                size_t b1=(size_t)s_i*NUM_HEADS*D_NOPE+(size_t)h1*D_NOPE;
                 output[b0+d0]=__float2bfloat16(acc_o[g][t][0]*il0);
                 output[b0+d1]=__float2bfloat16(acc_o[g][t][1]*il0);
                 output[b1+d0]=__float2bfloat16(acc_o[g][t][2]*il1);
@@ -841,53 +821,70 @@ sparse_mla_prefill_mg_kernel(
 }
 
 // ============================================================================
-// Launch function — dispatches single-group or multi-group based on num_heads
+// Launch dispatcher — template instantiation + runtime dispatch
 // ============================================================================
+
+template <int NUM_HEADS>
+void launch_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+               bf16* output, float sm_scale, int num_tokens)
+{
+    constexpr size_t smem_bytes = sg::TOTAL;
+    constexpr int REPLICATE_H = NUM_HEADS / HPB;
+    dim3 grid(num_tokens * REPLICATE_H);
+    dim3 block(BLOCK_THREADS);
+
+    static bool configured = false;
+    if (!configured && smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(sparse_mla_prefill_kernel<NUM_HEADS>,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            smem_bytes);
+        configured = true;
+    }
+    sparse_mla_prefill_kernel<NUM_HEADS><<<grid, block, smem_bytes>>>(
+        Q, KV_cache, indices, output, sm_scale, num_tokens);
+}
+
+template <int NUM_HEADS>
+void launch_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+               bf16* output, float sm_scale, int num_tokens)
+{
+    constexpr size_t smem_bytes = mg::TOTAL;
+    constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA;
+    dim3 grid(num_tokens * REPLICATE_H);
+    dim3 block(BLOCK_THREADS);
+
+    static bool configured = false;
+    if (!configured && smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(sparse_mla_prefill_mg_kernel<NUM_HEADS>,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            smem_bytes);
+        configured = true;
+    }
+    sparse_mla_prefill_mg_kernel<NUM_HEADS><<<grid, block, smem_bytes>>>(
+        Q, KV_cache, indices, output, sm_scale, num_tokens);
+}
+
 void sparse_mla_prefill_launch(
     torch::Tensor Q, torch::Tensor KV_cache, torch::Tensor indices,
     torch::Tensor output, float sm_scale,
     int num_heads, int num_tokens, int topk, int BI_param)
 {
-    dim3 block(BLOCK_THREADS);
-    const int head_groups = num_heads / HPB;
+    TORCH_CHECK(topk == TOPK, "topk must be ", TOPK, " (compile-time constant); got ", topk);
 
-    if (head_groups > 1 && (head_groups % MG_N_HG == 0)) {
-        // Multi-group kernel: N_HG=2, processes 32 heads per CTA
-        constexpr size_t smem_bytes = MG_SMEM_TOTAL;
-        const int REPLICATE_H = num_heads / MG_HEADS_PER_CTA;
-        dim3 grid(num_tokens * REPLICATE_H);
+    auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
+    auto KV_ptr = reinterpret_cast<const uint8_t*>(KV_cache.data_ptr());
+    auto idx_ptr = indices.data_ptr<int32_t>();
+    auto out_ptr = reinterpret_cast<bf16*>(output.data_ptr());
 
-        static bool mg_configured = false;
-        if (!mg_configured && smem_bytes > 48 * 1024) {
-            cudaFuncSetAttribute(sparse_mla_prefill_mg_kernel,
-                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                smem_bytes);
-            mg_configured = true;
-        }
-        sparse_mla_prefill_mg_kernel<<<grid, block, smem_bytes>>>(
-            reinterpret_cast<const bf16*>(Q.data_ptr()),
-            reinterpret_cast<const uint8_t*>(KV_cache.data_ptr()),
-            indices.data_ptr<int32_t>(),
-            reinterpret_cast<bf16*>(output.data_ptr()),
-            sm_scale, num_heads, num_tokens, topk);
-    } else {
-        // Single-group kernel: original path
-        constexpr size_t smem_bytes = SMEM_TOTAL;
-        const int REPLICATE_H = num_heads / HPB;
-        dim3 grid(num_tokens * REPLICATE_H);
-
-        static bool sg_configured = false;
-        if (!sg_configured && smem_bytes > 48 * 1024) {
-            cudaFuncSetAttribute(sparse_mla_prefill_kernel,
-                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                smem_bytes);
-            sg_configured = true;
-        }
-        sparse_mla_prefill_kernel<<<grid, block, smem_bytes>>>(
-            reinterpret_cast<const bf16*>(Q.data_ptr()),
-            reinterpret_cast<const uint8_t*>(KV_cache.data_ptr()),
-            indices.data_ptr<int32_t>(),
-            reinterpret_cast<bf16*>(output.data_ptr()),
-            sm_scale, num_heads, num_tokens, topk);
+    // Dispatch: NUM_HEADS is a template parameter → REPLICATE_H, address
+    // arithmetic with NUM_HEADS*DIM, and all derived constants are constexpr.
+    // TOPK is already constexpr (2048) via common.cuh → NI, TOTAL_KV_CHUNKS, etc.
+    switch (num_heads) {
+    case 16:  launch_sg<16> (Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens); break;
+    case 32:  launch_mg<32> (Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens); break;
+    case 64:  launch_mg<64> (Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens); break;
+    case 128: launch_mg<128>(Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens); break;
+    default:
+        TORCH_CHECK(false, "num_heads must be 16, 32, 64, or 128; got ", num_heads);
     }
 }
