@@ -28,7 +28,11 @@ static constexpr int ACC_TILES = N_V_CHUNKS * NT_PER_WARP_XV;
 
 // KV entry in smem: nope FP8 (512B) + scales F32 (16B) = 528B (no rope)
 static constexpr int KV_SMEM_STRIDE = D_NOPE + NUM_SCALES * sizeof(float);  // 528
-static_assert(KV_SMEM_STRIDE == 528);
+
+// Q nope stride: 512/4=128, 128%32=0 → all rows hit same bank! Pad to 528.
+static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;  // 528 (16B padding per row)
+// V transpose stride: BI=64, 64/4=16, need padding too
+static constexpr int V_TRANS_STRIDE = BI + 4;  // 68 (4B padding per row)
 
 __device__ __forceinline__ void bar_arrive(int id, int cnt) {
     asm volatile("barrier.cta.arrive %0, %1;\n" :: "r"(id), "r"(cnt) : "memory");
@@ -81,7 +85,7 @@ sparse_mla_prefill_mma_kernel(
 
     extern __shared__ char smem_raw[];
     char* sp = smem_raw;
-    uint8_t* q_nope_fp8 = (uint8_t*)sp;  sp += HPB * D_NOPE;
+    uint8_t* q_nope_fp8 = (uint8_t*)sp;  sp += HPB * Q_NOPE_STRIDE;
     float*   q_nope_sc  = (float*)sp;    sp += HPB * NUM_SCALES * 4;
     bf16*    q_rope_smem= (bf16*)sp;     sp += HPB * D_ROPE * 2;
     uint8_t* kv_buf0    = (uint8_t*)sp;  sp += BI * KV_SMEM_STRIDE;
@@ -91,7 +95,7 @@ sparse_mla_prefill_mma_kernel(
     float*   l_smem     = (float*)sp;    sp += HPB * 4;
     uint8_t* w_fp8      = (uint8_t*)sp;  sp += HPB * BI;
     float*   w_head_sc  = (float*)sp;    sp += HPB * 4;
-    uint8_t* v_trans    = (uint8_t*)sp;  sp += V_CHUNK * BI;
+    uint8_t* v_trans    = (uint8_t*)sp;  sp += V_CHUNK * V_TRANS_STRIDE;
     uint8_t* kv_bufs[2] = {kv_buf0, kv_buf1};
 
     // ================================================================
@@ -165,7 +169,7 @@ sparse_mla_prefill_mma_kernel(
             int h=idx/D_NOPE, d=idx%D_NOPE, blk=d/QUANT_TILE;
             float si=1.f/q_nope_sc[h*NUM_SCALES+blk];
             float v=fmaxf(FP8_MIN,fminf(FP8_MAX,__bfloat162float(q_base[h*DIM+d])*si));
-            __nv_fp8_e4m3 fp8v(v); q_nope_fp8[h*D_NOPE+d]=fp8v.__x;
+            __nv_fp8_e4m3 fp8v(v); q_nope_fp8[h*Q_NOPE_STRIDE+d]=fp8v.__x;
         }
         for (int h = threadIdx.x; h < HPB; h += MATH_THREADS) { m_smem[h]=-1e30f; l_smem[h]=0.f; }
         bar_sync(2, MATH_THREADS);
@@ -191,7 +195,7 @@ sparse_mla_prefill_mma_kernel(
                 for (int ks = 0; ks < QUANT_TILE/32; ks++) {
                     int ko = blk*QUANT_TILE+ks*32;
                     uint32_t a0,a1,a2,a3,b0,b1;
-                    load_A_fp8(a0,a1,a2,a3, q_nope_fp8, D_NOPE, ko, lane);
+                    load_A_fp8(a0,a1,a2,a3, q_nope_fp8, Q_NOPE_STRIDE, ko, lane);
                     load_B_fp8(b0,b1, kv_smem, KV_SMEM_STRIDE, qk_nb, ko, lane);
                     MmaFp8Result r=mma_fp8_m16n8k32(a0,a1,a2,a3,b0,b1,ab[0],ab[1],ab[2],ab[3]);
                     ab[0]=r.d0;ab[1]=r.d1;ab[2]=r.d2;ab[3]=r.d3;
@@ -284,7 +288,7 @@ sparse_mla_prefill_mma_kernel(
                 // V transpose from smem (stride=528, nope part only)
                 for(int idx=threadIdx.x;idx<V_CHUNK*BI;idx+=MATH_THREADS){
                     int d=idx/BI,e=idx%BI;
-                    v_trans[d*BI+e]=kv_smem[e*KV_SMEM_STRIDE+v_off+d];}
+                    v_trans[d*V_TRANS_STRIDE+e]=kv_smem[e*KV_SMEM_STRIDE+v_off+d];}
                 bar_sync(2,MATH_THREADS);
                 #pragma unroll
                 for(int nt=0;nt<NT_PER_WARP_XV;nt++){
@@ -294,7 +298,7 @@ sparse_mla_prefill_mma_kernel(
                     for(int kstep=0;kstep<BI/32;kstep++){
                         int ko=kstep*32; uint32_t a0,a1,a2,a3,b0,b1;
                         load_A_fp8(a0,a1,a2,a3,w_fp8,BI,ko,lane);
-                        load_B_fp8(b0,b1,v_trans,BI,nl,ko,lane);
+                        load_B_fp8(b0,b1,v_trans,V_TRANS_STRIDE,nl,ko,lane);
                         MmaFp8Result r=mma_fp8_m16n8k32(a0,a1,a2,a3,b0,b1,xv[0],xv[1],xv[2],xv[3]);
                         xv[0]=r.d0;xv[1]=r.d1;xv[2]=r.d2;xv[3]=r.d3;}
                     float sc0=w_head_sc[gid],sc1=w_head_sc[gid+8];
@@ -333,10 +337,10 @@ void sparse_mla_prefill_launch(
     int num_heads, int num_tokens, int topk, int BI_param)
 {
     const int REPLICATE_H = num_heads / HPB;
-    size_t smem_bytes = HPB*D_NOPE + HPB*NUM_SCALES*4 + HPB*D_ROPE*2
+    size_t smem_bytes = HPB*Q_NOPE_STRIDE + HPB*NUM_SCALES*4 + HPB*D_ROPE*2
                       + 2*BI*KV_SMEM_STRIDE
                       + N_MATH_WARPS*HPB*4 + HPB*4 + HPB*4
-                      + HPB*BI + HPB*4 + V_CHUNK*BI;
+                      + HPB*BI + HPB*4 + V_CHUNK*V_TRANS_STRIDE;
 
     dim3 grid(num_tokens * REPLICATE_H);
     dim3 block(BLOCK_THREADS);
