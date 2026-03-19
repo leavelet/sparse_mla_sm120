@@ -7,7 +7,6 @@ csrc_dir = os.path.join(os.path.dirname(__file__), "sparse_mla_sm120", "csrc")
 cuda_sources = [
     os.path.join(csrc_dir, "binding.cpp"),
     os.path.join(csrc_dir, "sparse_mla_decode.cu"),
-    os.path.join(csrc_dir, "sparse_mla_combine.cu"),
     os.path.join(csrc_dir, "sparse_mla_prefill.cu"),
 ]
 
@@ -25,6 +24,7 @@ extra_compile_args = {
         "--ptxas-options=-v",
         "-DNDEBUG",
         "-lineinfo",
+        "--threads", "8",
     ],
 }
 

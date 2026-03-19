@@ -1,288 +1,611 @@
-#include "common.cuh"
-#include "smem_utils.cuh"
+#include "mla_kernel_utils.cuh"
 
 #include <torch/extension.h>
 
-// Inline FP8 E4M3 → float conversion from raw byte
-__device__ __forceinline__ float fp8e4m3_to_float(uint8_t raw) {
-    __nv_fp8_e4m3 v;
-    v.__x = raw;
-    return float(v);
+// ============================================================================
+// Sparse MLA Decode Kernel — MMA-based split-KV with in-kernel combine
+//
+// Template params: NUM_HEADS, TILES_PER_SPLIT (both constexpr).
+// NSPLITS = NI / TILES_PER_SPLIT derived at compile time.
+//
+// Each CTA computes QK + softmax + XV for its tile range, writes partial
+// results to workspace, then the last CTA per (token, head_tile) merges
+// all splits and writes the final output — no separate combine kernel.
+// ============================================================================
+
+// ── Tile geometry ───────────────────────────────────────────────────────
+static constexpr int HPB = 16;
+static constexpr int BI  = 64;
+static constexpr int NI  = TOPK / BI;                           // 32
+static constexpr int N_MATH_WARPS  = 8;
+static constexpr int N_IO_WARPS    = 4;
+static constexpr int N_TOTAL_WARPS = N_MATH_WARPS + N_IO_WARPS; // 12
+static constexpr int BLOCK_THREADS = N_TOTAL_WARPS * 32;        // 384
+static constexpr int MATH_THREADS  = N_MATH_WARPS * 32;         // 256
+static constexpr int IO_THREADS    = N_IO_WARPS * 32;           // 128
+
+static constexpr int V_CHUNK        = 128;
+static constexpr int N_V_CHUNKS     = D_NOPE / V_CHUNK;                    // 4
+static constexpr int ENTRIES_PER_WARP = BI / N_MATH_WARPS;                 // 8
+static constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / N_MATH_WARPS;         // 2
+static constexpr int ACC_TILES      = N_V_CHUNKS * NT_PER_WARP_XV;        // 8
+static constexpr int XV_KSTEPS      = BI / 32;                            // 2
+static constexpr int QK_NOPE_KSTEPS = QUANT_TILE / 32;                    // 4
+
+// ── Smem strides ────────────────────────────────────────────────────────
+static constexpr int KV_SMEM_STRIDE = D_NOPE + NUM_SCALES * sizeof(float); // 528
+static constexpr int Q_NOPE_STRIDE  = D_NOPE + 16;    // 528
+static constexpr int V_TRANS_STRIDE = BI + 16;         // 80
+static constexpr int W_FP8_STRIDE   = BI + 16;         // 80
+
+static constexpr int KV_ROPE_BYTE_OFFSET = D_NOPE + NUM_SCALES * sizeof(float);
+
+// ── Output staging ──────────────────────────────────────────────────────
+static constexpr int OUT_STAGING_STRIDE = D_NOPE + 8;    // 520 bf16 elements
+static constexpr int OUT_VEC = 8;
+static constexpr int OUT_TILES_PER_HEAD = D_NOPE / OUT_VEC; // 64
+
+// ── Smem layout ─────────────────────────────────────────────────────────
+static constexpr size_t SMEM_Q_NOPE     = HPB * Q_NOPE_STRIDE;
+static constexpr size_t SMEM_Q_SC       = HPB * NUM_SCALES * sizeof(float);
+static constexpr size_t SMEM_Q_ROPE     = HPB * D_ROPE * sizeof(bf16);
+static constexpr size_t SMEM_KV_BUF     = BI * KV_SMEM_STRIDE;
+static constexpr size_t SMEM_REDUCE     = N_MATH_WARPS * HPB * sizeof(float);
+static constexpr size_t SMEM_SUM_REDUCE = N_MATH_WARPS * HPB * sizeof(float);
+static constexpr size_t SMEM_M          = HPB * sizeof(float);
+static constexpr size_t SMEM_L          = HPB * sizeof(float);
+static constexpr size_t SMEM_W_SC_ALL   = N_V_CHUNKS * HPB * sizeof(float);
+static constexpr size_t SMEM_W_FP8      = HPB * W_FP8_STRIDE;
+static constexpr size_t SMEM_V_TRANS    = V_CHUNK * V_TRANS_STRIDE;
+
+namespace dec {
+    static constexpr size_t OFF_Q_NOPE    = 0;
+    static constexpr size_t OFF_Q_SC      = OFF_Q_NOPE    + SMEM_Q_NOPE;
+    static constexpr size_t OFF_Q_ROPE    = OFF_Q_SC      + SMEM_Q_SC;
+    static constexpr size_t OFF_KV0       = OFF_Q_ROPE    + SMEM_Q_ROPE;
+    static constexpr size_t OFF_KV1       = OFF_KV0       + SMEM_KV_BUF;
+    static constexpr size_t OFF_REDUCE    = OFF_KV1       + SMEM_KV_BUF;
+    static constexpr size_t OFF_SUM_RED   = OFF_REDUCE    + SMEM_REDUCE;
+    static constexpr size_t OFF_M         = OFF_SUM_RED   + SMEM_SUM_REDUCE;
+    static constexpr size_t OFF_L         = OFF_M         + SMEM_M;
+    static constexpr size_t OFF_W_SC_ALL  = OFF_L         + SMEM_L;
+    static constexpr size_t OFF_W_FP8     = OFF_W_SC_ALL  + SMEM_W_SC_ALL;
+    static constexpr size_t OFF_V_TRANS   = OFF_W_FP8     + SMEM_W_FP8;
+    static constexpr size_t TOTAL         = OFF_V_TRANS   + SMEM_V_TRANS;
 }
+static_assert(dec::TOTAL < 100 * 1024, "decode smem exceeds 100 KB");
 
-// -------------------------------------------------------------------
-// Decode partial kernel
-// Grid: (num_tokens * REPLICATE_H, NI)
-// Block: THREADS threads
-// Each CTA: one head-tile (HPB heads) x one KV-block (BI entries)
-// Writes partial_O [num_tokens, NI, num_heads, D_NOPE] bf16
-//        partial_LSE [num_tokens, NI, num_heads]        fp32
-// -------------------------------------------------------------------
+struct DecodeSmem {
+    uint8_t* q_nope_fp8;
+    float*   q_nope_sc;
+    bf16*    q_rope;
+    uint8_t* kv_bufs[2];
+    float*   reduce_buf;
+    float*   sum_reduce_buf;
+    float*   m_smem;
+    float*   l_smem;
+    float*   w_head_sc_all;
+    uint8_t* w_fp8;
+    uint8_t* v_trans;
 
-template <int HPB, int BI>
-__global__ void sparse_mla_decode_partial_kernel(
+    __device__ static DecodeSmem init(char* b) {
+        return {
+            (uint8_t*)(b + dec::OFF_Q_NOPE),
+            (float*)  (b + dec::OFF_Q_SC),
+            (bf16*)   (b + dec::OFF_Q_ROPE),
+            {(uint8_t*)(b + dec::OFF_KV0), (uint8_t*)(b + dec::OFF_KV1)},
+            (float*)  (b + dec::OFF_REDUCE),
+            (float*)  (b + dec::OFF_SUM_RED),
+            (float*)  (b + dec::OFF_M),
+            (float*)  (b + dec::OFF_L),
+            (float*)  (b + dec::OFF_W_SC_ALL),
+            (uint8_t*)(b + dec::OFF_W_FP8),
+            (uint8_t*)(b + dec::OFF_V_TRANS),
+        };
+    }
+};
+
+// ============================================================================
+// Decode kernel — split-KV with in-kernel combine
+// ============================================================================
+
+template <int NUM_HEADS, int TILES_PER_SPLIT>
+__global__ void __launch_bounds__(BLOCK_THREADS, 1)
+sparse_mla_decode_kernel(
     const bf16* __restrict__ Q,
     const uint8_t* __restrict__ KV_cache,
     const int32_t* __restrict__ indices,
     bf16* __restrict__ partial_O,
     float* __restrict__ partial_LSE,
+    bf16* __restrict__ output,
+    uint32_t* __restrict__ semaphores,
     float sm_scale,
-    int num_heads,
-    int num_tokens,
-    int NI)
+    int num_tokens)
 {
-    static_assert(HPB == 16 && (BI == 32 || BI == 64), "supported configs");
-    const int THREADS = blockDim.x;
-    const int tid = threadIdx.x;
+    static constexpr int REPLICATE_H = NUM_HEADS / HPB;
+    static constexpr int NSPLITS = NI / TILES_PER_SPLIT;
 
-    const int REPLICATE_H = num_heads / HPB;
     const int s_i = blockIdx.x / REPLICATE_H;
     const int h_tile = blockIdx.x % REPLICATE_H;
     const int h_start = h_tile * HPB;
-    const int kv_block = blockIdx.y;
+    const int split_idx = blockIdx.y;
     if (s_i >= num_tokens) return;
 
-    const float sm_scale_log2e = sm_scale * LOG2E;
+    constexpr int tile_start_stride = TILES_PER_SPLIT * BI;
 
-    // ---- shared memory layout ----
+    const int warp_rank = threadIdx.x / 32;
+    const int wy = warp_rank / 4;
+
     extern __shared__ char smem_raw[];
-    bf16*    q_smem     = reinterpret_cast<bf16*>(smem_raw);
-    // q_smem: [HPB, DIM]  → HPB * DIM * 2 bytes
-    uint8_t* kv_smem    = reinterpret_cast<uint8_t*>(q_smem + HPB * DIM);
-    // kv_smem: [BI, KV_PACKED_BYTES]
-    float*   score_smem = reinterpret_cast<float*>(kv_smem + BI * KV_PACKED_BYTES);
-    // score_smem: [HPB, BI]
-    int32_t* valid_smem = reinterpret_cast<int32_t*>(score_smem + HPB * BI);
-    // valid_smem: [BI]  (1 = valid, 0 = invalid)
+    DecodeSmem sm = DecodeSmem::init(smem_raw);
 
-    // ================================================================
-    // Step 1: Cooperative load of Q for this head tile
-    // ================================================================
-    {
-        const bf16* q_base = Q + (size_t)s_i * num_heads * DIM + (size_t)h_start * DIM;
-        const int q_elems = HPB * DIM; // 16 * 576 = 9216 bf16 values
-        for (int i = tid; i < q_elems; i += THREADS) {
-            q_smem[i] = q_base[i];
-        }
-    }
+    // ── IO warps ────────────────────────────────────────────────────────
+    if (wy == 2) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
 
-    // ================================================================
-    // Step 2: Gather KV entries from the pool via sparse indices
-    // ================================================================
-    {
-        const int32_t* idx_base = indices + (size_t)s_i * TOPK + kv_block * BI;
+        const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
+        const int32_t* idx_base = indices + (size_t)s_i * TOPK + split_idx * tile_start_stride;
 
-        // Load validity mask
-        for (int bi = tid; bi < BI; bi += THREADS) {
-            valid_smem[bi] = (idx_base[bi] >= 0) ? 1 : 0;
+        io_gather_tile<KV_SMEM_STRIDE, IO_THREADS, BI>(
+            sm.kv_bufs[0], idx_base, KV_cache, io_tid);
+        bar_arrive_t<0, BLOCK_THREADS>();
+
+        #pragma unroll
+        for (int ti = 0; ti < TILES_PER_SPLIT; ti++) {
+            if (ti + 1 < TILES_PER_SPLIT)
+                io_gather_tile<KV_SMEM_STRIDE, IO_THREADS, BI>(
+                    sm.kv_bufs[(ti + 1) & 1],
+                    idx_base + (ti + 1) * BI, KV_cache, io_tid);
+            bar_sync_t<1, BLOCK_THREADS>();
+            if (ti + 1 < TILES_PER_SPLIT)
+                bar_arrive_t<0, BLOCK_THREADS>();
         }
 
-        // Flatten the gather: total bytes = BI * KV_PACKED_BYTES
-        // Load 16 bytes per iteration per thread
-        constexpr int KV_TOTAL = BI * KV_PACKED_BYTES;
-        constexpr int LOAD_WIDTH = 16; // 128 bits
+    // ── Math warps ──────────────────────────────────────────────────────
+    } else {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(200));
 
-        for (int flat = tid * LOAD_WIDTH; flat < KV_TOTAL; flat += THREADS * LOAD_WIDTH) {
-            int bi = flat / KV_PACKED_BYTES;
-            int byte_off = flat % KV_PACKED_BYTES;
+        const int lane = threadIdx.x & 31;
+        const int mwarp = warp_rank;
+        const int gid = lane >> 2, tid = lane & 3;
+        const float sm_scale_log2e = sm_scale * LOG2E;
+        const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * DIM + (size_t)h_start * DIM;
+        const int32_t* idx_base = indices + (size_t)s_i * TOPK + split_idx * tile_start_stride;
 
-            int idx = idx_base[bi];
-            idx = (idx >= 0) ? idx : 0;
+        quantize_q_to_smem<HPB, Q_NOPE_STRIDE, MATH_THREADS>(
+            sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, sm.reduce_buf);
+        QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
-            const uint8_t* src = KV_cache + (size_t)idx * KV_PACKED_BYTES + byte_off;
-            uint8_t* dst = kv_smem + flat;
-
-            // 656 is divisible by 16, so boundary is aligned
-            if (byte_off + LOAD_WIDTH <= KV_PACKED_BYTES) {
-                *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
-            }
+        for (int h = threadIdx.x; h < HPB; h += MATH_THREADS) {
+            sm.m_smem[h] = -1e30f;
+            sm.l_smem[h] = 0.f;
         }
-    }
 
-    __syncthreads();
+        float acc_o[ACC_TILES][4];
+        #pragma unroll
+        for (int t = 0; t < ACC_TILES; t++)
+            acc_o[t][0] = acc_o[t][1] = acc_o[t][2] = acc_o[t][3] = 0.f;
 
-    // ================================================================
-    // Step 3: Compute scores  score[h][k] = Q_nope·K_nope + Q_rope·K_rope
-    // ================================================================
-    {
-        const int total_pairs = HPB * BI;
-        for (int pair = tid; pair < total_pairs; pair += THREADS) {
-            int h = pair / BI;
-            int k = pair % BI;
+        bar_sync_t<2, MATH_THREADS>();
+        bar_sync_t<0, BLOCK_THREADS>();
 
-            if (!valid_smem[k]) {
-                score_smem[h * BI + k] = -1e30f;
-                continue;
-            }
+        // ── Main loop — QK + softmax + XV ───────────────────────────
+        #pragma unroll
+        for (int ti = 0; ti < TILES_PER_SPLIT; ti++) {
+            uint8_t* kv_smem = sm.kv_bufs[ti & 1];
+            const int32_t* ib = idx_base + ti * BI;
+            const int qk_nb = mwarp * ENTRIES_PER_WARP;
 
-            const bf16* q_row = q_smem + h * DIM;
-            const uint8_t* kv_row = kv_smem + k * KV_PACKED_BYTES;
-            const float* k_scales = reinterpret_cast<const float*>(kv_row + D_NOPE);
-            const bf16* k_rope = reinterpret_cast<const bf16*>(kv_row + D_NOPE + NUM_SCALES * sizeof(float));
+            for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += MATH_THREADS)
+                sm.w_head_sc_all[i] = 0.f;
 
-            float score = 0.0f;
+            float qk[4] = {0.f, 0.f, 0.f, 0.f};
+            compute_qk_nope<Q_NOPE_STRIDE, KV_SMEM_STRIDE, QK_NOPE_KSTEPS>(
+                qk, sm.q_nope_fp8, sm.q_nope_sc, kv_smem, qk_nb, lane);
 
-            // Nope part: 4 blocks of 128, each with its own scale
-            #pragma unroll
-            for (int b = 0; b < NUM_SCALES; b++) {
-                float partial = 0.0f;
-                const uint8_t* k_fp8_block = kv_row + b * QUANT_TILE;
-                const bf16* q_block = q_row + b * QUANT_TILE;
-
-                // Vectorized: process 4 FP8 elements at a time
-                #pragma unroll 4
-                for (int d = 0; d < QUANT_TILE; d += 4) {
-                    uint32_t k4 = *reinterpret_cast<const uint32_t*>(k_fp8_block + d);
-                    float k0 = fp8e4m3_to_float(k4 & 0xFF);
-                    float k1 = fp8e4m3_to_float((k4 >> 8) & 0xFF);
-                    float k2 = fp8e4m3_to_float((k4 >> 16) & 0xFF);
-                    float k3 = fp8e4m3_to_float((k4 >> 24) & 0xFF);
-
-                    // Load Q as 2 x bf16
-                    float q0 = to_float(q_block[d]);
-                    float q1 = to_float(q_block[d + 1]);
-                    float q2 = to_float(q_block[d + 2]);
-                    float q3 = to_float(q_block[d + 3]);
-
-                    partial += k0 * q0 + k1 * q1 + k2 * q2 + k3 * q3;
-                }
-                score += partial * k_scales[b];
-            }
-
-            // Rope part: 64 dims, bf16 x bf16
             {
-                const bf16* q_rope = q_row + D_NOPE;
-                float rope_score = 0.0f;
-                #pragma unroll 4
-                for (int d = 0; d < D_ROPE; d += 2) {
-                    rope_score += to_float(q_rope[d])     * to_float(k_rope[d])
-                                + to_float(q_rope[d + 1]) * to_float(k_rope[d + 1]);
+                int entry_idx = ib[qk_nb + gid];
+                entry_idx = (entry_idx >= 0) ? entry_idx : 0;
+                const bf16* g_rope = reinterpret_cast<const bf16*>(
+                    KV_cache + (size_t)entry_idx * KV_PACKED_BYTES + KV_ROPE_BYTE_OFFSET);
+                compute_qk_rope(qk, q_rope_regs, g_rope, lane);
+            }
+
+            {
+                int e0 = qk_nb + tid * 2, e1 = e0 + 1;
+                if (ib[e0] < 0) { qk[0] = -1e30f; qk[2] = -1e30f; }
+                if (ib[e1] < 0) { qk[1] = -1e30f; qk[3] = -1e30f; }
+            }
+
+            float s[4] = { qk[0] * sm_scale_log2e, qk[1] * sm_scale_log2e,
+                           qk[2] * sm_scale_log2e, qk[3] * sm_scale_log2e };
+
+            float lm0 = fmaxf(s[0], s[1]), lm1 = fmaxf(s[2], s[3]);
+            lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff, lm0, 1));
+            lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff, lm0, 2));
+            lm1 = fmaxf(lm1, __shfl_xor_sync(0xffffffff, lm1, 1));
+            lm1 = fmaxf(lm1, __shfl_xor_sync(0xffffffff, lm1, 2));
+            if (tid == 0) {
+                sm.reduce_buf[mwarp * HPB + gid] = lm0;
+                sm.reduce_buf[mwarp * HPB + gid + 8] = lm1;
+            }
+            bar_sync_t<2, MATH_THREADS>();
+
+            if (threadIdx.x < HPB) {
+                int h = threadIdx.x;
+                float old_m = sm.m_smem[h], tm = -1e30f;
+                #pragma unroll
+                for (int w = 0; w < N_MATH_WARPS; w++)
+                    tm = fmaxf(tm, sm.reduce_buf[w * HPB + h]);
+                float nm = fmaxf(old_m, tm);
+                float alpha = exp2f(old_m - nm);
+                sm.m_smem[h] = nm;
+                sm.l_smem[h] *= alpha;
+                sm.reduce_buf[h] = alpha;
+                sm.reduce_buf[HPB + h] = nm;
+            }
+            bar_sync_t<2, MATH_THREADS>();
+
+            float alpha0 = sm.reduce_buf[gid], alpha1 = sm.reduce_buf[gid + 8];
+            float nm0 = sm.reduce_buf[HPB + gid], nm1 = sm.reduce_buf[HPB + gid + 8];
+
+            #pragma unroll
+            for (int t = 0; t < ACC_TILES; t++) {
+                acc_o[t][0] *= alpha0; acc_o[t][1] *= alpha0;
+                acc_o[t][2] *= alpha1; acc_o[t][3] *= alpha1;
+            }
+
+            float w0 = exp2f(s[0] - nm0), w1 = exp2f(s[1] - nm0);
+            float w2 = exp2f(s[2] - nm1), w3 = exp2f(s[3] - nm1);
+
+            float ls0 = w0 + w1, ls1 = w2 + w3;
+            ls0 += __shfl_xor_sync(0xffffffff, ls0, 1);
+            ls0 += __shfl_xor_sync(0xffffffff, ls0, 2);
+            ls1 += __shfl_xor_sync(0xffffffff, ls1, 1);
+            ls1 += __shfl_xor_sync(0xffffffff, ls1, 2);
+            if (tid == 0) {
+                sm.sum_reduce_buf[mwarp * HPB + gid] = ls0;
+                sm.sum_reduce_buf[mwarp * HPB + gid + 8] = ls1;
+            }
+
+            {
+                int e0i = qk_nb + tid * 2, e1i = e0i + 1;
+                #pragma unroll
+                for (int vc = 0; vc < N_V_CHUNKS; vc++) {
+                    float vsc0 = reinterpret_cast<const float*>(
+                        kv_smem + e0i * KV_SMEM_STRIDE + D_NOPE)[vc];
+                    float vsc1 = reinterpret_cast<const float*>(
+                        kv_smem + e1i * KV_SMEM_STRIDE + D_NOPE)[vc];
+                    float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
+                    float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
+                    atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid]),
+                        __float_as_int(fmaxf(fabsf(ws00), fabsf(ws01))));
+                    atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid + 8]),
+                        __float_as_int(fmaxf(fabsf(ws10), fabsf(ws11))));
                 }
-                score += rope_score;
+            }
+            bar_sync_t<2, MATH_THREADS>();
+
+            if (threadIdx.x < HPB) {
+                int h = threadIdx.x;
+                float ts = 0.f;
+                #pragma unroll
+                for (int w = 0; w < N_MATH_WARPS; w++)
+                    ts += sm.sum_reduce_buf[w * HPB + h];
+                sm.l_smem[h] += ts;
+            }
+            for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += MATH_THREADS)
+                sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
+            bar_sync_t<2, MATH_THREADS>();
+
+            // ── XV MMA ──────────────────────────────────────────────
+            {
+                int e0i = qk_nb + tid * 2, e1i = e0i + 1;
+
+                #pragma unroll
+                for (int vc = 0; vc < N_V_CHUNKS; vc++) {
+                    const int v_off = vc * V_CHUNK;
+                    float* vc_sc = sm.w_head_sc_all + vc * HPB;
+
+                    {
+                        float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
+                        float vsc0 = reinterpret_cast<const float*>(
+                            kv_smem + e0i * KV_SMEM_STRIDE + D_NOPE)[vc];
+                        float vsc1 = reinterpret_cast<const float*>(
+                            kv_smem + e1i * KV_SMEM_STRIDE + D_NOPE)[vc];
+                        float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
+                        float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
+                        __nv_fp8_e4m3 f00(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws00 * si0)));
+                        __nv_fp8_e4m3 f01(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws01 * si0)));
+                        __nv_fp8_e4m3 f10(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws10 * si1)));
+                        __nv_fp8_e4m3 f11(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws11 * si1)));
+                        sm.w_fp8[gid * W_FP8_STRIDE + e0i] = f00.__x;
+                        sm.w_fp8[gid * W_FP8_STRIDE + e1i] = f01.__x;
+                        sm.w_fp8[(gid + 8) * W_FP8_STRIDE + e0i] = f10.__x;
+                        sm.w_fp8[(gid + 8) * W_FP8_STRIDE + e1i] = f11.__x;
+                    }
+
+                    transpose_v_chunk<V_CHUNK, V_TRANS_STRIDE, KV_SMEM_STRIDE, MATH_THREADS, BI>(
+                        sm.v_trans, kv_smem, v_off, lane);
+                    bar_sync_t<2, MATH_THREADS>();
+
+                    #pragma unroll
+                    for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
+                        int ti_acc = vc * NT_PER_WARP_XV + nt;
+                        int nl = mwarp * (NT_PER_WARP_XV * 8) + nt * 8;
+                        float xv[4] = {0.f, 0.f, 0.f, 0.f};
+                        #pragma unroll
+                        for (int kstep = 0; kstep < XV_KSTEPS; kstep++) {
+                            int ko = kstep * 32;
+                            uint32_t a0, a1, a2, a3, b0, b1;
+                            ldmatrix_load_A_fp8(a0, a1, a2, a3,
+                                sm.w_fp8 + ko, W_FP8_STRIDE, lane);
+                            ldmatrix_load_B_fp8(b0, b1,
+                                sm.v_trans + nl * V_TRANS_STRIDE + ko,
+                                V_TRANS_STRIDE, lane);
+                            MmaFp8Result r = mma_fp8_m16n8k32(
+                                a0, a1, a2, a3, b0, b1,
+                                xv[0], xv[1], xv[2], xv[3]);
+                            xv[0] = r.d0; xv[1] = r.d1; xv[2] = r.d2; xv[3] = r.d3;
+                        }
+                        float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
+                        acc_o[ti_acc][0] += xv[0] * sc0; acc_o[ti_acc][1] += xv[1] * sc0;
+                        acc_o[ti_acc][2] += xv[2] * sc1; acc_o[ti_acc][3] += xv[3] * sc1;
+                    }
+
+                    if (vc < N_V_CHUNKS - 1)
+                        bar_sync_t<2, MATH_THREADS>();
+                }
             }
 
-            score_smem[h * BI + k] = score;
-        }
-    }
-
-    __syncthreads();
-
-    // ================================================================
-    // Step 4: Local softmax per head  &  write partial_LSE
-    // ================================================================
-    for (int h = tid; h < HPB; h += THREADS) {
-        float* row = score_smem + h * BI;
-
-        float max_val = -1e30f;
-        for (int k = 0; k < BI; k++)
-            max_val = fmaxf(max_val, row[k] * sm_scale_log2e);
-
-        float sum_exp = 0.0f;
-        for (int k = 0; k < BI; k++) {
-            float s = fast_exp2f(row[k] * sm_scale_log2e - max_val);
-            row[k] = s;
-            sum_exp += s;
+            bar_arrive_t<1, BLOCK_THREADS>();
+            if (ti + 1 < TILES_PER_SPLIT)
+                bar_sync_t<0, BLOCK_THREADS>();
         }
 
-        // Normalize
-        float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
-        for (int k = 0; k < BI; k++) row[k] *= inv_sum;
+        // ── Write partial output via smem staging ───────────────────
+        bf16* staging = reinterpret_cast<bf16*>(sm.kv_bufs[0]);
 
-        // Write LSE
-        float lse = (sum_exp > 0.0f) ? (log2f(sum_exp) + max_val) : -1e30f;
-        size_t lse_idx = (size_t)s_i * NI * num_heads
-                       + (size_t)kv_block * num_heads
-                       + (h_start + h);
-        partial_LSE[lse_idx] = lse;
-    }
+        float il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
+        float il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
 
-    __syncthreads();
+        #pragma unroll
+        for (int t = 0; t < ACC_TILES; t++) {
+            constexpr int _NT8 = NT_PER_WARP_XV * 8;
+            int c = t / NT_PER_WARP_XV, lnt = t % NT_PER_WARP_XV;
+            int d0 = c * V_CHUNK + mwarp * _NT8 + lnt * 8 + tid * 2;
+            *reinterpret_cast<bf16_2*>(&staging[gid * OUT_STAGING_STRIDE + d0]) =
+                __floats2bfloat162_rn(acc_o[t][0] * il0, acc_o[t][1] * il0);
+            *reinterpret_cast<bf16_2*>(&staging[(gid + 8) * OUT_STAGING_STRIDE + d0]) =
+                __floats2bfloat162_rn(acc_o[t][2] * il1, acc_o[t][3] * il1);
+        }
+        bar_sync_t<2, MATH_THREADS>();
 
-    // ================================================================
-    // Step 5: Compute output = weights · V_nope (dequantized)
-    // ================================================================
-    {
-        const int total_out = HPB * D_NOPE; // 16 * 512 = 8192
-        for (int elem = tid; elem < total_out; elem += THREADS) {
-            int h = elem / D_NOPE;
-            int d = elem % D_NOPE;
-            int scale_blk = d / QUANT_TILE;
-
-            const float* weights = score_smem + h * BI;
-            float acc = 0.0f;
-
-            for (int k = 0; k < BI; k++) {
-                float w = weights[k];
-                if (w == 0.0f) continue;
-
-                const uint8_t* v_row = kv_smem + k * KV_PACKED_BYTES;
-                const float* v_scales = reinterpret_cast<const float*>(v_row + D_NOPE);
-                float v_val = fp8e4m3_to_float(v_row[d]) * v_scales[scale_blk];
-                acc += w * v_val;
+        // Write partial_O to workspace
+        {
+            constexpr size_t h_stride = (size_t)D_NOPE;
+            constexpr size_t split_stride = (size_t)NUM_HEADS * D_NOPE;
+            constexpr size_t token_stride = (size_t)NSPLITS * split_stride;
+            const size_t po_base = (size_t)s_i * token_stride
+                                 + (size_t)split_idx * split_stride
+                                 + (size_t)h_start * h_stride;
+            for (int idx = threadIdx.x; idx < HPB * OUT_TILES_PER_HEAD; idx += MATH_THREADS) {
+                int h = idx / OUT_TILES_PER_HEAD;
+                int d8 = idx - h * OUT_TILES_PER_HEAD;
+                uint4 val = *reinterpret_cast<const uint4*>(
+                    &staging[h * OUT_STAGING_STRIDE + d8 * OUT_VEC]);
+                *reinterpret_cast<uint4*>(
+                    &partial_O[po_base + h * h_stride + d8 * OUT_VEC]) = val;
             }
+        }
 
-            size_t out_idx = (size_t)s_i * NI * num_heads * D_NOPE
-                           + (size_t)kv_block * num_heads * D_NOPE
-                           + (size_t)(h_start + h) * D_NOPE
-                           + d;
-            partial_O[out_idx] = to_bf16(acc);
+        // Write partial_LSE to workspace
+        if (threadIdx.x < HPB) {
+            int h = threadIdx.x;
+            float m = sm.m_smem[h];
+            float l = sm.l_smem[h];
+            float lse = (l > 0.f) ? (log2f(l) + m) : -1e30f;
+            constexpr size_t lse_split_stride = (size_t)NUM_HEADS;
+            constexpr size_t lse_token_stride = (size_t)NSPLITS * lse_split_stride;
+            size_t lse_idx = (size_t)s_i * lse_token_stride
+                           + (size_t)split_idx * lse_split_stride
+                           + (h_start + h);
+            partial_LSE[lse_idx] = lse;
+        }
+
+        // ── In-kernel combine via atomicInc ─────────────────────────
+        __threadfence();
+
+        bool is_last = false;
+        if (threadIdx.x == 0) {
+            uint32_t old;
+            constexpr uint32_t limit = NSPLITS - 1;
+            asm volatile("atom.relaxed.gpu.global.inc.u32 %0, [%1], %2;\n"
+                : "=r"(old)
+                : "l"(&semaphores[s_i * REPLICATE_H + h_tile]), "r"(limit));
+            reinterpret_cast<uint32_t*>(sm.reduce_buf)[0] = (old == limit) ? 1u : 0u;
+        }
+        bar_sync_t<2, MATH_THREADS>();
+        is_last = (reinterpret_cast<uint32_t*>(sm.reduce_buf)[0] == 1u);
+
+        if (!is_last) return;
+
+        // ── Last CTA: merge all NSPLITS and write final output ──────
+        // Optimized: use own acc_o as seed, direct global reads (no smem
+        // staging / barriers in merge loop), only smem for final output.
+        __threadfence();
+
+        float* lse_buf = sm.reduce_buf;
+
+        // Load all LSE values into smem (single cooperative load + 1 barrier)
+        for (int i = threadIdx.x; i < NSPLITS * HPB; i += MATH_THREADS) {
+            int sp = i / HPB, h = i % HPB;
+            constexpr size_t lse_split_stride2 = (size_t)NUM_HEADS;
+            constexpr size_t lse_token_stride2 = (size_t)NSPLITS * lse_split_stride2;
+            size_t lse_idx = (size_t)s_i * lse_token_stride2
+                           + (size_t)sp * lse_split_stride2
+                           + (h_start + h);
+            lse_buf[sp * HPB + h] = partial_LSE[lse_idx];
+        }
+        bar_sync_t<2, MATH_THREADS>();
+
+        // Own LSE (already in smem from above, or compute from m/l)
+        float my_lse0 = lse_buf[split_idx * HPB + gid];
+        float my_lse1 = lse_buf[split_idx * HPB + gid + 8];
+
+        // Find max LSE across all splits
+        float max_lse0 = my_lse0, max_lse1 = my_lse1;
+        #pragma unroll
+        for (int sp = 0; sp < NSPLITS; sp++) {
+            max_lse0 = fmaxf(max_lse0, lse_buf[sp * HPB + gid]);
+            max_lse1 = fmaxf(max_lse1, lse_buf[sp * HPB + gid + 8]);
+        }
+
+        // Seed merge_acc from own acc_o (float32, no bf16 round-trip)
+        float my_sc0 = exp2f(my_lse0 - max_lse0);
+        float my_sc1 = exp2f(my_lse1 - max_lse1);
+        float scale_sum0 = my_sc0, scale_sum1 = my_sc1;
+
+        // acc_o is un-normalized. merge_acc = normalized * scale = (acc_o * il) * sc
+        float merge_acc[ACC_TILES][4];
+        #pragma unroll
+        for (int t = 0; t < ACC_TILES; t++) {
+            merge_acc[t][0] = acc_o[t][0] * il0 * my_sc0;
+            merge_acc[t][1] = acc_o[t][1] * il0 * my_sc0;
+            merge_acc[t][2] = acc_o[t][2] * il1 * my_sc1;
+            merge_acc[t][3] = acc_o[t][3] * il1 * my_sc1;
+        }
+
+        // Merge other NSPLITS-1 splits — direct global reads, NO barriers
+        constexpr size_t po_split_stride = (size_t)NUM_HEADS * D_NOPE;
+        constexpr size_t po_token_stride = (size_t)NSPLITS * po_split_stride;
+        const size_t po_token_base = (size_t)s_i * po_token_stride
+                                   + (size_t)h_start * D_NOPE;
+
+        #pragma unroll 1
+        for (int sp = 0; sp < NSPLITS; sp++) {
+            if (sp == split_idx) continue;
+
+            float sc0 = exp2f(lse_buf[sp * HPB + gid] - max_lse0);
+            float sc1 = exp2f(lse_buf[sp * HPB + gid + 8] - max_lse1);
+            scale_sum0 += sc0;
+            scale_sum1 += sc1;
+
+            const bf16* po_ptr = partial_O + po_token_base
+                               + (size_t)sp * po_split_stride;
+
+            #pragma unroll
+            for (int t = 0; t < ACC_TILES; t++) {
+                constexpr int _NT8 = NT_PER_WARP_XV * 8;
+                int c = t / NT_PER_WARP_XV, lnt = t % NT_PER_WARP_XV;
+                int d0 = c * V_CHUNK + mwarp * _NT8 + lnt * 8 + tid * 2;
+
+                merge_acc[t][0] += sc0 * to_float(po_ptr[gid * D_NOPE + d0]);
+                merge_acc[t][1] += sc0 * to_float(po_ptr[gid * D_NOPE + d0 + 1]);
+                merge_acc[t][2] += sc1 * to_float(po_ptr[(gid + 8) * D_NOPE + d0]);
+                merge_acc[t][3] += sc1 * to_float(po_ptr[(gid + 8) * D_NOPE + d0 + 1]);
+            }
+        }
+
+        // Normalize and write to smem staging for coalesced output
+        float inv0 = (scale_sum0 > 0.f) ? (1.f / scale_sum0) : 0.f;
+        float inv1 = (scale_sum1 > 0.f) ? (1.f / scale_sum1) : 0.f;
+
+        #pragma unroll
+        for (int t = 0; t < ACC_TILES; t++) {
+            constexpr int _NT8 = NT_PER_WARP_XV * 8;
+            int c = t / NT_PER_WARP_XV, lnt = t % NT_PER_WARP_XV;
+            int d0 = c * V_CHUNK + mwarp * _NT8 + lnt * 8 + tid * 2;
+            *reinterpret_cast<bf16_2*>(&staging[gid * OUT_STAGING_STRIDE + d0]) =
+                __floats2bfloat162_rn(merge_acc[t][0] * inv0, merge_acc[t][1] * inv0);
+            *reinterpret_cast<bf16_2*>(&staging[(gid + 8) * OUT_STAGING_STRIDE + d0]) =
+                __floats2bfloat162_rn(merge_acc[t][2] * inv1, merge_acc[t][3] * inv1);
+        }
+        bar_sync_t<2, MATH_THREADS>();
+
+        // Coalesced write to final output
+        {
+            const size_t out_base = (size_t)s_i * NUM_HEADS * D_NOPE
+                                  + (size_t)h_start * D_NOPE;
+            for (int idx = threadIdx.x; idx < HPB * OUT_TILES_PER_HEAD; idx += MATH_THREADS) {
+                int h = idx / OUT_TILES_PER_HEAD;
+                int d8 = idx - h * OUT_TILES_PER_HEAD;
+                uint4 val = *reinterpret_cast<const uint4*>(
+                    &staging[h * OUT_STAGING_STRIDE + d8 * OUT_VEC]);
+                *reinterpret_cast<uint4*>(
+                    &output[out_base + h * D_NOPE + d8 * OUT_VEC]) = val;
+            }
         }
     }
 }
 
-// -------------------------------------------------------------------
-// Launch wrapper
-// -------------------------------------------------------------------
+// ============================================================================
+// Launch helpers
+// ============================================================================
 
-void sparse_mla_decode_partial_launch(
-    torch::Tensor Q,
-    torch::Tensor KV_cache,
-    torch::Tensor indices,
-    torch::Tensor partial_O,
-    torch::Tensor partial_LSE,
-    float sm_scale,
-    int num_heads,
-    int num_tokens,
-    int topk,
-    int BI_param)
+template <int NUM_HEADS, int TILES_PER_SPLIT>
+void launch_decode(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+                   bf16* partial_O, float* partial_LSE,
+                   bf16* output, uint32_t* semaphores,
+                   float sm_scale, int num_tokens)
 {
-    const int HPB = 16;
-    const int BI = BI_param;
-    const int NI = topk / BI;
-    const int REPLICATE_H = num_heads / HPB;
-    const int THREADS = 256;
+    constexpr size_t smem_bytes = dec::TOTAL;
+    constexpr int REPLICATE_H = NUM_HEADS / HPB;
+    constexpr int NSPLITS = NI / TILES_PER_SPLIT;
+    dim3 grid(num_tokens * REPLICATE_H, NSPLITS);
+    dim3 block(BLOCK_THREADS);
 
-    // Shared memory size
-    size_t smem_bytes = HPB * DIM * sizeof(bf16)          // q_smem
-                      + BI * KV_PACKED_BYTES               // kv_smem
-                      + HPB * BI * sizeof(float)           // score_smem
-                      + BI * sizeof(int32_t);              // valid_smem
-
-    dim3 grid(num_tokens * REPLICATE_H, NI);
-    dim3 block(THREADS);
-
-    if (smem_bytes > 48 * 1024) {
-        cudaFuncSetAttribute(
-            sparse_mla_decode_partial_kernel<16, 64>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem_bytes);
+    static bool configured = false;
+    if (!configured && smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(sparse_mla_decode_kernel<NUM_HEADS, TILES_PER_SPLIT>,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            smem_bytes);
+        configured = true;
     }
+    sparse_mla_decode_kernel<NUM_HEADS, TILES_PER_SPLIT><<<grid, block, smem_bytes>>>(
+        Q, KV_cache, indices, partial_O, partial_LSE,
+        output, semaphores, sm_scale, num_tokens);
+}
 
-    if (BI == 32) {
-        sparse_mla_decode_partial_kernel<16, 32><<<grid, block, smem_bytes>>>(
-            reinterpret_cast<const bf16*>(Q.data_ptr()),
-            reinterpret_cast<const uint8_t*>(KV_cache.data_ptr()),
-            indices.data_ptr<int32_t>(),
-            reinterpret_cast<bf16*>(partial_O.data_ptr()),
-            partial_LSE.data_ptr<float>(),
-            sm_scale, num_heads, num_tokens, NI);
-    } else {
-        sparse_mla_decode_partial_kernel<16, 64><<<grid, block, smem_bytes>>>(
-            reinterpret_cast<const bf16*>(Q.data_ptr()),
-            reinterpret_cast<const uint8_t*>(KV_cache.data_ptr()),
-            indices.data_ptr<int32_t>(),
-            reinterpret_cast<bf16*>(partial_O.data_ptr()),
-            partial_LSE.data_ptr<float>(),
-            sm_scale, num_heads, num_tokens, NI);
+template <int NUM_HEADS>
+void dispatch_tiles(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+                    bf16* partial_O, float* partial_LSE,
+                    bf16* output, uint32_t* semaphores,
+                    float sm_scale, int num_tokens, int tiles_per_split)
+{
+    switch (tiles_per_split) {
+    case 2:  launch_decode<NUM_HEADS, 2> (Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens); break;
+    case 4:  launch_decode<NUM_HEADS, 4> (Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens); break;
+    case 8:  launch_decode<NUM_HEADS, 8> (Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens); break;
+    case 16: launch_decode<NUM_HEADS, 16>(Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens); break;
+    case 32: launch_decode<NUM_HEADS, 32>(Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens); break;
+    default: TORCH_CHECK(false, "tiles_per_split must be 2,4,8,16,32; got ", tiles_per_split);
+    }
+}
+
+void sparse_mla_decode_launch(
+    torch::Tensor Q, torch::Tensor KV_cache, torch::Tensor indices,
+    torch::Tensor partial_O, torch::Tensor partial_LSE,
+    torch::Tensor output, torch::Tensor semaphores,
+    float sm_scale, int num_heads, int num_tokens, int topk,
+    int tiles_per_split, int nsplits)
+{
+    TORCH_CHECK(topk == TOPK, "topk must be ", TOPK);
+    TORCH_CHECK(num_tokens <= 64, "decode path requires num_tokens <= 64; got ", num_tokens);
+
+    auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
+    auto KV_ptr = reinterpret_cast<const uint8_t*>(KV_cache.data_ptr());
+    auto idx_ptr = indices.data_ptr<int32_t>();
+    auto PO_ptr = reinterpret_cast<bf16*>(partial_O.data_ptr());
+    auto LSE_ptr = partial_LSE.data_ptr<float>();
+    auto O_ptr = reinterpret_cast<bf16*>(output.data_ptr());
+    auto sem_ptr = reinterpret_cast<uint32_t*>(semaphores.data_ptr<int32_t>());
+
+    switch (num_heads) {
+    case 16:  dispatch_tiles<16> (Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split); break;
+    case 32:  dispatch_tiles<32> (Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split); break;
+    case 64:  dispatch_tiles<64> (Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split); break;
+    case 128: dispatch_tiles<128>(Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split); break;
+    default:  TORCH_CHECK(false, "num_heads must be 16,32,64,128; got ", num_heads);
     }
 }

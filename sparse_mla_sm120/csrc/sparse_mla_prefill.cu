@@ -1,6 +1,4 @@
-#include "common.cuh"
-#include "mma_sm120.cuh"
-#include "smem_utils.cuh"
+#include "mla_kernel_utils.cuh"
 
 #include <torch/extension.h>
 
@@ -28,7 +26,6 @@ static constexpr int N_V_CHUNKS     = D_NOPE / V_CHUNK;                    // 4
 static constexpr int ENTRIES_PER_WARP = BI / N_MATH_WARPS;                 // 8
 static constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / N_MATH_WARPS;         // 2
 static constexpr int ACC_TILES      = N_V_CHUNKS * NT_PER_WARP_XV;        // 8
-static constexpr int N_ROPE_CHUNKS  = D_ROPE / 16;                        // 4
 static constexpr int XV_KSTEPS      = BI / 32;                            // 2
 static constexpr int QK_NOPE_KSTEPS = QUANT_TILE / 32;                    // 4
 
@@ -37,12 +34,6 @@ static constexpr int KV_SMEM_STRIDE = D_NOPE + NUM_SCALES * sizeof(float); // 52
 static constexpr int Q_NOPE_STRIDE  = D_NOPE + 16;    // 528: stride/4=132, 132%32=4
 static constexpr int V_TRANS_STRIDE = BI + 16;         // 80: 16B-aligned, 80/4=20, 20%32=20
 static constexpr int W_FP8_STRIDE   = BI + 16;         // 80: 16B-aligned
-
-// ── KV gather constants ─────────────────────────────────────────────────
-static constexpr int CP_BYTES = 16;
-static constexpr int CHUNKS_PER_KV_ENTRY = KV_SMEM_STRIDE / CP_BYTES;     // 33
-static_assert(KV_SMEM_STRIDE % CP_BYTES == 0, "stride must be 16B-aligned");
-static constexpr int TOTAL_KV_CHUNKS = BI * CHUNKS_PER_KV_ENTRY;          // 2112
 
 // ── KV cache layout ─────────────────────────────────────────────────────
 static constexpr int KV_ROPE_BYTE_OFFSET = D_NOPE + NUM_SCALES * sizeof(float); // 528
@@ -69,6 +60,8 @@ static constexpr size_t SMEM_W_SC_ALL   = N_V_CHUNKS * HPB * sizeof(float);
 static constexpr size_t SMEM_W_FP8      = HPB * W_FP8_STRIDE;
 static constexpr size_t SMEM_V_TRANS    = V_CHUNK * V_TRANS_STRIDE;
 
+static constexpr size_t SMEM_MBAR_KV = 2 * sizeof(uint64_t);  // 16 bytes, double-buffered
+
 // Single-group kernel smem offsets
 namespace sg {
     static constexpr size_t OFF_Q_NOPE    = 0;
@@ -83,7 +76,8 @@ namespace sg {
     static constexpr size_t OFF_W_SC_ALL  = OFF_L         + SMEM_L;
     static constexpr size_t OFF_W_FP8     = OFF_W_SC_ALL  + SMEM_W_SC_ALL;
     static constexpr size_t OFF_V_TRANS   = OFF_W_FP8     + SMEM_W_FP8;
-    static constexpr size_t TOTAL         = OFF_V_TRANS   + SMEM_V_TRANS;
+    static constexpr size_t OFF_MBAR_KV   = (OFF_V_TRANS + SMEM_V_TRANS + 7) / 8 * 8;
+    static constexpr size_t TOTAL         = OFF_MBAR_KV   + SMEM_MBAR_KV;
 }
 
 // Multi-group kernel smem offsets (N_HG=2)
@@ -104,39 +98,54 @@ namespace mg {
     static constexpr size_t OFF_W_SC_ALL  = OFF_L         + MG_N_HG * SMEM_L;
     static constexpr size_t OFF_W_FP8     = OFF_W_SC_ALL  + MG_N_HG * SMEM_W_SC_ALL;
     static constexpr size_t OFF_V_TRANS   = OFF_W_FP8     + SMEM_W_FP8;
-    static constexpr size_t TOTAL         = OFF_V_TRANS   + SMEM_V_TRANS;
+    static constexpr size_t OFF_MBAR_KV   = (OFF_V_TRANS + SMEM_V_TRANS + 7) / 8 * 8;
+    static constexpr size_t TOTAL         = OFF_MBAR_KV   + SMEM_MBAR_KV;
 }
 
 static_assert(sg::TOTAL < 100 * 1024, "SG smem exceeds 100 KB");
 static_assert(mg::TOTAL < 100 * 1024, "MG smem exceeds 100 KB");
 
-// ── Barrier helpers — ID as immediate, count as register ────────────────
-template <int ID, int CNT>
-__device__ __forceinline__ void bar_arrive_t() {
-    asm volatile("barrier.cta.arrive %0, %1;\n" :: "n"(ID), "r"(CNT) : "memory");
-}
-template <int ID, int CNT>
-__device__ __forceinline__ void bar_sync_t() {
-    asm volatile("barrier.cta.sync %0, %1;\n" :: "n"(ID), "r"(CNT) : "memory");
+// ── Wrappers for shared utility functions with prefill-specific constants ──
+
+__device__ __forceinline__ void prefill_io_gather_tile(
+    uint8_t* dst, const int32_t* ib,
+    const uint8_t* __restrict__ KV_cache, int io_tid)
+{
+    io_gather_tile<KV_SMEM_STRIDE, IO_THREADS, BI>(dst, ib, KV_cache, io_tid);
 }
 
-__device__ __forceinline__ void cp_async_16B_l2(void* smem_ptr, const void* gmem_ptr) {
-    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    asm volatile(
-        "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-        :: "r"(addr), "l"(gmem_ptr));
+__device__ __forceinline__ void prefill_io_bulk_gather_tile(
+    uint8_t* dst, const int32_t* ib,
+    const uint8_t* __restrict__ KV_cache,
+    uint64_t* mbar, int io_tid)
+{
+    io_bulk_gather_tile<KV_SMEM_STRIDE, IO_THREADS, BI>(
+        dst, ib, KV_cache, mbar, io_tid);
 }
 
-// ── V transpose helper ──────────────────────────────────────────────────
-__device__ __forceinline__ void transpose_v_chunk(
+__device__ __forceinline__ void prefill_quantize_q(
+    uint8_t* q_nope_fp8, float* q_nope_sc, bf16* q_rope,
+    const bf16* q_base, float* reduce_buf)
+{
+    quantize_q_to_smem<HPB, Q_NOPE_STRIDE, MATH_THREADS>(
+        q_nope_fp8, q_nope_sc, q_rope, q_base, reduce_buf);
+}
+
+__device__ __forceinline__ void prefill_compute_qk_nope(
+    float qk[4], const uint8_t* q_nope_fp8, const float* q_nope_sc,
+    const uint8_t* kv_smem, int qk_nb, int lane)
+{
+    compute_qk_nope<Q_NOPE_STRIDE, KV_SMEM_STRIDE, QK_NOPE_KSTEPS>(
+        qk, q_nope_fp8, q_nope_sc, kv_smem, qk_nb, lane);
+}
+
+__device__ __forceinline__ void prefill_transpose_v_chunk(
     uint8_t* __restrict__ v_trans,
     const uint8_t* __restrict__ kv_smem,
-    int v_off, int /*lane*/)
+    int v_off, int lane)
 {
-    for (int idx = threadIdx.x; idx < V_CHUNK * BI; idx += MATH_THREADS) {
-        int d = idx >> 6, e = idx & 63;
-        v_trans[d * V_TRANS_STRIDE + e] = kv_smem[e * KV_SMEM_STRIDE + v_off + d];
-    }
+    transpose_v_chunk<V_CHUNK, V_TRANS_STRIDE, KV_SMEM_STRIDE, MATH_THREADS, BI>(
+        v_trans, kv_smem, v_off, lane);
 }
 
 // ── Smem layout structs — constexpr offsets ─────────────────────────────
@@ -152,6 +161,7 @@ struct PrefillSmem {
     float*   w_head_sc_all;
     uint8_t* w_fp8;
     uint8_t* v_trans;
+    uint64_t* mbar_kv;
 
     __device__ static PrefillSmem init(char* b) {
         return {
@@ -166,6 +176,7 @@ struct PrefillSmem {
             (float*)  (b + sg::OFF_W_SC_ALL),
             (uint8_t*)(b + sg::OFF_W_FP8),
             (uint8_t*)(b + sg::OFF_V_TRANS),
+            (uint64_t*)(b + sg::OFF_MBAR_KV),
         };
     }
 };
@@ -181,6 +192,7 @@ struct PrefillSmemMG {
     float*   w_head_sc_all;
     uint8_t* w_fp8;
     uint8_t* v_trans;
+    uint64_t* mbar_kv;
 
     __device__ static PrefillSmemMG init(char* b) {
         PrefillSmemMG s;
@@ -197,127 +209,12 @@ struct PrefillSmemMG {
         s.w_head_sc_all = (float*)  (b + mg::OFF_W_SC_ALL);
         s.w_fp8         = (uint8_t*)(b + mg::OFF_W_FP8);
         s.v_trans       = (uint8_t*)(b + mg::OFF_V_TRANS);
+        s.mbar_kv       = (uint64_t*)(b + mg::OFF_MBAR_KV);
         return s;
     }
     __device__ bf16* q_rope_staging() { return (bf16*)v_trans; }
 };
 
-// ── IO path: gather KV tile ─────────────────────────────────────────────
-__device__ __forceinline__ void io_gather_tile(
-    uint8_t* dst, const int32_t* ib,
-    const uint8_t* __restrict__ KV_cache, int io_tid)
-{
-    #pragma unroll 1
-    for (int c = io_tid; c < TOTAL_KV_CHUNKS; c += IO_THREADS) {
-        int bi = c / CHUNKS_PER_KV_ENTRY;
-        int bo = (c - bi * CHUNKS_PER_KV_ENTRY) * CP_BYTES;
-        int idx = ib[bi]; idx = (idx >= 0) ? idx : 0;
-        cp_async_16B_l2(dst + bi * KV_SMEM_STRIDE + bo,
-                        KV_cache + (size_t)idx * KV_PACKED_BYTES + bo);
-    }
-    cp_async_commit();
-    cp_async_wait_all();
-}
-
-// ── Q quantization ──────────────────────────────────────────────────────
-__device__ __forceinline__ void quantize_q_to_smem(
-    uint8_t* q_nope_fp8, float* q_nope_sc, bf16* q_rope,
-    const bf16* q_base, float* reduce_buf)
-{
-    float* amax = reduce_buf;
-    for (int i = threadIdx.x; i < HPB * D_ROPE; i += MATH_THREADS) {
-        int h = i / D_ROPE, d = i % D_ROPE;
-        q_rope[h * D_ROPE + d] = q_base[h * DIM + D_NOPE + d];
-    }
-    for (int i = threadIdx.x; i < HPB * NUM_SCALES; i += MATH_THREADS)
-        amax[i] = 0.f;
-    bar_sync_t<2, MATH_THREADS>();
-
-    for (int idx = threadIdx.x; idx < HPB * D_NOPE; idx += MATH_THREADS) {
-        int h = idx / D_NOPE, blk = (idx % D_NOPE) / QUANT_TILE;
-        atomicMax(reinterpret_cast<int*>(&amax[h * NUM_SCALES + blk]),
-                  __float_as_int(fabsf(__bfloat162float(q_base[h * DIM + idx % D_NOPE]))));
-    }
-    bar_sync_t<2, MATH_THREADS>();
-
-    for (int i = threadIdx.x; i < HPB * NUM_SCALES; i += MATH_THREADS)
-        q_nope_sc[i] = fmaxf(amax[i], 1e-4f) / FP8_MAX;
-    bar_sync_t<2, MATH_THREADS>();
-
-    for (int idx = threadIdx.x; idx < HPB * D_NOPE; idx += MATH_THREADS) {
-        int h = idx / D_NOPE, d = idx % D_NOPE, blk = d / QUANT_TILE;
-        float si = 1.f / q_nope_sc[h * NUM_SCALES + blk];
-        float v = fmaxf(FP8_MIN, fminf(FP8_MAX, __bfloat162float(q_base[h * DIM + d]) * si));
-        __nv_fp8_e4m3 fp8v(v);
-        q_nope_fp8[h * Q_NOPE_STRIDE + d] = fp8v.__x;
-    }
-}
-
-// ── QK nope MMA ─────────────────────────────────────────────────────────
-__device__ __forceinline__ void compute_qk_nope(
-    float qk[4], const uint8_t* q_nope_fp8, const float* q_nope_sc,
-    const uint8_t* kv_smem, int qk_nb, int lane)
-{
-    const int gid = lane >> 2, tid = lane & 3;
-    #pragma unroll
-    for (int blk = 0; blk < NUM_SCALES; blk++) {
-        float ab[4] = {0.f, 0.f, 0.f, 0.f};
-        #pragma unroll
-        for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
-            int ko = blk * QUANT_TILE + ks * 32;
-            uint32_t a0, a1, a2, a3, b0, b1;
-            ldmatrix_load_A_fp8(a0, a1, a2, a3,
-                q_nope_fp8 + ko, Q_NOPE_STRIDE, lane);
-            ldmatrix_load_B_fp8(b0, b1,
-                kv_smem + qk_nb * KV_SMEM_STRIDE + ko, KV_SMEM_STRIDE, lane);
-            MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1,
-                                               ab[0], ab[1], ab[2], ab[3]);
-            ab[0] = r.d0; ab[1] = r.d1; ab[2] = r.d2; ab[3] = r.d3;
-        }
-        float qs0 = q_nope_sc[gid * NUM_SCALES + blk];
-        float qs1 = q_nope_sc[(gid + 8) * NUM_SCALES + blk];
-        int e0 = qk_nb + tid * 2, e1 = e0 + 1;
-        float k0 = reinterpret_cast<const float*>(kv_smem + e0 * KV_SMEM_STRIDE + D_NOPE)[blk];
-        float k1 = reinterpret_cast<const float*>(kv_smem + e1 * KV_SMEM_STRIDE + D_NOPE)[blk];
-        qk[0] += ab[0] * qs0 * k0; qk[1] += ab[1] * qs0 * k1;
-        qk[2] += ab[2] * qs1 * k0; qk[3] += ab[3] * qs1 * k1;
-    }
-}
-
-// ── Q rope registers ────────────────────────────────────────────────────
-struct QRopeRegs {
-    uint32_t a[N_ROPE_CHUNKS][4];
-};
-
-__device__ __forceinline__ QRopeRegs preload_q_rope_regs(
-    const bf16* q_rope_smem, int lane)
-{
-    QRopeRegs regs;
-    #pragma unroll
-    for (int ks = 0; ks < N_ROPE_CHUNKS; ks++)
-        ldmatrix_load_A_bf16(regs.a[ks][0], regs.a[ks][1],
-                              regs.a[ks][2], regs.a[ks][3],
-                              q_rope_smem + ks * 16, D_ROPE, lane);
-    return regs;
-}
-
-__device__ __forceinline__ void compute_qk_rope(
-    float qk[4], const QRopeRegs& qr, const bf16* g_rope, int lane)
-{
-    const int tid = lane & 3;
-    float ra[4] = {0.f, 0.f, 0.f, 0.f};
-    #pragma unroll
-    for (int ks = 0; ks < N_ROPE_CHUNKS; ks++) {
-        int ko = ks * 16;
-        uint32_t b0 = *reinterpret_cast<const uint32_t*>(g_rope + ko + tid * 2);
-        uint32_t b1 = *reinterpret_cast<const uint32_t*>(g_rope + ko + 8 + tid * 2);
-        MmaBf16Result r = mma_bf16_m16n8k16(
-            qr.a[ks][0], qr.a[ks][1], qr.a[ks][2], qr.a[ks][3],
-            b0, b1, ra[0], ra[1], ra[2], ra[3]);
-        ra[0] = r.d0; ra[1] = r.d1; ra[2] = r.d2; ra[3] = r.d3;
-    }
-    qk[0] += ra[0]; qk[1] += ra[1]; qk[2] += ra[2]; qk[3] += ra[3];
-}
 
 // ============================================================================
 // Single-group prefill kernel (num_heads <= 16, memory-bound, 88% BW)
@@ -343,22 +240,28 @@ sparse_mla_prefill_kernel(
     extern __shared__ char smem_raw[];
     PrefillSmem sm = PrefillSmem::init(smem_raw);
 
+    // Initialize mbarriers before warp specialization (use barrier 3 for sync)
+    if (threadIdx.x == 0) {
+        mbarrier_init(sm.mbar_kv + 0, 1);
+        mbarrier_init(sm.mbar_kv + 1, 1);
+    }
+    bar_sync_t<3, BLOCK_THREADS>();
+
     if (wy == 2) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
 
         const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
         const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
-        io_gather_tile(sm.kv_bufs[0], idx_base, KV_cache, io_tid);
-        bar_arrive_t<0, BLOCK_THREADS>();
+        prefill_io_bulk_gather_tile(sm.kv_bufs[0], idx_base,
+                                    KV_cache, sm.mbar_kv + 0, io_tid);
 
         for (int ni = 0; ni < NI; ni++) {
             if (ni + 1 < NI)
-                io_gather_tile(sm.kv_bufs[(ni + 1) & 1],
-                               idx_base + (ni + 1) * BI, KV_cache, io_tid);
+                prefill_io_bulk_gather_tile(sm.kv_bufs[(ni + 1) & 1],
+                               idx_base + (ni + 1) * BI, KV_cache,
+                               sm.mbar_kv + ((ni + 1) & 1), io_tid);
             bar_sync_t<1, BLOCK_THREADS>();
-            if (ni + 1 < NI)
-                bar_arrive_t<0, BLOCK_THREADS>();
         }
 
     } else {
@@ -371,7 +274,7 @@ sparse_mla_prefill_kernel(
         const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * DIM + (size_t)h_start * DIM;
         const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
-        quantize_q_to_smem(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope,
+        prefill_quantize_q(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope,
                            q_base, sm.reduce_buf);
         QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
@@ -386,7 +289,7 @@ sparse_mla_prefill_kernel(
             acc_o[t][0] = acc_o[t][1] = acc_o[t][2] = acc_o[t][3] = 0.f;
 
         bar_sync_t<2, MATH_THREADS>();
-        bar_sync_t<0, BLOCK_THREADS>();
+        mbarrier_wait_parity(sm.mbar_kv + 0, 0);
 
         for (int ni = 0; ni < NI; ni++) {
             uint8_t* kv_smem = sm.kv_bufs[ni & 1];
@@ -397,7 +300,7 @@ sparse_mla_prefill_kernel(
                 sm.w_head_sc_all[i] = 0.f;
 
             float qk[4] = {0.f, 0.f, 0.f, 0.f};
-            compute_qk_nope(qk, sm.q_nope_fp8, sm.q_nope_sc, kv_smem, qk_nb, lane);
+            prefill_compute_qk_nope(qk, sm.q_nope_fp8, sm.q_nope_sc, kv_smem, qk_nb, lane);
 
             {
                 int entry_idx = ib[qk_nb + gid];
@@ -522,7 +425,7 @@ sparse_mla_prefill_kernel(
                         sm.w_fp8[(gid + 8) * W_FP8_STRIDE + e1i] = f11.__x;
                     }
 
-                    transpose_v_chunk(sm.v_trans, kv_smem, v_off, lane);
+                    prefill_transpose_v_chunk(sm.v_trans, kv_smem, v_off, lane);
                     bar_sync_t<2, MATH_THREADS>();
 
                     #pragma unroll
@@ -555,8 +458,10 @@ sparse_mla_prefill_kernel(
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();
-            if (ni + 1 < NI)
-                bar_sync_t<0, BLOCK_THREADS>();
+            if (ni + 1 < NI) {
+                const int next_phase = ((ni + 1) >> 1) & 1;
+                mbarrier_wait_parity(sm.mbar_kv + ((ni + 1) & 1), next_phase);
+            }
         }
 
         // ── Coalesced output via smem staging ───────────────────
@@ -618,19 +523,25 @@ sparse_mla_prefill_mg_kernel(
     extern __shared__ char smem_raw[];
     PrefillSmemMG sm = PrefillSmemMG::init(smem_raw);
 
+    // Initialize mbarriers before warp specialization (use barrier 3 for sync)
+    if (threadIdx.x == 0) {
+        mbarrier_init(sm.mbar_kv + 0, 1);
+        mbarrier_init(sm.mbar_kv + 1, 1);
+    }
+    bar_sync_t<3, BLOCK_THREADS>();
+
     if (wy == 2) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
         const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
         const int32_t* idx_base = indices + (size_t)s_i * TOPK;
-        io_gather_tile(sm.kv_bufs[0], idx_base, KV_cache, io_tid);
-        bar_arrive_t<0, BLOCK_THREADS>();
+        prefill_io_bulk_gather_tile(sm.kv_bufs[0], idx_base,
+                                    KV_cache, sm.mbar_kv + 0, io_tid);
         for (int ni = 0; ni < NI; ni++) {
             if (ni + 1 < NI)
-                io_gather_tile(sm.kv_bufs[(ni + 1) & 1],
-                               idx_base + (ni + 1) * BI, KV_cache, io_tid);
+                prefill_io_bulk_gather_tile(sm.kv_bufs[(ni + 1) & 1],
+                               idx_base + (ni + 1) * BI, KV_cache,
+                               sm.mbar_kv + ((ni + 1) & 1), io_tid);
             bar_sync_t<1, BLOCK_THREADS>();
-            if (ni + 1 < NI)
-                bar_arrive_t<0, BLOCK_THREADS>();
         }
     } else {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(200));
@@ -649,7 +560,7 @@ sparse_mla_prefill_mg_kernel(
             const bf16* q_base_g = Q + (size_t)s_i * NUM_HEADS * DIM
                                      + (size_t)(h_start + g * HPB) * DIM;
             bf16* rope_staging = sm.q_rope_staging();
-            quantize_q_to_smem(sm.q_nope_fp8[g], sm.q_nope_sc[g],
+            prefill_quantize_q(sm.q_nope_fp8[g], sm.q_nope_sc[g],
                                rope_staging, q_base_g, sm.reduce_buf);
             q_rope_regs[g] = preload_q_rope_regs(rope_staging, lane);
             bar_sync_t<2, MATH_THREADS>();
@@ -664,7 +575,7 @@ sparse_mla_prefill_mg_kernel(
         }
 
         bar_sync_t<2, MATH_THREADS>();
-        bar_sync_t<0, BLOCK_THREADS>();
+        mbarrier_wait_parity(sm.mbar_kv + 0, 0);
 
         float weights[MG_N_HG][4];
 
@@ -684,7 +595,7 @@ sparse_mla_prefill_mg_kernel(
                     g_wsc[i] = 0.f;
 
                 float qk[4] = {0.f, 0.f, 0.f, 0.f};
-                compute_qk_nope(qk, sm.q_nope_fp8[g], sm.q_nope_sc[g],
+                prefill_compute_qk_nope(qk, sm.q_nope_fp8[g], sm.q_nope_sc[g],
                                 kv_smem, qk_nb, lane);
                 {
                     int entry_idx = ib[qk_nb + gid];
@@ -770,7 +681,7 @@ sparse_mla_prefill_mg_kernel(
                 for (int vc = 0; vc < N_V_CHUNKS; vc++) {
                     const int v_off = vc * V_CHUNK;
 
-                    transpose_v_chunk(sm.v_trans, kv_smem, v_off, lane);
+                    prefill_transpose_v_chunk(sm.v_trans, kv_smem, v_off, lane);
 
                     #pragma unroll
                     for (int g = 0; g < MG_N_HG; g++) {
@@ -818,8 +729,10 @@ sparse_mla_prefill_mg_kernel(
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();
-            if (ni + 1 < NI)
-                bar_sync_t<0, BLOCK_THREADS>();
+            if (ni + 1 < NI) {
+                const int next_phase = ((ni + 1) >> 1) & 1;
+                mbarrier_wait_parity(sm.mbar_kv + ((ni + 1) & 1), next_phase);
+            }
         }
 
         // ── Coalesced output via smem staging ───────────────────
