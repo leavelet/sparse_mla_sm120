@@ -562,7 +562,7 @@ template <int NUM_HEADS, int TILES_PER_SPLIT>
 void launch_decode(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                    bf16* partial_O, float* partial_LSE,
                    bf16* output, uint32_t* semaphores,
-                   float sm_scale, int num_tokens)
+                   float sm_scale, int num_tokens, cudaStream_t stream)
 {
     constexpr size_t smem_bytes = dec::TOTAL;
     constexpr int REPLICATE_H = NUM_HEADS / HPB;
@@ -577,7 +577,7 @@ void launch_decode(const bf16* Q, const uint8_t* KV_cache, const int32_t* indice
                             smem_bytes);
         configured = true;
     }
-    sparse_mla_decode_kernel<NUM_HEADS, TILES_PER_SPLIT><<<grid, block, smem_bytes>>>(
+    sparse_mla_decode_kernel<NUM_HEADS, TILES_PER_SPLIT><<<grid, block, smem_bytes, stream>>>(
         Q, KV_cache, indices, partial_O, partial_LSE,
         output, semaphores, sm_scale, num_tokens);
 }
@@ -586,14 +586,15 @@ template <int NUM_HEADS>
 void dispatch_tiles(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                     bf16* partial_O, float* partial_LSE,
                     bf16* output, uint32_t* semaphores,
-                    float sm_scale, int num_tokens, int tiles_per_split)
+                    float sm_scale, int num_tokens, int tiles_per_split,
+                    cudaStream_t stream)
 {
     switch (tiles_per_split) {
-    case 2:  launch_decode<NUM_HEADS, 2> (Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens); break;
-    case 4:  launch_decode<NUM_HEADS, 4> (Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens); break;
-    case 8:  launch_decode<NUM_HEADS, 8> (Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens); break;
-    case 16: launch_decode<NUM_HEADS, 16>(Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens); break;
-    case 32: launch_decode<NUM_HEADS, 32>(Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens); break;
+    case 2:  launch_decode<NUM_HEADS, 2> (Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens, stream); break;
+    case 4:  launch_decode<NUM_HEADS, 4> (Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens, stream); break;
+    case 8:  launch_decode<NUM_HEADS, 8> (Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens, stream); break;
+    case 16: launch_decode<NUM_HEADS, 16>(Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens, stream); break;
+    case 32: launch_decode<NUM_HEADS, 32>(Q, KV_cache, indices, partial_O, partial_LSE, output, semaphores, sm_scale, num_tokens, stream); break;
     default: TORCH_CHECK(false, "tiles_per_split must be 2,4,8,16,32; got ", tiles_per_split);
     }
 }
@@ -603,7 +604,7 @@ void sparse_mla_decode_launch(
     torch::Tensor partial_O, torch::Tensor partial_LSE,
     torch::Tensor output, torch::Tensor semaphores,
     float sm_scale, int num_heads, int num_tokens, int topk,
-    int tiles_per_split, int nsplits)
+    int tiles_per_split, int nsplits, cudaStream_t stream)
 {
     TORCH_CHECK(topk == TOPK, "topk must be ", TOPK);
     TORCH_CHECK(num_tokens <= 64, "decode path requires num_tokens <= 64; got ", num_tokens);
@@ -617,10 +618,10 @@ void sparse_mla_decode_launch(
     auto sem_ptr = reinterpret_cast<uint32_t*>(semaphores.data_ptr<int32_t>());
 
     switch (num_heads) {
-    case 16:  dispatch_tiles<16> (Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split); break;
-    case 32:  dispatch_tiles<32> (Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split); break;
-    case 64:  dispatch_tiles<64> (Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split); break;
-    case 128: dispatch_tiles<128>(Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split); break;
+    case 16:  dispatch_tiles<16> (Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split, stream); break;
+    case 32:  dispatch_tiles<32> (Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split, stream); break;
+    case 64:  dispatch_tiles<64> (Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split, stream); break;
+    case 128: dispatch_tiles<128>(Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, O_ptr, sem_ptr, sm_scale, num_tokens, tiles_per_split, stream); break;
     default:  TORCH_CHECK(false, "num_heads must be 16,32,64,128; got ", num_heads);
     }
 }

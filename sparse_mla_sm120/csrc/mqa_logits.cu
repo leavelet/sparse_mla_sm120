@@ -213,12 +213,12 @@ template <int NH>
 static void dispatch_ragged(
     const uint8_t* Q, const uint8_t* KV, const float* KVs, const float* W,
     const int* Ks, const int* Ke, float* out,
-    int sq, int skv, int so, int msk)
+    int sq, int skv, int so, int msk, cudaStream_t stream)
 {
     constexpr int BKV = 128, BH = BestBlockH<NH>::value;
     const int ow = (msk > 0) ? msk : skv;
     fp8_mqa_logits_ragged_kernel<NH, BKV, BH>
-        <<<dim3(sq, (ow + BKV - 1) / BKV), BLOCK_SIZE, smem_for<BKV, BH>()>>>(
+        <<<dim3(sq, (ow + BKV - 1) / BKV), BLOCK_SIZE, smem_for<BKV, BH>(), stream>>>(
             Q, KV, KVs, W, Ks, Ke, out, skv, so);
 }
 
@@ -226,11 +226,12 @@ template <int NH, int NN>
 static void dispatch_paged(
     const uint8_t* Q, const uint8_t* KV, const float* KVs, const float* W,
     const int* cl, const int* bt, float* out,
-    int tq, int mbl, int sbt, int so, int skb, int sksb)
+    int tq, int mbl, int sbt, int so, int skb, int sksb,
+    cudaStream_t stream)
 {
     constexpr int BKV = 64, BH = BestBlockH<NH>::value;
     fp8_mqa_logits_paged_kernel<NH, NN, BH>
-        <<<dim3(tq, mbl), BLOCK_SIZE, smem_for<BKV, BH>()>>>(
+        <<<dim3(tq, mbl), BLOCK_SIZE, smem_for<BKV, BH>(), stream>>>(
             Q, KV, KVs, W, cl, bt, out, sbt, so, skb, sksb);
 }
 
@@ -238,7 +239,7 @@ static void dispatch_paged(
 void fp8_mqa_logits_ragged_launch(
     torch::Tensor Q, torch::Tensor KV, torch::Tensor KV_scale,
     torch::Tensor W, torch::Tensor K_start, torch::Tensor K_end,
-    torch::Tensor logits, int max_seqlen_k)
+    torch::Tensor logits, int max_seqlen_k, cudaStream_t stream)
 {
     int sq = Q.size(0), nh = Q.size(1), skv = KV.size(0), so = logits.stride(0);
     TORCH_CHECK(nh == 16 || nh == 128); TORCH_CHECK(Q.size(2) == HEAD_DIM);
@@ -246,16 +247,16 @@ void fp8_mqa_logits_ragged_launch(
     auto kv = static_cast<const uint8_t*>(KV.data_ptr());
     if (nh == 128)
         dispatch_ragged<128>(q, kv, KV_scale.data_ptr<float>(), W.data_ptr<float>(),
-            K_start.data_ptr<int>(), K_end.data_ptr<int>(), logits.data_ptr<float>(), sq, skv, so, max_seqlen_k);
+            K_start.data_ptr<int>(), K_end.data_ptr<int>(), logits.data_ptr<float>(), sq, skv, so, max_seqlen_k, stream);
     else
         dispatch_ragged<16>(q, kv, KV_scale.data_ptr<float>(), W.data_ptr<float>(),
-            K_start.data_ptr<int>(), K_end.data_ptr<int>(), logits.data_ptr<float>(), sq, skv, so, max_seqlen_k);
+            K_start.data_ptr<int>(), K_end.data_ptr<int>(), logits.data_ptr<float>(), sq, skv, so, max_seqlen_k, stream);
 }
 
 void fp8_mqa_logits_paged_launch(
     torch::Tensor Q, torch::Tensor KV, torch::Tensor KV_scale,
     torch::Tensor W, torch::Tensor ctx_lens, torch::Tensor block_table,
-    torch::Tensor logits, int next_n)
+    torch::Tensor logits, int next_n, cudaStream_t stream)
 {
     int tq = Q.size(0), nh = Q.size(1), so = logits.stride(0);
     int sbt = block_table.stride(0), mbl = block_table.size(1);
@@ -264,7 +265,7 @@ void fp8_mqa_logits_paged_launch(
     auto q = static_cast<const uint8_t*>(Q.data_ptr());
     auto kv = static_cast<const uint8_t*>(KV.data_ptr());
     #define LP(NH) dispatch_paged<NH,1>(q,kv,KV_scale.data_ptr<float>(),W.data_ptr<float>(),\
-        ctx_lens.data_ptr<int>(),block_table.data_ptr<int>(),logits.data_ptr<float>(),tq,mbl,sbt,so,skb,sksb)
+        ctx_lens.data_ptr<int>(),block_table.data_ptr<int>(),logits.data_ptr<float>(),tq,mbl,sbt,so,skb,sksb,stream)
     if (nh == 128) { LP(128); } else { LP(16); }
     #undef LP
 }

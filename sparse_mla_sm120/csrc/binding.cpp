@@ -1,26 +1,36 @@
+#include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
+
+namespace {
+
+cudaStream_t get_current_stream(const torch::Tensor& tensor) {
+    return at::cuda::getCurrentCUDAStream(tensor.get_device()).stream();
+}
+
+}  // namespace
 
 void sparse_mla_decode_launch(
     torch::Tensor Q, torch::Tensor KV_cache, torch::Tensor indices,
     torch::Tensor partial_O, torch::Tensor partial_LSE,
     torch::Tensor output, torch::Tensor semaphores,
     float sm_scale, int num_heads, int num_tokens, int topk,
-    int tiles_per_split, int nsplits);
+    int tiles_per_split, int nsplits, cudaStream_t stream);
 
 void sparse_mla_prefill_launch(
     torch::Tensor Q, torch::Tensor KV_cache, torch::Tensor indices,
     torch::Tensor output,
-    float sm_scale, int num_heads, int num_tokens, int topk, int BI);
+    float sm_scale, int num_heads, int num_tokens, int topk, int BI,
+    cudaStream_t stream);
 
 void fp8_mqa_logits_ragged_launch(
     torch::Tensor Q, torch::Tensor KV, torch::Tensor KV_scale,
     torch::Tensor W, torch::Tensor K_start, torch::Tensor K_end,
-    torch::Tensor logits, int max_seqlen_k);
+    torch::Tensor logits, int max_seqlen_k, cudaStream_t stream);
 
 void fp8_mqa_logits_paged_launch(
     torch::Tensor Q, torch::Tensor KV, torch::Tensor KV_scale,
     torch::Tensor W, torch::Tensor ctx_lens, torch::Tensor block_table,
-    torch::Tensor logits, int next_n);
+    torch::Tensor logits, int next_n, cudaStream_t stream);
 
 static constexpr int DECODE_HPB = 16;
 static constexpr int MQA_HEAD_DIM = 128;
@@ -49,12 +59,13 @@ void sparse_mla_decode_fwd(
     TORCH_CHECK(num_tokens <= 64, "decode path requires num_tokens <= 64");
     TORCH_CHECK(num_heads % DECODE_HPB == 0);
 
+    const cudaStream_t stream = get_current_stream(Q);
     sparse_mla_decode_launch(
         Q, KV_cache, indices,
         partial_O, partial_LSE,
         output, semaphores,
         sm_scale, num_heads, num_tokens, topk,
-        tiles_per_split, nsplits);
+        tiles_per_split, nsplits, stream);
 }
 
 void sparse_mla_prefill_fwd(
@@ -77,9 +88,10 @@ void sparse_mla_prefill_fwd(
     TORCH_CHECK(dim == d_v + d_rope, "dim mismatch");
     TORCH_CHECK(num_heads % DECODE_HPB == 0);
 
+    const cudaStream_t stream = get_current_stream(Q);
     sparse_mla_prefill_launch(
         Q, KV_cache, indices, output,
-        sm_scale, num_heads, num_tokens, topk, 64);
+        sm_scale, num_heads, num_tokens, topk, 64, stream);
 }
 
 void fp8_mqa_logits_ragged_fwd(
@@ -103,8 +115,9 @@ void fp8_mqa_logits_ragged_fwd(
     TORCH_CHECK(Q.is_contiguous() && KV.is_contiguous(),
                 "Q and KV must be contiguous");
 
+    const cudaStream_t stream = get_current_stream(Q);
     fp8_mqa_logits_ragged_launch(Q, KV, KV_scale, W, K_start, K_end,
-                                 logits, max_seqlen_k);
+                                 logits, max_seqlen_k, stream);
 }
 
 void fp8_mqa_logits_paged_fwd(
@@ -127,8 +140,9 @@ void fp8_mqa_logits_paged_fwd(
     TORCH_CHECK(Q.size(1) % 16 == 0, "num_heads must be a multiple of 16");
     TORCH_CHECK(Q.is_contiguous(), "Q must be contiguous");
 
+    const cudaStream_t stream = get_current_stream(Q);
     fp8_mqa_logits_paged_launch(Q, KV, KV_scale, W, ctx_lens, block_table,
-                                logits, next_n);
+                                logits, next_n, stream);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

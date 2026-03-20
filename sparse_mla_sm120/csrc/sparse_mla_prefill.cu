@@ -840,7 +840,8 @@ sparse_mla_prefill_mg_kernel(
 
 template <int NUM_HEADS>
 void launch_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
-               bf16* output, float sm_scale, int num_tokens)
+               bf16* output, float sm_scale, int num_tokens,
+               cudaStream_t stream)
 {
     constexpr size_t smem_bytes = sg::TOTAL;
     constexpr int REPLICATE_H = NUM_HEADS / HPB;
@@ -854,13 +855,14 @@ void launch_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                             smem_bytes);
         configured = true;
     }
-    sparse_mla_prefill_kernel<NUM_HEADS><<<grid, block, smem_bytes>>>(
+    sparse_mla_prefill_kernel<NUM_HEADS><<<grid, block, smem_bytes, stream>>>(
         Q, KV_cache, indices, output, sm_scale, num_tokens);
 }
 
 template <int NUM_HEADS>
 void launch_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
-               bf16* output, float sm_scale, int num_tokens)
+               bf16* output, float sm_scale, int num_tokens,
+               cudaStream_t stream)
 {
     constexpr size_t smem_bytes = mg::TOTAL;
     constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA;
@@ -874,14 +876,15 @@ void launch_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                             smem_bytes);
         configured = true;
     }
-    sparse_mla_prefill_mg_kernel<NUM_HEADS><<<grid, block, smem_bytes>>>(
+    sparse_mla_prefill_mg_kernel<NUM_HEADS><<<grid, block, smem_bytes, stream>>>(
         Q, KV_cache, indices, output, sm_scale, num_tokens);
 }
 
 void sparse_mla_prefill_launch(
     torch::Tensor Q, torch::Tensor KV_cache, torch::Tensor indices,
     torch::Tensor output, float sm_scale,
-    int num_heads, int num_tokens, int topk, int BI_param)
+    int num_heads, int num_tokens, int topk, int BI_param,
+    cudaStream_t stream)
 {
     TORCH_CHECK(topk == TOPK, "topk must be ", TOPK, " (compile-time constant); got ", topk);
 
@@ -894,10 +897,10 @@ void sparse_mla_prefill_launch(
     // arithmetic with NUM_HEADS*DIM, and all derived constants are constexpr.
     // TOPK is already constexpr (2048) via common.cuh → NI, TOTAL_KV_CHUNKS, etc.
     switch (num_heads) {
-    case 16:  launch_sg<16> (Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens); break;
-    case 32:  launch_mg<32> (Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens); break;
-    case 64:  launch_mg<64> (Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens); break;
-    case 128: launch_mg<128>(Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens); break;
+    case 16:  launch_sg<16> (Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens, stream); break;
+    case 32:  launch_mg<32> (Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens, stream); break;
+    case 64:  launch_mg<64> (Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens, stream); break;
+    case 128: launch_mg<128>(Q_ptr, KV_ptr, idx_ptr, out_ptr, sm_scale, num_tokens, stream); break;
     default:
         TORCH_CHECK(false, "num_heads must be 16, 32, 64, or 128; got ", num_heads);
     }
