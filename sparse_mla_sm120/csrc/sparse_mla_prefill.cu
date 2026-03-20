@@ -84,6 +84,12 @@ namespace sg {
 static constexpr int MG_N_HG = 2;
 static constexpr int MG_HEADS_PER_CTA = MG_N_HG * HPB;  // 32
 
+// MG-specific smem sizes (doubled for parallel group processing)
+static constexpr size_t SMEM_REDUCE_MG    = MG_N_HG * N_MATH_WARPS * HPB * sizeof(float);
+static constexpr size_t SMEM_SUM_RED_MG   = MG_N_HG * N_MATH_WARPS * HPB * sizeof(float);
+static constexpr size_t SMEM_W_FP8_MG     = MG_N_HG * HPB * W_FP8_STRIDE;
+static constexpr int    MG_REDUCE_GRP_STRIDE = N_MATH_WARPS * HPB; // 128
+
 namespace mg {
     static constexpr size_t OFF_Q_NOPE0   = 0;
     static constexpr size_t OFF_Q_NOPE1   = OFF_Q_NOPE0   + SMEM_Q_NOPE;
@@ -92,12 +98,12 @@ namespace mg {
     static constexpr size_t OFF_KV0       = OFF_Q_SC1     + SMEM_Q_SC;
     static constexpr size_t OFF_KV1       = OFF_KV0       + SMEM_KV_BUF;
     static constexpr size_t OFF_REDUCE    = OFF_KV1       + SMEM_KV_BUF;
-    static constexpr size_t OFF_SUM_RED   = OFF_REDUCE    + SMEM_REDUCE;
-    static constexpr size_t OFF_M         = OFF_SUM_RED   + SMEM_SUM_REDUCE;
+    static constexpr size_t OFF_SUM_RED   = OFF_REDUCE    + SMEM_REDUCE_MG;
+    static constexpr size_t OFF_M         = OFF_SUM_RED   + SMEM_SUM_RED_MG;
     static constexpr size_t OFF_L         = OFF_M         + MG_N_HG * SMEM_M;
     static constexpr size_t OFF_W_SC_ALL  = OFF_L         + MG_N_HG * SMEM_L;
     static constexpr size_t OFF_W_FP8     = OFF_W_SC_ALL  + MG_N_HG * SMEM_W_SC_ALL;
-    static constexpr size_t OFF_V_TRANS   = OFF_W_FP8     + SMEM_W_FP8;
+    static constexpr size_t OFF_V_TRANS   = OFF_W_FP8     + SMEM_W_FP8_MG;
     static constexpr size_t OFF_MBAR_KV   = (OFF_V_TRANS + SMEM_V_TRANS + 7) / 8 * 8;
     static constexpr size_t TOTAL         = OFF_MBAR_KV   + SMEM_MBAR_KV;
 }
@@ -190,7 +196,7 @@ struct PrefillSmemMG {
     float*   m_smem;
     float*   l_smem;
     float*   w_head_sc_all;
-    uint8_t* w_fp8;
+    uint8_t* w_fp8_base;
     uint8_t* v_trans;
     uint64_t* mbar_kv;
 
@@ -207,10 +213,13 @@ struct PrefillSmemMG {
         s.m_smem        = (float*)  (b + mg::OFF_M);
         s.l_smem        = (float*)  (b + mg::OFF_L);
         s.w_head_sc_all = (float*)  (b + mg::OFF_W_SC_ALL);
-        s.w_fp8         = (uint8_t*)(b + mg::OFF_W_FP8);
+        s.w_fp8_base    = (uint8_t*)(b + mg::OFF_W_FP8);
         s.v_trans       = (uint8_t*)(b + mg::OFF_V_TRANS);
         s.mbar_kv       = (uint64_t*)(b + mg::OFF_MBAR_KV);
         return s;
+    }
+    __device__ __forceinline__ uint8_t* w_fp8_grp(int g) {
+        return w_fp8_base + g * HPB * W_FP8_STRIDE;
     }
     __device__ bf16* q_rope_staging() { return (bf16*)v_trans; }
 };
@@ -501,6 +510,11 @@ sparse_mla_prefill_kernel(
 
 // ============================================================================
 // Multi-group prefill kernel (num_heads > 16, e.g. 128)
+//
+// Optimized: both head groups processed in parallel within each NI
+// iteration, cutting barrier count from ~23 to ~11 per tile.
+//   Phase 1: QK + softmax for both groups with 4 combined barriers (was 8)
+//   Phase 2: w_fp8 for both groups → 1 barrier → MMA both groups (7 total, was 15)
 // ============================================================================
 template <int NUM_HEADS>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
@@ -523,7 +537,6 @@ sparse_mla_prefill_mg_kernel(
     extern __shared__ char smem_raw[];
     PrefillSmemMG sm = PrefillSmemMG::init(smem_raw);
 
-    // Initialize mbarriers before warp specialization (use barrier 3 for sync)
     if (threadIdx.x == 0) {
         mbarrier_init(sm.mbar_kv + 0, 1);
         mbarrier_init(sm.mbar_kv + 1, 1);
@@ -583,148 +596,195 @@ sparse_mla_prefill_mg_kernel(
             uint8_t* kv_smem = sm.kv_bufs[ni & 1];
             const int32_t* ib = idx_base + ni * BI;
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
+            const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
 
-            // ── PHASE 1: QK + softmax per group ─────────────────────
+            // ── PHASE 1: QK + softmax — both groups in parallel ─────
+
+            // Clear w_head_sc_all for both groups
+            for (int i = threadIdx.x; i < MG_N_HG * N_V_CHUNKS * HPB; i += MATH_THREADS)
+                sm.w_head_sc_all[i] = 0.f;
+
+            // Compute QK for both groups (no barriers between groups)
+            float sc_g[MG_N_HG][4];
+
+            // Load rope B operands once (shared across groups)
+            int entry_idx = ib[qk_nb + gid];
+            entry_idx = (entry_idx >= 0) ? entry_idx : 0;
+            const bf16* g_rope = reinterpret_cast<const bf16*>(
+                KV_cache + (size_t)entry_idx * KV_PACKED_BYTES + KV_ROPE_BYTE_OFFSET);
+
             #pragma unroll
             for (int g = 0; g < MG_N_HG; g++) {
-                float* g_m = sm.m_smem + g * HPB;
-                float* g_l = sm.l_smem + g * HPB;
-                float* g_wsc = sm.w_head_sc_all + g * N_V_CHUNKS * HPB;
-
-                for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += MATH_THREADS)
-                    g_wsc[i] = 0.f;
-
                 float qk[4] = {0.f, 0.f, 0.f, 0.f};
                 prefill_compute_qk_nope(qk, sm.q_nope_fp8[g], sm.q_nope_sc[g],
                                 kv_smem, qk_nb, lane);
+                compute_qk_rope(qk, q_rope_regs[g], g_rope, lane);
                 {
-                    int entry_idx = ib[qk_nb + gid];
-                    entry_idx = (entry_idx >= 0) ? entry_idx : 0;
-                    const bf16* g_rope = reinterpret_cast<const bf16*>(
-                        KV_cache + (size_t)entry_idx * KV_PACKED_BYTES + KV_ROPE_BYTE_OFFSET);
-                    compute_qk_rope(qk, q_rope_regs[g], g_rope, lane);
+                    if (ib[e0i] < 0) { qk[0] = -1e30f; qk[2] = -1e30f; }
+                    if (ib[e1i] < 0) { qk[1] = -1e30f; qk[3] = -1e30f; }
                 }
-                {
-                    int e0 = qk_nb + tid * 2, e1 = e0 + 1;
-                    if (ib[e0] < 0) { qk[0] = -1e30f; qk[2] = -1e30f; }
-                    if (ib[e1] < 0) { qk[1] = -1e30f; qk[3] = -1e30f; }
-                }
-
-                float sc[4] = { qk[0]*sm_scale_log2e, qk[1]*sm_scale_log2e,
-                                qk[2]*sm_scale_log2e, qk[3]*sm_scale_log2e };
-                float lm0 = fmaxf(sc[0],sc[1]), lm1 = fmaxf(sc[2],sc[3]);
-                lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff,lm0,1));
-                lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff,lm0,2));
-                lm1 = fmaxf(lm1, __shfl_xor_sync(0xffffffff,lm1,1));
-                lm1 = fmaxf(lm1, __shfl_xor_sync(0xffffffff,lm1,2));
-                if (tid==0) { sm.reduce_buf[mwarp*HPB+gid]=lm0; sm.reduce_buf[mwarp*HPB+gid+8]=lm1; }
-                bar_sync_t<2, MATH_THREADS>();
-
-                if (threadIdx.x < HPB) {
-                    int h = threadIdx.x;
-                    float old_m = g_m[h], tm = -1e30f;
-                    #pragma unroll
-                    for (int w = 0; w < N_MATH_WARPS; w++) tm = fmaxf(tm, sm.reduce_buf[w*HPB+h]);
-                    float nm = fmaxf(old_m, tm), alpha = exp2f(old_m - nm);
-                    g_m[h] = nm; g_l[h] *= alpha;
-                    sm.reduce_buf[h] = alpha; sm.reduce_buf[HPB+h] = nm;
-                }
-                bar_sync_t<2, MATH_THREADS>();
-
-                float alpha0 = sm.reduce_buf[gid], alpha1 = sm.reduce_buf[gid+8];
-                float nm0 = sm.reduce_buf[HPB+gid], nm1 = sm.reduce_buf[HPB+gid+8];
-                #pragma unroll
-                for (int t = 0; t < ACC_TILES; t++) {
-                    acc_o[g][t][0]*=alpha0; acc_o[g][t][1]*=alpha0;
-                    acc_o[g][t][2]*=alpha1; acc_o[g][t][3]*=alpha1;
-                }
-
-                float w0=exp2f(sc[0]-nm0), w1=exp2f(sc[1]-nm0);
-                float w2=exp2f(sc[2]-nm1), w3=exp2f(sc[3]-nm1);
-                weights[g][0]=w0; weights[g][1]=w1; weights[g][2]=w2; weights[g][3]=w3;
-
-                float ls0=w0+w1, ls1=w2+w3;
-                ls0+=__shfl_xor_sync(0xffffffff,ls0,1); ls0+=__shfl_xor_sync(0xffffffff,ls0,2);
-                ls1+=__shfl_xor_sync(0xffffffff,ls1,1); ls1+=__shfl_xor_sync(0xffffffff,ls1,2);
-                if (tid==0) { sm.sum_reduce_buf[mwarp*HPB+gid]=ls0; sm.sum_reduce_buf[mwarp*HPB+gid+8]=ls1; }
-
-                {
-                    int e0i=qk_nb+tid*2, e1i=e0i+1;
-                    #pragma unroll
-                    for (int vc = 0; vc < N_V_CHUNKS; vc++) {
-                        float vsc0 = reinterpret_cast<const float*>(kv_smem+e0i*KV_SMEM_STRIDE+D_NOPE)[vc];
-                        float vsc1 = reinterpret_cast<const float*>(kv_smem+e1i*KV_SMEM_STRIDE+D_NOPE)[vc];
-                        atomicMax(reinterpret_cast<int*>(&g_wsc[vc*HPB+gid]),
-                            __float_as_int(fmaxf(fabsf(w0*vsc0),fabsf(w1*vsc1))));
-                        atomicMax(reinterpret_cast<int*>(&g_wsc[vc*HPB+gid+8]),
-                            __float_as_int(fmaxf(fabsf(w2*vsc0),fabsf(w3*vsc1))));
-                    }
-                }
-                bar_sync_t<2, MATH_THREADS>();
-
-                if (threadIdx.x < HPB) {
-                    int h = threadIdx.x; float ts = 0.f;
-                    #pragma unroll
-                    for (int w = 0; w < N_MATH_WARPS; w++) ts += sm.sum_reduce_buf[w*HPB+h];
-                    g_l[h] += ts;
-                }
-                for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += MATH_THREADS)
-                    g_wsc[i] = fmaxf(g_wsc[i], 1e-10f) / FP8_MAX;
-                bar_sync_t<2, MATH_THREADS>();
+                sc_g[g][0] = qk[0]*sm_scale_log2e; sc_g[g][1] = qk[1]*sm_scale_log2e;
+                sc_g[g][2] = qk[2]*sm_scale_log2e; sc_g[g][3] = qk[3]*sm_scale_log2e;
             }
 
-            // ── PHASE 2: XV — shared V transpose, per-group w_fp8 + MMA ──
-            {
-                int e0i = qk_nb + tid * 2, e1i = e0i + 1;
+            // ── Combined max reduction for both groups (1 barrier) ──
+            #pragma unroll
+            for (int g = 0; g < MG_N_HG; g++) {
+                float lm0 = fmaxf(sc_g[g][0], sc_g[g][1]);
+                float lm1 = fmaxf(sc_g[g][2], sc_g[g][3]);
+                lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff, lm0, 1));
+                lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff, lm0, 2));
+                lm1 = fmaxf(lm1, __shfl_xor_sync(0xffffffff, lm1, 1));
+                lm1 = fmaxf(lm1, __shfl_xor_sync(0xffffffff, lm1, 2));
+                if (tid == 0) {
+                    sm.reduce_buf[g * MG_REDUCE_GRP_STRIDE + mwarp * HPB + gid] = lm0;
+                    sm.reduce_buf[g * MG_REDUCE_GRP_STRIDE + mwarp * HPB + gid + 8] = lm1;
+                }
+            }
+            bar_sync_t<2, MATH_THREADS>();
 
+            // ── Cross-warp max + alpha/nm for both groups (1 barrier) ──
+            if (threadIdx.x < MG_N_HG * HPB) {
+                const int g = threadIdx.x / HPB;
+                const int h = threadIdx.x % HPB;
+                float* g_m = sm.m_smem + g * HPB;
+                float* g_l = sm.l_smem + g * HPB;
+                float old_m = g_m[h], tm = -1e30f;
+                #pragma unroll
+                for (int w = 0; w < N_MATH_WARPS; w++)
+                    tm = fmaxf(tm, sm.reduce_buf[g * MG_REDUCE_GRP_STRIDE + w * HPB + h]);
+                float nm = fmaxf(old_m, tm);
+                float alpha = exp2f(old_m - nm);
+                g_m[h] = nm;
+                g_l[h] *= alpha;
+                sm.reduce_buf[g * MG_N_HG * HPB + h] = alpha;
+                sm.reduce_buf[g * MG_N_HG * HPB + HPB + h] = nm;
+            }
+            bar_sync_t<2, MATH_THREADS>();
+
+            // ── Rescale + exp weights for both groups (no barrier) ──
+            #pragma unroll
+            for (int g = 0; g < MG_N_HG; g++) {
+                float alpha0 = sm.reduce_buf[g * MG_N_HG * HPB + gid];
+                float alpha1 = sm.reduce_buf[g * MG_N_HG * HPB + gid + 8];
+                float nm0 = sm.reduce_buf[g * MG_N_HG * HPB + HPB + gid];
+                float nm1 = sm.reduce_buf[g * MG_N_HG * HPB + HPB + gid + 8];
+                #pragma unroll
+                for (int t = 0; t < ACC_TILES; t++) {
+                    acc_o[g][t][0] *= alpha0; acc_o[g][t][1] *= alpha0;
+                    acc_o[g][t][2] *= alpha1; acc_o[g][t][3] *= alpha1;
+                }
+                weights[g][0] = exp2f(sc_g[g][0] - nm0);
+                weights[g][1] = exp2f(sc_g[g][1] - nm0);
+                weights[g][2] = exp2f(sc_g[g][2] - nm1);
+                weights[g][3] = exp2f(sc_g[g][3] - nm1);
+            }
+
+            // ── Combined sum + atomicMax for both groups (1 barrier) ──
+            #pragma unroll
+            for (int g = 0; g < MG_N_HG; g++) {
+                float w0 = weights[g][0], w1 = weights[g][1];
+                float w2 = weights[g][2], w3 = weights[g][3];
+                float ls0 = w0 + w1, ls1 = w2 + w3;
+                ls0 += __shfl_xor_sync(0xffffffff, ls0, 1);
+                ls0 += __shfl_xor_sync(0xffffffff, ls0, 2);
+                ls1 += __shfl_xor_sync(0xffffffff, ls1, 1);
+                ls1 += __shfl_xor_sync(0xffffffff, ls1, 2);
+                if (tid == 0) {
+                    sm.sum_reduce_buf[g * MG_REDUCE_GRP_STRIDE + mwarp * HPB + gid] = ls0;
+                    sm.sum_reduce_buf[g * MG_REDUCE_GRP_STRIDE + mwarp * HPB + gid + 8] = ls1;
+                }
+
+                float* g_wsc = sm.w_head_sc_all + g * N_V_CHUNKS * HPB;
+                #pragma unroll
+                for (int vc = 0; vc < N_V_CHUNKS; vc++) {
+                    float vsc0 = reinterpret_cast<const float*>(kv_smem + e0i * KV_SMEM_STRIDE + D_NOPE)[vc];
+                    float vsc1 = reinterpret_cast<const float*>(kv_smem + e1i * KV_SMEM_STRIDE + D_NOPE)[vc];
+                    atomicMax(reinterpret_cast<int*>(&g_wsc[vc * HPB + gid]),
+                        __float_as_int(fmaxf(fabsf(w0 * vsc0), fabsf(w1 * vsc1))));
+                    atomicMax(reinterpret_cast<int*>(&g_wsc[vc * HPB + gid + 8]),
+                        __float_as_int(fmaxf(fabsf(w2 * vsc0), fabsf(w3 * vsc1))));
+                }
+            }
+            bar_sync_t<2, MATH_THREADS>();
+
+            // ── Normalize scales + accumulate l for both groups (1 barrier) ──
+            if (threadIdx.x < MG_N_HG * HPB) {
+                const int g = threadIdx.x / HPB;
+                const int h = threadIdx.x % HPB;
+                float* g_l = sm.l_smem + g * HPB;
+                float ts = 0.f;
+                #pragma unroll
+                for (int w = 0; w < N_MATH_WARPS; w++)
+                    ts += sm.sum_reduce_buf[g * MG_REDUCE_GRP_STRIDE + w * HPB + h];
+                g_l[h] += ts;
+            }
+            for (int i = threadIdx.x; i < MG_N_HG * N_V_CHUNKS * HPB; i += MATH_THREADS)
+                sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
+            bar_sync_t<2, MATH_THREADS>();
+
+            // ── PHASE 2: XV — both groups' w_fp8 + shared V transpose ──
+            {
                 #pragma unroll
                 for (int vc = 0; vc < N_V_CHUNKS; vc++) {
                     const int v_off = vc * V_CHUNK;
 
+                    // V transpose (shared across groups)
                     prefill_transpose_v_chunk(sm.v_trans, kv_smem, v_off, lane);
 
+                    // Quantize w_fp8 for BOTH groups simultaneously (different smem rows)
                     #pragma unroll
                     for (int g = 0; g < MG_N_HG; g++) {
                         float* g_wsc = sm.w_head_sc_all + g * N_V_CHUNKS * HPB + vc * HPB;
-                        float gw0=weights[g][0], gw1=weights[g][1];
-                        float gw2=weights[g][2], gw3=weights[g][3];
+                        float gw0 = weights[g][0], gw1 = weights[g][1];
+                        float gw2 = weights[g][2], gw3 = weights[g][3];
 
-                        float si0=1.f/g_wsc[gid], si1=1.f/g_wsc[gid+8];
-                        float vsc0 = reinterpret_cast<const float*>(kv_smem+e0i*KV_SMEM_STRIDE+D_NOPE)[vc];
-                        float vsc1 = reinterpret_cast<const float*>(kv_smem+e1i*KV_SMEM_STRIDE+D_NOPE)[vc];
-                        float ws00=gw0*vsc0, ws01=gw1*vsc1, ws10=gw2*vsc0, ws11=gw3*vsc1;
-                        __nv_fp8_e4m3 f00(fmaxf(-FP8_MAX,fminf(FP8_MAX,ws00*si0)));
-                        __nv_fp8_e4m3 f01(fmaxf(-FP8_MAX,fminf(FP8_MAX,ws01*si0)));
-                        __nv_fp8_e4m3 f10(fmaxf(-FP8_MAX,fminf(FP8_MAX,ws10*si1)));
-                        __nv_fp8_e4m3 f11(fmaxf(-FP8_MAX,fminf(FP8_MAX,ws11*si1)));
-                        sm.w_fp8[gid*W_FP8_STRIDE+e0i]=f00.__x;
-                        sm.w_fp8[gid*W_FP8_STRIDE+e1i]=f01.__x;
-                        sm.w_fp8[(gid+8)*W_FP8_STRIDE+e0i]=f10.__x;
-                        sm.w_fp8[(gid+8)*W_FP8_STRIDE+e1i]=f11.__x;
+                        float si0 = 1.f / g_wsc[gid], si1 = 1.f / g_wsc[gid + 8];
+                        float vsc0 = reinterpret_cast<const float*>(kv_smem + e0i * KV_SMEM_STRIDE + D_NOPE)[vc];
+                        float vsc1 = reinterpret_cast<const float*>(kv_smem + e1i * KV_SMEM_STRIDE + D_NOPE)[vc];
+                        float ws00 = gw0 * vsc0, ws01 = gw1 * vsc1;
+                        float ws10 = gw2 * vsc0, ws11 = gw3 * vsc1;
+                        __nv_fp8_e4m3 f00(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws00 * si0)));
+                        __nv_fp8_e4m3 f01(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws01 * si0)));
+                        __nv_fp8_e4m3 f10(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws10 * si1)));
+                        __nv_fp8_e4m3 f11(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws11 * si1)));
+                        uint8_t* gw = sm.w_fp8_grp(g);
+                        gw[gid * W_FP8_STRIDE + e0i] = f00.__x;
+                        gw[gid * W_FP8_STRIDE + e1i] = f01.__x;
+                        gw[(gid + 8) * W_FP8_STRIDE + e0i] = f10.__x;
+                        gw[(gid + 8) * W_FP8_STRIDE + e1i] = f11.__x;
+                    }
 
-                        bar_sync_t<2, MATH_THREADS>();
+                    bar_sync_t<2, MATH_THREADS>();
+
+                    // XV MMA for BOTH groups (reading from group-specific w_fp8 rows)
+                    #pragma unroll
+                    for (int g = 0; g < MG_N_HG; g++) {
+                        float* g_wsc = sm.w_head_sc_all + g * N_V_CHUNKS * HPB + vc * HPB;
+                        uint8_t* gw = sm.w_fp8_grp(g);
 
                         #pragma unroll
                         for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
-                            int ti=vc*NT_PER_WARP_XV+nt;
-                            int nl=mwarp*(NT_PER_WARP_XV*8)+nt*8;
-                            float xv[4]={0.f,0.f,0.f,0.f};
+                            int ti = vc * NT_PER_WARP_XV + nt;
+                            int nl = mwarp * (NT_PER_WARP_XV * 8) + nt * 8;
+                            float xv[4] = {0.f, 0.f, 0.f, 0.f};
                             #pragma unroll
-                            for (int kstep=0; kstep<XV_KSTEPS; kstep++) {
-                                int ko=kstep*32; uint32_t a0,a1,a2,a3,b0,b1;
-                                ldmatrix_load_A_fp8(a0,a1,a2,a3, sm.w_fp8+ko, W_FP8_STRIDE, lane);
-                                ldmatrix_load_B_fp8(b0,b1, sm.v_trans+nl*V_TRANS_STRIDE+ko, V_TRANS_STRIDE, lane);
-                                MmaFp8Result r = mma_fp8_m16n8k32(a0,a1,a2,a3,b0,b1,xv[0],xv[1],xv[2],xv[3]);
-                                xv[0]=r.d0;xv[1]=r.d1;xv[2]=r.d2;xv[3]=r.d3;
+                            for (int kstep = 0; kstep < XV_KSTEPS; kstep++) {
+                                int ko = kstep * 32;
+                                uint32_t a0, a1, a2, a3, b0, b1;
+                                ldmatrix_load_A_fp8(a0, a1, a2, a3, gw + ko, W_FP8_STRIDE, lane);
+                                ldmatrix_load_B_fp8(b0, b1, sm.v_trans + nl * V_TRANS_STRIDE + ko, V_TRANS_STRIDE, lane);
+                                MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
+                                xv[0] = r.d0; xv[1] = r.d1; xv[2] = r.d2; xv[3] = r.d3;
                             }
-                            float sc0=g_wsc[gid], sc1=g_wsc[gid+8];
-                            acc_o[g][ti][0]+=xv[0]*sc0; acc_o[g][ti][1]+=xv[1]*sc0;
-                            acc_o[g][ti][2]+=xv[2]*sc1; acc_o[g][ti][3]+=xv[3]*sc1;
+                            float sc0 = g_wsc[gid], sc1 = g_wsc[gid + 8];
+                            acc_o[g][ti][0] += xv[0] * sc0; acc_o[g][ti][1] += xv[1] * sc0;
+                            acc_o[g][ti][2] += xv[2] * sc1; acc_o[g][ti][3] += xv[3] * sc1;
                         }
-
-                        if (!((vc == N_V_CHUNKS-1) && (g == MG_N_HG-1)))
-                            bar_sync_t<2, MATH_THREADS>();
                     }
+
+                    if (vc < N_V_CHUNKS - 1)
+                        bar_sync_t<2, MATH_THREADS>();
                 }
             }
 
@@ -742,30 +802,30 @@ sparse_mla_prefill_mg_kernel(
         for (int g = 0; g < MG_N_HG; g++) {
             float* g_l = sm.l_smem + g * HPB;
             int g_h_base = h_start + g * HPB;
-            float il0=(g_l[gid]>0.f)?(1.f/g_l[gid]):0.f;
-            float il1=(g_l[gid+8]>0.f)?(1.f/g_l[gid+8]):0.f;
+            float il0 = (g_l[gid] > 0.f) ? (1.f / g_l[gid]) : 0.f;
+            float il1 = (g_l[gid + 8] > 0.f) ? (1.f / g_l[gid + 8]) : 0.f;
 
             #pragma unroll
             for (int t = 0; t < ACC_TILES; t++) {
                 constexpr int _NT8 = NT_PER_WARP_XV * 8;
-                int c=t/NT_PER_WARP_XV, lnt=t%NT_PER_WARP_XV;
-                int d0=c*V_CHUNK+mwarp*_NT8+lnt*8+tid*2;
-                *reinterpret_cast<bf16_2*>(&staging[gid*OUT_STAGING_STRIDE+d0]) =
-                    __floats2bfloat162_rn(acc_o[g][t][0]*il0, acc_o[g][t][1]*il0);
-                *reinterpret_cast<bf16_2*>(&staging[(gid+8)*OUT_STAGING_STRIDE+d0]) =
-                    __floats2bfloat162_rn(acc_o[g][t][2]*il1, acc_o[g][t][3]*il1);
+                int c = t / NT_PER_WARP_XV, lnt = t % NT_PER_WARP_XV;
+                int d0 = c * V_CHUNK + mwarp * _NT8 + lnt * 8 + tid * 2;
+                *reinterpret_cast<bf16_2*>(&staging[gid * OUT_STAGING_STRIDE + d0]) =
+                    __floats2bfloat162_rn(acc_o[g][t][0] * il0, acc_o[g][t][1] * il0);
+                *reinterpret_cast<bf16_2*>(&staging[(gid + 8) * OUT_STAGING_STRIDE + d0]) =
+                    __floats2bfloat162_rn(acc_o[g][t][2] * il1, acc_o[g][t][3] * il1);
             }
             bar_sync_t<2, MATH_THREADS>();
 
             {
-                const size_t out_base = (size_t)s_i*NUM_HEADS*D_NOPE + (size_t)g_h_base*D_NOPE;
+                const size_t out_base = (size_t)s_i * NUM_HEADS * D_NOPE + (size_t)g_h_base * D_NOPE;
                 for (int idx = threadIdx.x; idx < HPB * OUT_TILES_PER_HEAD; idx += MATH_THREADS) {
                     int h = idx / OUT_TILES_PER_HEAD;
                     int d8 = idx - h * OUT_TILES_PER_HEAD;
                     uint4 val = *reinterpret_cast<const uint4*>(
-                        &staging[h*OUT_STAGING_STRIDE + d8*OUT_VEC]);
+                        &staging[h * OUT_STAGING_STRIDE + d8 * OUT_VEC]);
                     *reinterpret_cast<uint4*>(
-                        &output[out_base + h*D_NOPE + d8*OUT_VEC]) = val;
+                        &output[out_base + h * D_NOPE + d8 * OUT_VEC]) = val;
                 }
             }
             if (g < MG_N_HG - 1)

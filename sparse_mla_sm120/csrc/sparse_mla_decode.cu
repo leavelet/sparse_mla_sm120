@@ -57,6 +57,7 @@ static constexpr size_t SMEM_L          = HPB * sizeof(float);
 static constexpr size_t SMEM_W_SC_ALL   = N_V_CHUNKS * HPB * sizeof(float);
 static constexpr size_t SMEM_W_FP8      = HPB * W_FP8_STRIDE;
 static constexpr size_t SMEM_V_TRANS    = V_CHUNK * V_TRANS_STRIDE;
+static constexpr size_t SMEM_MBAR_KV    = 2 * sizeof(uint64_t);  // double-buffered
 
 namespace dec {
     static constexpr size_t OFF_Q_NOPE    = 0;
@@ -71,7 +72,8 @@ namespace dec {
     static constexpr size_t OFF_W_SC_ALL  = OFF_L         + SMEM_L;
     static constexpr size_t OFF_W_FP8     = OFF_W_SC_ALL  + SMEM_W_SC_ALL;
     static constexpr size_t OFF_V_TRANS   = OFF_W_FP8     + SMEM_W_FP8;
-    static constexpr size_t TOTAL         = OFF_V_TRANS   + SMEM_V_TRANS;
+    static constexpr size_t OFF_MBAR_KV   = (OFF_V_TRANS + SMEM_V_TRANS + 7) / 8 * 8;
+    static constexpr size_t TOTAL         = OFF_MBAR_KV   + SMEM_MBAR_KV;
 }
 static_assert(dec::TOTAL < 100 * 1024, "decode smem exceeds 100 KB");
 
@@ -87,6 +89,7 @@ struct DecodeSmem {
     float*   w_head_sc_all;
     uint8_t* w_fp8;
     uint8_t* v_trans;
+    uint64_t* mbar_kv;
 
     __device__ static DecodeSmem init(char* b) {
         return {
@@ -101,9 +104,11 @@ struct DecodeSmem {
             (float*)  (b + dec::OFF_W_SC_ALL),
             (uint8_t*)(b + dec::OFF_W_FP8),
             (uint8_t*)(b + dec::OFF_V_TRANS),
+            (uint64_t*)(b + dec::OFF_MBAR_KV),
         };
     }
 };
+
 
 // ============================================================================
 // Decode kernel — split-KV with in-kernel combine
@@ -139,6 +144,12 @@ sparse_mla_decode_kernel(
     extern __shared__ char smem_raw[];
     DecodeSmem sm = DecodeSmem::init(smem_raw);
 
+    if (threadIdx.x == 0) {
+        mbarrier_init(sm.mbar_kv + 0, 1);
+        mbarrier_init(sm.mbar_kv + 1, 1);
+    }
+    bar_sync_t<3, BLOCK_THREADS>();
+
     // ── IO warps ────────────────────────────────────────────────────────
     if (wy == 2) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
@@ -146,19 +157,17 @@ sparse_mla_decode_kernel(
         const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
         const int32_t* idx_base = indices + (size_t)s_i * TOPK + split_idx * tile_start_stride;
 
-        io_gather_tile<KV_SMEM_STRIDE, IO_THREADS, BI>(
-            sm.kv_bufs[0], idx_base, KV_cache, io_tid);
-        bar_arrive_t<0, BLOCK_THREADS>();
+        io_bulk_gather_tile<KV_SMEM_STRIDE, IO_THREADS, BI>(
+            sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid);
 
         #pragma unroll
         for (int ti = 0; ti < TILES_PER_SPLIT; ti++) {
             if (ti + 1 < TILES_PER_SPLIT)
-                io_gather_tile<KV_SMEM_STRIDE, IO_THREADS, BI>(
+                io_bulk_gather_tile<KV_SMEM_STRIDE, IO_THREADS, BI>(
                     sm.kv_bufs[(ti + 1) & 1],
-                    idx_base + (ti + 1) * BI, KV_cache, io_tid);
+                    idx_base + (ti + 1) * BI, KV_cache,
+                    sm.mbar_kv + ((ti + 1) & 1), io_tid);
             bar_sync_t<1, BLOCK_THREADS>();
-            if (ti + 1 < TILES_PER_SPLIT)
-                bar_arrive_t<0, BLOCK_THREADS>();
         }
 
     // ── Math warps ──────────────────────────────────────────────────────
@@ -187,7 +196,7 @@ sparse_mla_decode_kernel(
             acc_o[t][0] = acc_o[t][1] = acc_o[t][2] = acc_o[t][3] = 0.f;
 
         bar_sync_t<2, MATH_THREADS>();
-        bar_sync_t<0, BLOCK_THREADS>();
+        mbarrier_wait_parity(sm.mbar_kv + 0, 0);
 
         // ── Main loop — QK + softmax + XV ───────────────────────────
         #pragma unroll
@@ -359,8 +368,10 @@ sparse_mla_decode_kernel(
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();
-            if (ti + 1 < TILES_PER_SPLIT)
-                bar_sync_t<0, BLOCK_THREADS>();
+            if (ti + 1 < TILES_PER_SPLIT) {
+                const int next_phase = ((ti + 1) >> 1) & 1;
+                mbarrier_wait_parity(sm.mbar_kv + ((ti + 1) & 1), next_phase);
+            }
         }
 
         // ── Write partial output via smem staging ───────────────────
@@ -499,11 +510,15 @@ sparse_mla_decode_kernel(
                 constexpr int _NT8 = NT_PER_WARP_XV * 8;
                 int c = t / NT_PER_WARP_XV, lnt = t % NT_PER_WARP_XV;
                 int d0 = c * V_CHUNK + mwarp * _NT8 + lnt * 8 + tid * 2;
+                bf16_2 v01 = *reinterpret_cast<const bf16_2*>(&po_ptr[gid * D_NOPE + d0]);
+                bf16_2 v23 = *reinterpret_cast<const bf16_2*>(&po_ptr[(gid + 8) * D_NOPE + d0]);
+                float2 f01 = __bfloat1622float2(v01);
+                float2 f23 = __bfloat1622float2(v23);
 
-                merge_acc[t][0] += sc0 * to_float(po_ptr[gid * D_NOPE + d0]);
-                merge_acc[t][1] += sc0 * to_float(po_ptr[gid * D_NOPE + d0 + 1]);
-                merge_acc[t][2] += sc1 * to_float(po_ptr[(gid + 8) * D_NOPE + d0]);
-                merge_acc[t][3] += sc1 * to_float(po_ptr[(gid + 8) * D_NOPE + d0 + 1]);
+                merge_acc[t][0] += sc0 * f01.x;
+                merge_acc[t][1] += sc0 * f01.y;
+                merge_acc[t][2] += sc1 * f23.x;
+                merge_acc[t][3] += sc1 * f23.y;
             }
         }
 

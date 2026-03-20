@@ -30,17 +30,37 @@ def _get_decode_workspace(num_heads, nsplits, device):
 
 
 def _compute_decode_splits(num_tokens, num_heads):
-    """Compute NSPLITS and TILES_PER_SPLIT for decode."""
+    """Compute NSPLITS and TILES_PER_SPLIT for decode.
+
+    Decode is latency/workspace bound more than occupancy bound. Empirically,
+    the best split choices on SM120 are very stable for the main DeepSeek
+    decode shapes, so prefer a small measured policy table over a single
+    occupancy-style heuristic.
+    """
     hpb = 16
     bi = 64
     topk = 2048
-    num_sms = 188
     ni = topk // bi  # 32
+
+    # Measured on RTX PRO 6000 Blackwell Server Edition.
+    if num_heads == 16:
+        return 16, 2
+    if num_heads == 128:
+        if num_tokens <= 1:
+            return 16, 2
+        if num_tokens <= 2:
+            return 8, 4
+        if num_tokens <= 5:
+            return 4, 8
+        if num_tokens <= 8:
+            return 2, 16
 
     replicate_h = num_heads // hpb
     ctas_per_split = num_tokens * replicate_h
 
-    nsplits = min(ni, max(1, (2 * num_sms + ctas_per_split - 1) // ctas_per_split))
+    # Fallback for less common head counts / batch sizes.
+    target_total_ctas = 128
+    nsplits = min(ni, max(1, (target_total_ctas + ctas_per_split - 1) // ctas_per_split))
     min_tiles = 2
     nsplits = min(nsplits, ni // min_tiles)
     nsplits = max(nsplits, 1)

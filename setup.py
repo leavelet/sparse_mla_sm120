@@ -8,6 +8,7 @@ cuda_sources = [
     os.path.join(csrc_dir, "binding.cpp"),
     os.path.join(csrc_dir, "sparse_mla_decode.cu"),
     os.path.join(csrc_dir, "sparse_mla_prefill.cu"),
+    os.path.join(csrc_dir, "mqa_logits.cu"),
 ]
 
 extra_compile_args = {
@@ -16,6 +17,7 @@ extra_compile_args = {
         "-O3",
         "-std=c++17",
         "-gencode=arch=compute_120a,code=sm_120a",
+        "-gencode=arch=compute_120f,code=sm_120f",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",

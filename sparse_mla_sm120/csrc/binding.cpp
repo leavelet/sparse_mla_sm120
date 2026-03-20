@@ -12,7 +12,18 @@ void sparse_mla_prefill_launch(
     torch::Tensor output,
     float sm_scale, int num_heads, int num_tokens, int topk, int BI);
 
+void fp8_mqa_logits_ragged_launch(
+    torch::Tensor Q, torch::Tensor KV, torch::Tensor KV_scale,
+    torch::Tensor W, torch::Tensor K_start, torch::Tensor K_end,
+    torch::Tensor logits, int max_seqlen_k);
+
+void fp8_mqa_logits_paged_launch(
+    torch::Tensor Q, torch::Tensor KV, torch::Tensor KV_scale,
+    torch::Tensor W, torch::Tensor ctx_lens, torch::Tensor block_table,
+    torch::Tensor logits, int next_n);
+
 static constexpr int DECODE_HPB = 16;
+static constexpr int MQA_HEAD_DIM = 128;
 
 void sparse_mla_decode_fwd(
     torch::Tensor Q,
@@ -71,7 +82,60 @@ void sparse_mla_prefill_fwd(
         sm_scale, num_heads, num_tokens, topk, 64);
 }
 
+void fp8_mqa_logits_ragged_fwd(
+    torch::Tensor Q,
+    torch::Tensor KV,
+    torch::Tensor KV_scale,
+    torch::Tensor W,
+    torch::Tensor K_start,
+    torch::Tensor K_end,
+    torch::Tensor logits,
+    int max_seqlen_k)
+{
+    TORCH_CHECK(Q.is_cuda() && KV.is_cuda() && KV_scale.is_cuda() &&
+                W.is_cuda() && K_start.is_cuda() && K_end.is_cuda() &&
+                logits.is_cuda(), "All tensors must be on CUDA");
+    TORCH_CHECK(Q.dim() == 3 && Q.size(2) == MQA_HEAD_DIM,
+                "Q must be (seq_q, num_heads, 128)");
+    TORCH_CHECK(KV.dim() == 2 && KV.size(1) == MQA_HEAD_DIM,
+                "KV must be (seq_kv, 128)");
+    TORCH_CHECK(Q.size(1) % 16 == 0, "num_heads must be a multiple of 16");
+    TORCH_CHECK(Q.is_contiguous() && KV.is_contiguous(),
+                "Q and KV must be contiguous");
+
+    fp8_mqa_logits_ragged_launch(Q, KV, KV_scale, W, K_start, K_end,
+                                 logits, max_seqlen_k);
+}
+
+void fp8_mqa_logits_paged_fwd(
+    torch::Tensor Q,
+    torch::Tensor KV,
+    torch::Tensor KV_scale,
+    torch::Tensor W,
+    torch::Tensor ctx_lens,
+    torch::Tensor block_table,
+    torch::Tensor logits,
+    int next_n)
+{
+    TORCH_CHECK(Q.is_cuda() && KV.is_cuda() && KV_scale.is_cuda() &&
+                W.is_cuda() && ctx_lens.is_cuda() && block_table.is_cuda() &&
+                logits.is_cuda(), "All tensors must be on CUDA");
+    TORCH_CHECK(Q.dim() == 3 && Q.size(2) == MQA_HEAD_DIM,
+                "Q must be (batch*next_n, num_heads, 128)");
+    TORCH_CHECK(KV.dim() == 3 && KV.size(1) == 64 && KV.size(2) == MQA_HEAD_DIM,
+                "KV must be (num_blocks, 64, 128)");
+    TORCH_CHECK(Q.size(1) % 16 == 0, "num_heads must be a multiple of 16");
+    TORCH_CHECK(Q.is_contiguous(), "Q must be contiguous");
+
+    fp8_mqa_logits_paged_launch(Q, KV, KV_scale, W, ctx_lens, block_table,
+                                logits, next_n);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_mla_decode_fwd", &sparse_mla_decode_fwd, "Sparse MLA decode forward (SM120)");
     m.def("sparse_mla_prefill_fwd", &sparse_mla_prefill_fwd, "Sparse MLA prefill forward (SM120)");
+    m.def("fp8_mqa_logits_ragged_fwd", &fp8_mqa_logits_ragged_fwd,
+          "FP8 MQA logits ragged forward (SM120)");
+    m.def("fp8_mqa_logits_paged_fwd", &fp8_mqa_logits_paged_fwd,
+          "FP8 MQA logits paged forward (SM120)");
 }
