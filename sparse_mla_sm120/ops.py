@@ -5,6 +5,7 @@ def _load_lib():
     return _C
 
 _decode_workspace = {}
+_DECODE_THRESHOLD = 64
 
 def _get_decode_workspace(num_heads, nsplits, device):
     """Pre-allocate and cache workspace tensors for decode split-KV."""
@@ -70,14 +71,32 @@ def _compute_decode_splits(num_tokens, num_heads):
     return nsplits, tiles_per_split
 
 
-def sparse_mla_fwd(
+def _validate_common_inputs(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    d_v: int = 512,
+) -> tuple[int, int, int, int, int]:
+    assert q.dtype == torch.bfloat16, f"q must be bf16, got {q.dtype}"
+    assert q.is_contiguous(), "q must be contiguous"
+    assert kv_cache.is_contiguous(), "kv_cache must be contiguous"
+    assert indices.dtype == torch.int32, f"indices must be int32, got {indices.dtype}"
+    assert indices.is_contiguous(), "indices must be contiguous"
+
+    num_tokens, num_heads, dim = q.shape
+    d_rope = dim - d_v
+    topk = indices.shape[-1]
+    return num_tokens, num_heads, dim, d_rope, topk
+
+
+def sparse_mla_decode_fwd(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
 ) -> torch.Tensor:
-    """Sparse MLA forward pass on SM120 with native FP8 KV cache.
+    """Sparse MLA decode forward on SM120 with native FP8 KV cache.
 
     Args:
         q: [num_tokens, num_heads, dim] bf16, dim = d_v + d_rope (576)
@@ -90,32 +109,73 @@ def sparse_mla_fwd(
         output: [num_tokens, num_heads, d_v] bf16
     """
     _C = _load_lib()
-
-    assert q.dtype == torch.bfloat16, f"q must be bf16, got {q.dtype}"
-    assert q.is_contiguous()
-    assert kv_cache.is_contiguous()
-    assert indices.dtype == torch.int32
-
-    num_tokens, num_heads, dim = q.shape
-    d_rope = dim - d_v
-    topk = indices.shape[-1]
+    num_tokens, num_heads, _, d_rope, topk = _validate_common_inputs(
+        q, kv_cache, indices, d_v
+    )
+    assert (
+        num_tokens <= _DECODE_THRESHOLD
+    ), f"decode path requires <= {_DECODE_THRESHOLD} tokens, got {num_tokens}"
 
     output = torch.empty(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=q.device
     )
-
-    decode_threshold = 64
-    if num_tokens <= decode_threshold:
-        nsplits, tiles_per_split = _compute_decode_splits(num_tokens, num_heads)
-        ws = _get_decode_workspace(num_heads, nsplits, q.device)
-        _C.sparse_mla_decode_fwd(
-            q, kv_cache, indices, output,
-            ws['partial_O'], ws['partial_LSE'], ws['semaphores'],
-            sm_scale, d_v, d_rope, topk,
-            tiles_per_split, nsplits)
-    else:
-        _C.sparse_mla_prefill_fwd(
-            q, kv_cache, indices, output,
-            sm_scale, d_v, d_rope, topk)
-
+    nsplits, tiles_per_split = _compute_decode_splits(num_tokens, num_heads)
+    ws = _get_decode_workspace(num_heads, nsplits, q.device)
+    _C.sparse_mla_decode_fwd(
+        q,
+        kv_cache,
+        indices,
+        output,
+        ws["partial_O"],
+        ws["partial_LSE"],
+        ws["semaphores"],
+        sm_scale,
+        d_v,
+        d_rope,
+        topk,
+        tiles_per_split,
+        nsplits,
+    )
     return output
+
+
+def sparse_mla_prefill_fwd(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+) -> torch.Tensor:
+    """Sparse MLA prefill forward on SM120 with native FP8 KV cache."""
+    _C = _load_lib()
+    num_tokens, num_heads, _, d_rope, topk = _validate_common_inputs(
+        q, kv_cache, indices, d_v
+    )
+    output = torch.empty(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=q.device
+    )
+    _C.sparse_mla_prefill_fwd(
+        q,
+        kv_cache,
+        indices,
+        output,
+        sm_scale,
+        d_v,
+        d_rope,
+        topk,
+    )
+    return output
+
+
+def sparse_mla_fwd(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+) -> torch.Tensor:
+    """Compatibility wrapper that dispatches to decode or prefill by token count."""
+    num_tokens = q.shape[0]
+    if num_tokens <= _DECODE_THRESHOLD:
+        return sparse_mla_decode_fwd(q, kv_cache, indices, sm_scale, d_v)
+    return sparse_mla_prefill_fwd(q, kv_cache, indices, sm_scale, d_v)

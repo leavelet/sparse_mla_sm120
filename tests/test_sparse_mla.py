@@ -153,6 +153,40 @@ def sm120_sparse_mla(
     )
 
 
+def sm120_sparse_mla_decode(
+    q: torch.Tensor,
+    kv_packed: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+) -> torch.Tensor:
+    import sparse_mla_sm120
+    return sparse_mla_sm120.sparse_mla_decode_fwd(
+        q=q.contiguous(),
+        kv_cache=kv_packed.contiguous(),
+        indices=indices.contiguous(),
+        sm_scale=sm_scale,
+        d_v=d_v,
+    )
+
+
+def sm120_sparse_mla_prefill(
+    q: torch.Tensor,
+    kv_packed: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+) -> torch.Tensor:
+    import sparse_mla_sm120
+    return sparse_mla_sm120.sparse_mla_prefill_fwd(
+        q=q.contiguous(),
+        kv_cache=kv_packed.contiguous(),
+        indices=indices.contiguous(),
+        sm_scale=sm_scale,
+        d_v=d_v,
+    )
+
+
 # ── Test configs ──────────────────────────────────────────────────────────
 
 BATCH_SIZES = [1, 4, 8]
@@ -181,7 +215,7 @@ def test_correctness_all_valid(batch_size: int, num_heads: int) -> None:
     kv_dequant = unpack_kv_cache_fp8(kv_packed)
 
     ref = sparse_attention_ref(q, kv_dequant, indices, sm_scale, D_NOPE)
-    out = sm120_sparse_mla(q, kv_packed, indices, sm_scale, D_NOPE)
+    out = sm120_sparse_mla_decode(q, kv_packed, indices, sm_scale, D_NOPE)
 
     print(f"\n  batch={batch_size}, heads={num_heads}")
     print(f"  max_abs_err = {(out.float() - ref.float()).abs().max().item():.4f}")
@@ -211,7 +245,7 @@ def test_correctness_mixed_invalid(batch_size: int, num_heads: int) -> None:
     kv_dequant = unpack_kv_cache_fp8(kv_packed)
 
     ref = sparse_attention_ref(q, kv_dequant, indices, sm_scale, D_NOPE)
-    out = sm120_sparse_mla(q, kv_packed, indices, sm_scale, D_NOPE)
+    out = sm120_sparse_mla_decode(q, kv_packed, indices, sm_scale, D_NOPE)
 
     print(f"\n  batch={batch_size}, heads={num_heads}, valid={n_valid}/{TOPK}")
     print(f"  max_abs_err = {(out.float() - ref.float()).abs().max().item():.4f}")
@@ -235,7 +269,7 @@ def test_no_nan_inf(num_heads: int) -> None:
 
     kv_packed = pack_kv_cache_fp8(kv_bf16)
 
-    out = sm120_sparse_mla(q, kv_packed, indices, sm_scale, D_NOPE)
+    out = sm120_sparse_mla_decode(q, kv_packed, indices, sm_scale, D_NOPE)
     assert not torch.isnan(out).any(), "output contains NaN"
     assert not torch.isinf(out).any(), "output contains Inf"
 
@@ -261,7 +295,7 @@ def test_prefill_path(num_heads: int) -> None:
     kv_dequant = unpack_kv_cache_fp8(kv_packed)
 
     ref = sparse_attention_ref(q, kv_dequant, indices, sm_scale, D_NOPE)
-    out = sm120_sparse_mla(q, kv_packed, indices, sm_scale, D_NOPE)
+    out = sm120_sparse_mla_prefill(q, kv_packed, indices, sm_scale, D_NOPE)
 
     err = (out.float() - ref.float()).abs()
     print(f"\n  batch={batch_size}, heads={num_heads} (prefill)")

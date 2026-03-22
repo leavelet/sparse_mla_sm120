@@ -148,7 +148,9 @@ def main():
                 indices = torch.randint(0, total_len, (chunk, TOPK), device="cuda", dtype=torch.int32)
 
                 def run():
-                    sparse_mla_sm120.sparse_mla_fwd(q, kv_packed[:total_len], indices, sm_scale, D_V)
+                    sparse_mla_sm120.sparse_mla_prefill_fwd(
+                        q, kv_packed[:total_len], indices, sm_scale, D_V
+                    )
 
                 ms = bench_fn(run, warmup=5, rep=20)
                 f = flops(chunk, nh)
@@ -180,7 +182,9 @@ def main():
                 indices = torch.randint(0, total_len, (bs, TOPK), device="cuda", dtype=torch.int32)
 
                 def run():
-                    sparse_mla_sm120.sparse_mla_fwd(q, kv_packed[:total_len], indices, sm_scale, D_V)
+                    sparse_mla_sm120.sparse_mla_decode_fwd(
+                        q, kv_packed[:total_len], indices, sm_scale, D_V
+                    )
 
                 ms = bench_fn(run, warmup=5, rep=30)
                 f = flops(bs, nh)
