@@ -557,7 +557,7 @@ sparse_mla_prefill_mg_kernel(
             bar_sync_t<1, BLOCK_THREADS>();
         }
     } else {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(200));
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(232));
 
         const int lane = threadIdx.x & 31;
         const int mwarp = warp_rank;
@@ -567,6 +567,9 @@ sparse_mla_prefill_mg_kernel(
 
         QRopeRegs q_rope_regs[MG_N_HG];
         float acc_o[MG_N_HG][ACC_TILES][4];
+
+        // Deferred row_sum: per-warp partial l accumulators
+        float warp_l_partial[MG_N_HG][2];
 
         #pragma unroll
         for (int g = 0; g < MG_N_HG; g++) {
@@ -582,6 +585,8 @@ sparse_mla_prefill_mg_kernel(
                 sm.m_smem[g * HPB + h] = -1e30f;
                 sm.l_smem[g * HPB + h] = 0.f;
             }
+            warp_l_partial[g][0] = 0.f;
+            warp_l_partial[g][1] = 0.f;
             #pragma unroll
             for (int t = 0; t < ACC_TILES; t++)
                 acc_o[g][t][0] = acc_o[g][t][1] = acc_o[g][t][2] = acc_o[g][t][3] = 0.f;
@@ -656,7 +661,7 @@ sparse_mla_prefill_mg_kernel(
                 float nm = fmaxf(old_m, tm);
                 float alpha = exp2f(old_m - nm);
                 g_m[h] = nm;
-                g_l[h] *= alpha;
+                // g_l[h] *= alpha;  -- deferred to finalize
                 sm.reduce_buf[g * MG_N_HG * HPB + h] = alpha;
                 sm.reduce_buf[g * MG_N_HG * HPB + HPB + h] = nm;
             }
@@ -669,30 +674,42 @@ sparse_mla_prefill_mg_kernel(
                 float alpha1 = sm.reduce_buf[g * MG_N_HG * HPB + gid + 8];
                 float nm0 = sm.reduce_buf[g * MG_N_HG * HPB + HPB + gid];
                 float nm1 = sm.reduce_buf[g * MG_N_HG * HPB + HPB + gid + 8];
-                #pragma unroll
-                for (int t = 0; t < ACC_TILES; t++) {
-                    acc_o[g][t][0] *= alpha0; acc_o[g][t][1] *= alpha0;
-                    acc_o[g][t][2] *= alpha1; acc_o[g][t][3] *= alpha1;
+                // Conditional rescaling: skip when max didn't change (alpha == 1.0)
+                if (alpha0 != 1.0f) {
+                    #pragma unroll
+                    for (int t = 0; t < ACC_TILES; t++) {
+                        acc_o[g][t][0] *= alpha0; acc_o[g][t][1] *= alpha0;
+                    }
                 }
+                if (alpha1 != 1.0f) {
+                    #pragma unroll
+                    for (int t = 0; t < ACC_TILES; t++) {
+                        acc_o[g][t][2] *= alpha1; acc_o[g][t][3] *= alpha1;
+                    }
+                }
+                // Deferred row_sum: rescale warp's partial l
+                warp_l_partial[g][0] *= alpha0;
+                warp_l_partial[g][1] *= alpha1;
                 weights[g][0] = exp2f(sc_g[g][0] - nm0);
                 weights[g][1] = exp2f(sc_g[g][1] - nm0);
                 weights[g][2] = exp2f(sc_g[g][2] - nm1);
                 weights[g][3] = exp2f(sc_g[g][3] - nm1);
             }
 
-            // ── Combined sum + atomicMax for both groups (1 barrier) ──
+            // ── Deferred row_sum + atomicMax for both groups (1 barrier) ──
             #pragma unroll
             for (int g = 0; g < MG_N_HG; g++) {
                 float w0 = weights[g][0], w1 = weights[g][1];
                 float w2 = weights[g][2], w3 = weights[g][3];
+                // Deferred: accumulate row_sum in registers (no SMEM write)
                 float ls0 = w0 + w1, ls1 = w2 + w3;
                 ls0 += __shfl_xor_sync(0xffffffff, ls0, 1);
                 ls0 += __shfl_xor_sync(0xffffffff, ls0, 2);
                 ls1 += __shfl_xor_sync(0xffffffff, ls1, 1);
                 ls1 += __shfl_xor_sync(0xffffffff, ls1, 2);
                 if (tid == 0) {
-                    sm.sum_reduce_buf[g * MG_REDUCE_GRP_STRIDE + mwarp * HPB + gid] = ls0;
-                    sm.sum_reduce_buf[g * MG_REDUCE_GRP_STRIDE + mwarp * HPB + gid + 8] = ls1;
+                    warp_l_partial[g][0] += ls0;
+                    warp_l_partial[g][1] += ls1;
                 }
 
                 float* g_wsc = sm.w_head_sc_all + g * N_V_CHUNKS * HPB;
@@ -708,17 +725,7 @@ sparse_mla_prefill_mg_kernel(
             }
             bar_sync_t<2, MATH_THREADS>();
 
-            // ── Normalize scales + accumulate l for both groups (1 barrier) ──
-            if (threadIdx.x < MG_N_HG * HPB) {
-                const int g = threadIdx.x / HPB;
-                const int h = threadIdx.x % HPB;
-                float* g_l = sm.l_smem + g * HPB;
-                float ts = 0.f;
-                #pragma unroll
-                for (int w = 0; w < N_MATH_WARPS; w++)
-                    ts += sm.sum_reduce_buf[g * MG_REDUCE_GRP_STRIDE + w * HPB + h];
-                g_l[h] += ts;
-            }
+            // ── Normalize scales (deferred row_sum: no l accumulation here) ──
             for (int i = threadIdx.x; i < MG_N_HG * N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
             bar_sync_t<2, MATH_THREADS>();
@@ -757,24 +764,33 @@ sparse_mla_prefill_mg_kernel(
 
                     bar_sync_t<2, MATH_THREADS>();
 
-                    // XV MMA for BOTH groups (reading from group-specific w_fp8 rows)
+                    // XV MMA with B-operand reuse across head groups
                     #pragma unroll
-                    for (int g = 0; g < MG_N_HG; g++) {
-                        float* g_wsc = sm.w_head_sc_all + g * N_V_CHUNKS * HPB + vc * HPB;
-                        uint8_t* gw = sm.w_fp8_grp(g);
+                    for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
+                        int ti = vc * NT_PER_WARP_XV + nt;
+                        int nl = mwarp * (NT_PER_WARP_XV * 8) + nt * 8;
+
+                        // Preload B (V^T) for all ksteps — shared across groups
+                        uint32_t bv0[XV_KSTEPS], bv1[XV_KSTEPS];
+                        #pragma unroll
+                        for (int kstep = 0; kstep < XV_KSTEPS; kstep++) {
+                            int ko = kstep * 32;
+                            ldmatrix_load_B_fp8(bv0[kstep], bv1[kstep],
+                                sm.v_trans + nl * V_TRANS_STRIDE + ko, V_TRANS_STRIDE, lane);
+                        }
 
                         #pragma unroll
-                        for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
-                            int ti = vc * NT_PER_WARP_XV + nt;
-                            int nl = mwarp * (NT_PER_WARP_XV * 8) + nt * 8;
+                        for (int g = 0; g < MG_N_HG; g++) {
+                            float* g_wsc = sm.w_head_sc_all + g * N_V_CHUNKS * HPB + vc * HPB;
+                            uint8_t* gw = sm.w_fp8_grp(g);
                             float xv[4] = {0.f, 0.f, 0.f, 0.f};
                             #pragma unroll
                             for (int kstep = 0; kstep < XV_KSTEPS; kstep++) {
                                 int ko = kstep * 32;
-                                uint32_t a0, a1, a2, a3, b0, b1;
+                                uint32_t a0, a1, a2, a3;
                                 ldmatrix_load_A_fp8(a0, a1, a2, a3, gw + ko, W_FP8_STRIDE, lane);
-                                ldmatrix_load_B_fp8(b0, b1, sm.v_trans + nl * V_TRANS_STRIDE + ko, V_TRANS_STRIDE, lane);
-                                MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
+                                MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3,
+                                    bv0[kstep], bv1[kstep], xv[0], xv[1], xv[2], xv[3]);
                                 xv[0] = r.d0; xv[1] = r.d1; xv[2] = r.d2; xv[3] = r.d3;
                             }
                             float sc0 = g_wsc[gid], sc1 = g_wsc[gid + 8];
@@ -794,6 +810,27 @@ sparse_mla_prefill_mg_kernel(
                 mbarrier_wait_parity(sm.mbar_kv + ((ni + 1) & 1), next_phase);
             }
         }
+
+        // ── Finalize deferred row_sum ────────────────────────────
+        #pragma unroll
+        for (int g = 0; g < MG_N_HG; g++) {
+            if (tid == 0) {
+                sm.sum_reduce_buf[g * MG_REDUCE_GRP_STRIDE + mwarp * HPB + gid] = warp_l_partial[g][0];
+                sm.sum_reduce_buf[g * MG_REDUCE_GRP_STRIDE + mwarp * HPB + gid + 8] = warp_l_partial[g][1];
+            }
+        }
+        bar_sync_t<2, MATH_THREADS>();
+
+        if (threadIdx.x < MG_N_HG * HPB) {
+            const int g = threadIdx.x / HPB;
+            const int h = threadIdx.x % HPB;
+            float ts = 0.f;
+            #pragma unroll
+            for (int w = 0; w < N_MATH_WARPS; w++)
+                ts += sm.sum_reduce_buf[g * MG_REDUCE_GRP_STRIDE + w * HPB + h];
+            sm.l_smem[g * HPB + h] = ts;
+        }
+        bar_sync_t<2, MATH_THREADS>();
 
         // ── Coalesced output via smem staging ───────────────────
         bf16* staging = reinterpret_cast<bf16*>(sm.kv_bufs[0]);

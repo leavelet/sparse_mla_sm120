@@ -1,11 +1,15 @@
 import torch
 
+
 def _load_lib():
     import sparse_mla_sm120._C as _C
+
     return _C
+
 
 _decode_workspace = {}
 _DECODE_THRESHOLD = 64
+
 
 def _get_decode_workspace(num_heads, nsplits, device):
     """Pre-allocate and cache workspace tensors for decode split-KV."""
@@ -16,15 +20,17 @@ def _get_decode_workspace(num_heads, nsplits, device):
     hpb = 16
     if ws is None:
         ws = {
-            'partial_O': torch.empty(
+            "partial_O": torch.empty(
                 (max_tokens, nsplits, num_heads, d_v),
-                dtype=torch.bfloat16, device=device),
-            'partial_LSE': torch.empty(
-                (max_tokens, nsplits, num_heads),
-                dtype=torch.float32, device=device),
-            'semaphores': torch.zeros(
-                (max_tokens * (num_heads // hpb),),
-                dtype=torch.int32, device=device),
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            "partial_LSE": torch.empty(
+                (max_tokens, nsplits, num_heads), dtype=torch.float32, device=device
+            ),
+            "semaphores": torch.zeros(
+                (max_tokens * (num_heads // hpb),), dtype=torch.int32, device=device
+            ),
         }
         _decode_workspace[key] = ws
     return ws
@@ -61,7 +67,9 @@ def _compute_decode_splits(num_tokens, num_heads):
 
     # Fallback for less common head counts / batch sizes.
     target_total_ctas = 128
-    nsplits = min(ni, max(1, (target_total_ctas + ctas_per_split - 1) // ctas_per_split))
+    nsplits = min(
+        ni, max(1, (target_total_ctas + ctas_per_split - 1) // ctas_per_split)
+    )
     min_tiles = 2
     nsplits = min(nsplits, ni // min_tiles)
     nsplits = max(nsplits, 1)
@@ -112,9 +120,9 @@ def sparse_mla_decode_fwd(
     num_tokens, num_heads, _, d_rope, topk = _validate_common_inputs(
         q, kv_cache, indices, d_v
     )
-    assert (
-        num_tokens <= _DECODE_THRESHOLD
-    ), f"decode path requires <= {_DECODE_THRESHOLD} tokens, got {num_tokens}"
+    assert num_tokens <= _DECODE_THRESHOLD, (
+        f"decode path requires <= {_DECODE_THRESHOLD} tokens, got {num_tokens}"
+    )
 
     output = torch.empty(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=q.device

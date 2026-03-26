@@ -161,24 +161,12 @@ __device__ __forceinline__ void ldmatrix_load_A_bf16(
 }
 
 // ── B128 XOR swizzle helpers ─────────────────────────────────────────────
-//
-// For row-major FP8 tiles with row_stride = 128 bytes (= HEAD_DIM for
-// DeepSeek V3.2), B128 swizzle XORs each 16-byte chunk's column offset
-// with (row % 8) * 16.  This distributes 8 consecutive rows across all
-// 32 shared-memory banks, eliminating bank conflicts for ldmatrix.
-//
-// Data must be stored to smem with the same XOR applied at write time.
-// TMA with CU_TENSOR_MAP_SWIZZLE_128B does this automatically; for
-// manual __ldg stores use swizzle_b128_col() on the column byte offset.
 
 __device__ __forceinline__ int swizzle_b128_col(int row, int col_byte) {
     return col_byte ^ ((row & 7) << 4);
 }
 
 // Load FP8 A operand [16×32] from a B128-swizzled tile (row_stride = 128).
-//   tile_base: smem pointer to the tile origin (row 0, col 0).
-//   mt:        m-tile index (0..M_TILES-1), selects 16-row group.
-//   k:         k-iteration (0..K_ITERS-1), selects 32-col slice.
 __device__ __forceinline__ void ldmatrix_load_A_fp8_swz(
     uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3,
     const uint8_t* tile_base, int mt, int k, int lane)
@@ -191,9 +179,6 @@ __device__ __forceinline__ void ldmatrix_load_A_fp8_swz(
 }
 
 // Load FP8 B operand [8×32] from a B128-swizzled tile (row_stride = 128).
-//   tile_base: smem pointer to the tile origin (row 0, col 0).
-//   n_row:     first row of the 8-row n-tile within the KV tile.
-//   k:         k-iteration (0..K_ITERS-1), selects 32-col slice.
 __device__ __forceinline__ void ldmatrix_load_B_fp8_swz(
     uint32_t& b0, uint32_t& b1,
     const uint8_t* tile_base, int n_row, int k, int lane)

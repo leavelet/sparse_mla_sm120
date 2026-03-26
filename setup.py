@@ -26,7 +26,8 @@ extra_compile_args = {
         "--ptxas-options=-v",
         "-DNDEBUG",
         "-lineinfo",
-        "--threads", "8",
+        "--threads",
+        "8",
     ],
 }
 
