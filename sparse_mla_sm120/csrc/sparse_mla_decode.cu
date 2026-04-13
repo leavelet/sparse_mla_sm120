@@ -172,7 +172,7 @@ sparse_mla_decode_kernel(
 
     // ── Math warps ──────────────────────────────────────────────────────
     } else {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(200));
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(232));
 
         const int lane = threadIdx.x & 31;
         const int mwarp = warp_rank;
