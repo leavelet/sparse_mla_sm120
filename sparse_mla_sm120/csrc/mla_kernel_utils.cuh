@@ -15,11 +15,11 @@
 
 template <int ID, int CNT>
 __device__ __forceinline__ void bar_arrive_t() {
-    asm volatile("barrier.cta.arrive %0, %1;\n" :: "n"(ID), "r"(CNT) : "memory");
+    asm volatile("barrier.cta.arrive %0, %1;\n" :: "n"(ID), "n"(CNT) : "memory");
 }
 template <int ID, int CNT>
 __device__ __forceinline__ void bar_sync_t() {
-    asm volatile("barrier.cta.sync %0, %1;\n" :: "n"(ID), "r"(CNT) : "memory");
+    asm volatile("barrier.cta.sync %0, %1;\n" :: "n"(ID), "n"(CNT) : "memory");
 }
 
 // ── cp.async with L2 prefetch hint ──────────────────────────────────────
@@ -249,10 +249,19 @@ __device__ __forceinline__ void transpose_v_chunk(
     const uint8_t* __restrict__ kv_smem,
     int v_off, int /*lane*/)
 {
+    static_assert(_V_CHUNK % 4 == 0, "V_CHUNK must be a multiple of 4");
+    static_assert(_KV_SMEM_STRIDE % 4 == 0, "KV stride must be 4B-aligned");
     constexpr int BI_SHIFT = (_BI == 64) ? 6 : ((_BI == 32) ? 5 : 0);
     static_assert(BI_SHIFT != 0, "BI must be 32 or 64");
-    for (int idx = threadIdx.x; idx < _V_CHUNK * _BI; idx += _MATH_THREADS) {
-        int d = idx >> BI_SHIFT, e = idx & (_BI - 1);
-        v_trans[d * _V_TRANS_STRIDE + e] = kv_smem[e * _KV_SMEM_STRIDE + v_off + d];
+    constexpr int WORK = (_V_CHUNK / 4) * _BI;
+    for (int idx = threadIdx.x; idx < WORK; idx += _MATH_THREADS) {
+        int d4 = (idx >> BI_SHIFT) * 4;
+        int e  = idx & (_BI - 1);
+        uint32_t val = *reinterpret_cast<const uint32_t*>(
+            kv_smem + e * _KV_SMEM_STRIDE + v_off + d4);
+        v_trans[(d4 + 0) * _V_TRANS_STRIDE + e] = (uint8_t)(val);
+        v_trans[(d4 + 1) * _V_TRANS_STRIDE + e] = (uint8_t)(val >> 8);
+        v_trans[(d4 + 2) * _V_TRANS_STRIDE + e] = (uint8_t)(val >> 16);
+        v_trans[(d4 + 3) * _V_TRANS_STRIDE + e] = (uint8_t)(val >> 24);
     }
 }
