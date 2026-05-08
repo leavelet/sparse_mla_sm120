@@ -2,13 +2,13 @@ import os
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-csrc_dir = os.path.join(os.path.dirname(__file__), "sparse_mla_sm120", "csrc")
+csrc_dir = os.path.join(os.path.dirname(__file__), "csrc")
 
 cuda_sources = [
     os.path.join(csrc_dir, "binding.cpp"),
-    os.path.join(csrc_dir, "sparse_mla_decode.cu"),
-    os.path.join(csrc_dir, "sparse_mla_prefill.cu"),
-    os.path.join(csrc_dir, "mqa_logits.cu"),
+    os.path.join(csrc_dir, "kernel", "decode", "decode_launch.cu"),
+    os.path.join(csrc_dir, "kernel", "combine", "combine_kernel.cu"),
+    os.path.join(csrc_dir, "kernel", "prefill", "prefill_stub.cu"),
 ]
 
 extra_compile_args = {
@@ -32,12 +32,12 @@ extra_compile_args = {
 }
 
 setup(
-    name="sparse_mla_sm120",
+    name="flash_mla_sm120",
     version="0.1.0",
-    packages=find_packages(),
+    packages=["flash_mla_sm120"],
     ext_modules=[
         CUDAExtension(
-            name="sparse_mla_sm120._C",
+            name="flash_mla_sm120.cuda",
             sources=cuda_sources,
             include_dirs=[csrc_dir],
             extra_compile_args=extra_compile_args,

@@ -12,3 +12,6 @@ dist/
 *.pywz
 *.pyzw
 refs/
+microbench/
+docs_internal/
+tests/csrc/
