@@ -6,11 +6,9 @@
 // V transpose: byte-level [BI × V_CHUNK] → [V_CHUNK × BI] in smem.
 //
 // Required for FP8 XV MMA path (ldmatrix needs column-major B operand).
-// FP8 data cannot use ldmatrix.trans (it operates at b16 granularity,
-// swapping pairs of FP8 bytes rather than individual bytes).
-//
-// Uses uint32 loads (4 FP8 bytes at once) for throughput.
-// The V_TRANS_STRIDE includes padding for bank conflict avoidance.
+// Uses PRMT (byte permute) for 4×4 block transpose: load 4 uint32 from
+// 4 entries, permute bytes to transpose, store 4 uint32 to 4 dim rows.
+// 4× STS.32 instead of 4× STS.U8 → better smem store throughput.
 
 template <ModelType MT, ComputeMode CM>
 __device__ __forceinline__ void transpose_v_chunk(
@@ -23,28 +21,51 @@ __device__ __forceinline__ void transpose_v_chunk(
     constexpr int V_CHUNK_LOCAL = CT::V_CHUNK;
     constexpr int KV_STRIDE = KV::KV_SMEM_STRIDE;
     constexpr int VT_STRIDE = CT::V_TRANS_STRIDE;
-    constexpr int WORK = (V_CHUNK_LOCAL / 4) * BI;
 
-    for (int idx = threadIdx.x; idx < WORK; idx += MATH_THREADS) {
-        int d4 = (idx / BI) * 4;
-        int e  = idx % BI;
+    // Process 4×4 byte blocks: (V_CHUNK/4) × (BI/4) blocks total
+    constexpr int N_BLOCKS = (V_CHUNK_LOCAL / 4) * (BI / 4);
 
-        // Handle MODEL1 padding: when v_off + d4 >= D_NOPE, read zeros
-        uint32_t val;
+    for (int bid = threadIdx.x; bid < N_BLOCKS; bid += MATH_THREADS) {
+        int bd = (bid / (BI / 4)) * 4;   // dim block start (0, 4, 8, ...)
+        int be = (bid % (BI / 4)) * 4;   // entry block start (0, 4, 8, ...)
+
+        // Load 4 rows of 4 bytes each
+        uint32_t r0, r1, r2, r3;
         if constexpr (KV::V_HAS_ROPE) {
-            // MODEL1: pad 448→512, last chunk reads beyond D_NOPE
-            if (v_off + d4 + 3 < KV::D_NOPE)
-                val = *reinterpret_cast<const uint32_t*>(kv_smem + e * KV_STRIDE + v_off + d4);
-            else
-                val = 0;  // padding region
+            if (v_off + bd + 3 < KV::D_NOPE) {
+                r0 = *reinterpret_cast<const uint32_t*>(kv_smem + (be+0)*KV_STRIDE + v_off + bd);
+                r1 = *reinterpret_cast<const uint32_t*>(kv_smem + (be+1)*KV_STRIDE + v_off + bd);
+                r2 = *reinterpret_cast<const uint32_t*>(kv_smem + (be+2)*KV_STRIDE + v_off + bd);
+                r3 = *reinterpret_cast<const uint32_t*>(kv_smem + (be+3)*KV_STRIDE + v_off + bd);
+            } else {
+                r0 = r1 = r2 = r3 = 0;
+            }
         } else {
-            // V32: all 512 bytes are valid nope
-            val = *reinterpret_cast<const uint32_t*>(kv_smem + e * KV_STRIDE + v_off + d4);
+            r0 = *reinterpret_cast<const uint32_t*>(kv_smem + (be+0)*KV_STRIDE + v_off + bd);
+            r1 = *reinterpret_cast<const uint32_t*>(kv_smem + (be+1)*KV_STRIDE + v_off + bd);
+            r2 = *reinterpret_cast<const uint32_t*>(kv_smem + (be+2)*KV_STRIDE + v_off + bd);
+            r3 = *reinterpret_cast<const uint32_t*>(kv_smem + (be+3)*KV_STRIDE + v_off + bd);
         }
 
-        v_trans[(d4 + 0) * VT_STRIDE + e] = (uint8_t)(val);
-        v_trans[(d4 + 1) * VT_STRIDE + e] = (uint8_t)(val >> 8);
-        v_trans[(d4 + 2) * VT_STRIDE + e] = (uint8_t)(val >> 16);
-        v_trans[(d4 + 3) * VT_STRIDE + e] = (uint8_t)(val >> 24);
+        // 4×4 byte transpose using PRMT
+        // r0=[a00 a01 a02 a03], r1=[a10 a11 a12 a13], etc.
+        // Want: c0=[a00 a10 a20 a30], c1=[a01 a11 a21 a31], etc.
+        uint32_t t01_lo, t01_hi, t23_lo, t23_hi;
+        asm volatile("prmt.b32 %0, %1, %2, 0x5140;\n" : "=r"(t01_lo) : "r"(r0), "r"(r1));
+        asm volatile("prmt.b32 %0, %1, %2, 0x7362;\n" : "=r"(t01_hi) : "r"(r0), "r"(r1));
+        asm volatile("prmt.b32 %0, %1, %2, 0x5140;\n" : "=r"(t23_lo) : "r"(r2), "r"(r3));
+        asm volatile("prmt.b32 %0, %1, %2, 0x7362;\n" : "=r"(t23_hi) : "r"(r2), "r"(r3));
+
+        uint32_t c0, c1, c2, c3;
+        asm volatile("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(c0) : "r"(t01_lo), "r"(t23_lo));
+        asm volatile("prmt.b32 %0, %1, %2, 0x7632;\n" : "=r"(c1) : "r"(t01_lo), "r"(t23_lo));
+        asm volatile("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(c2) : "r"(t01_hi), "r"(t23_hi));
+        asm volatile("prmt.b32 %0, %1, %2, 0x7632;\n" : "=r"(c3) : "r"(t01_hi), "r"(t23_hi));
+
+        // Store 4 transposed columns as uint32
+        *reinterpret_cast<uint32_t*>(v_trans + (bd+0)*VT_STRIDE + be) = c0;
+        *reinterpret_cast<uint32_t*>(v_trans + (bd+1)*VT_STRIDE + be) = c1;
+        *reinterpret_cast<uint32_t*>(v_trans + (bd+2)*VT_STRIDE + be) = c2;
+        *reinterpret_cast<uint32_t*>(v_trans + (bd+3)*VT_STRIDE + be) = c3;
     }
 }
