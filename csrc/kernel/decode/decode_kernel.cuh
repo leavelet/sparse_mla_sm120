@@ -150,27 +150,35 @@ sparse_mla_decode_kernel(
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
             uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
-            // Precompute gid's entry base for QK rope prefetch.
-            // Only gid's entry needed — xv_rope_mma recomputes addresses independently.
-            const uint8_t* entry_base_gid;
-            {
-                int idx = ib[qk_nb + gid];
-                idx = (idx >= 0) ? idx : 0;
-                if constexpr (KV::V_HAS_ROPE) {
+            // Precompute entry base pointers for global KV access.
+            // V32 (flat addressing): only gid's entry needed (for QK rope).
+            // MODEL1 (block-structured): all 8 entries precomputed (div/mod expensive).
+            const uint8_t* entry_base[ENTRIES_PER_WARP];
+            if constexpr (KV::V_HAS_ROPE) {
+                // MODEL1: precompute all 8 — used by QK rope + XV rope
+                #pragma unroll
+                for (int e = 0; e < ENTRIES_PER_WARP; e++) {
+                    int idx = ib[qk_nb + e];
+                    idx = (idx >= 0) ? idx : 0;
                     int bi_e = idx / page_block_size;
                     int li_e = idx % page_block_size;
-                    entry_base_gid = KV_cache + (size_t)bi_e * stride_kv_block
-                                              + (size_t)li_e * IO::IO_STRIDE;
-                } else {
-                    entry_base_gid = KV_cache + (size_t)idx * IO::IO_STRIDE;
+                    entry_base[e] = KV_cache + (size_t)bi_e * stride_kv_block
+                                             + (size_t)li_e * IO::IO_STRIDE;
                 }
+            } else {
+                // V32: only precompute gid's entry (QK rope needs only this one)
+                int idx = ib[qk_nb + gid];
+                idx = (idx >= 0) ? idx : 0;
+                entry_base[gid] = KV_cache + (size_t)idx * IO::IO_STRIDE;
             }
 
             for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = 0.f;
 
+            // Prefetch KV rope B operands into registers — loads issue now,
+            // data arrives during the ~16 QK nope MMAs below (~300 cycle overlap).
             KVRopePrefetch rope_pf = prefetch_kv_rope(
-                reinterpret_cast<const bf16*>(entry_base_gid + KV::KV_ROPE_GMEM_OFFSET), lane);
+                reinterpret_cast<const bf16*>(entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET), lane);
 
             // ── QK nope (block-scaled FP8 MMA) ─────────────────────
             // sfa: UE8M0 Q scale for M-row = gid + (lane&1)*8
@@ -268,120 +276,63 @@ sparse_mla_decode_kernel(
                 sm.sum_reduce_buf[mwarp * HPB + gid + 8] = ls1;
             }
 
-            // ── XV nope MMA ─────────────────────────────────────────
-            if constexpr (L::BF16_XV) {
-                // BF16 XV: dequant FP8→BF16 per V-tile, BF16 MMA (MODEL1)
-                // O1 barrier: reduce_buf dead, sum_reduce_buf needed for deferred sum
-                if (threadIdx.x < HPB) {
-                    int h = threadIdx.x;
-                    float ts = 0.f;
-                    #pragma unroll
-                    for (int w = 0; w < N_MATH_WARPS; w++)
-                        ts += sm.sum_reduce_buf[w * HPB + h];
-                    sm.l_smem[h] += ts;
-                }
-                bar_sync_t<2, MATH_THREADS>();
-
-                // Store softmax weights as BF16
-                {
-                    const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
-                    sm.w_bf16[gid * L::W_BF16_STRIDE + e0i]       = __float2bfloat16(w0);
-                    sm.w_bf16[gid * L::W_BF16_STRIDE + e1i]       = __float2bfloat16(w1);
-                    sm.w_bf16[(gid+8) * L::W_BF16_STRIDE + e0i]   = __float2bfloat16(w2);
-                    sm.w_bf16[(gid+8) * L::W_BF16_STRIDE + e1i]   = __float2bfloat16(w3);
-                }
-                bar_sync_t<2, MATH_THREADS>();
-
+            // ── V scale cache + atomicMax ───────────────────────────
+            // Pre-load V scales into registers — reused in W quantize below.
+            float vsc_cache[CT::N_V_CHUNKS][2];
+            {
+                const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
+                const uint8_t* e0_base = kv_warp_base + tid * 2 * KV::KV_SMEM_STRIDE;
+                const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
                 #pragma unroll
                 for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-                    const int v_off = vc * KV::QUANT_TILE;
-
-                    // Cooperative dequant FP8→BF16
-                    for (int idx = threadIdx.x; idx < BI * KV::QUANT_TILE; idx += MATH_THREADS) {
-                        int entry = idx / KV::QUANT_TILE;
-                        int dim = idx % KV::QUANT_TILE;
-                        uint8_t fp8_byte = kv_smem[entry * KV::KV_SMEM_STRIDE + v_off + dim];
-                        float fp8_val = fp8e4m3_to_fp32(fp8_byte);
-                        uint8_t sc_byte = sm.kv_scale_bufs[ti & 1][entry * KV::SCALE_BYTES_PER_TOKEN + vc];
-                        float scale = ue8m0_to_fp32(sc_byte);
-                        sm.staging[entry * L::STAGING_STRIDE + dim] = __float2bfloat16(fp8_val * scale);
+                    if constexpr (KV::SCALE_IN_KV_SMEM) {
+                        vsc_cache[vc][0] = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
+                        vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
+                    } else {
+                        vsc_cache[vc][0] = ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+                        vsc_cache[vc][1] = ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
                     }
-                    bar_sync_t<2, MATH_THREADS>();
-
-                    constexpr int BF16_XV_KSTEPS = BI / 16;
-                    #pragma unroll
-                    for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
-                        int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
-                        int nl = mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
-                        float xv[4] = {0.f, 0.f, 0.f, 0.f};
-                        #pragma unroll
-                        for (int kstep = 0; kstep < BF16_XV_KSTEPS; kstep++) {
-                            int ko = kstep * 16;
-                            uint32_t a0, a1, a2, a3, b0, b1;
-                            ldmatrix_load_A_bf16(a0, a1, a2, a3,
-                                sm.w_bf16 + ko, L::W_BF16_STRIDE, lane);
-                            ldmatrix_load_B_bf16_trans(b0, b1,
-                                sm.staging + ko * L::STAGING_STRIDE + nl,
-                                L::STAGING_STRIDE, lane);
-                            MmaBf16Result r = mma_bf16_m16n8k16(
-                                a0, a1, a2, a3, b0, b1,
-                                xv[0], xv[1], xv[2], xv[3]);
-                            xv[0] = r.d0; xv[1] = r.d1; xv[2] = r.d2; xv[3] = r.d3;
-                        }
-                        acc_o[ti_acc][0] += xv[0]; acc_o[ti_acc][1] += xv[1];
-                        acc_o[ti_acc][2] += xv[2]; acc_o[ti_acc][3] += xv[3];
-                    }
-
-                    if (vc < CT::N_V_CHUNKS - 1)
-                        bar_sync_t<2, MATH_THREADS>();
+                    float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
+                    float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
+                    atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid]),
+                        __float_as_int(fmaxf(fabsf(ws00), fabsf(ws01))));
+                    atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid + 8]),
+                        __float_as_int(fmaxf(fabsf(ws10), fabsf(ws11))));
                 }
-            } else {
-                // FP8 XV: V transpose + W quantize + FP8 MMA (V32)
-                float vsc_cache[CT::N_V_CHUNKS][2];
-                {
-                    const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
-                    const uint8_t* e0_base = kv_warp_base + tid * 2 * KV::KV_SMEM_STRIDE;
-                    const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
-                    #pragma unroll
-                    for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-                        if constexpr (KV::SCALE_IN_KV_SMEM) {
-                            vsc_cache[vc][0] = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
-                            vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
-                        } else {
-                            vsc_cache[vc][0] = ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-                            vsc_cache[vc][1] = ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-                        }
-                        float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
-                        float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
-                        atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid]),
-                            __float_as_int(fmaxf(fabsf(ws00), fabsf(ws01))));
-                        atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid + 8]),
-                            __float_as_int(fmaxf(fabsf(ws10), fabsf(ws11))));
-                    }
-                }
-                bar_sync_t<2, MATH_THREADS>();
+            }
+            bar_sync_t<2, MATH_THREADS>();
 
-                if (threadIdx.x < HPB) {
-                    int h = threadIdx.x;
-                    float ts = 0.f;
-                    #pragma unroll
-                    for (int w = 0; w < N_MATH_WARPS; w++)
-                        ts += sm.sum_reduce_buf[w * HPB + h];
-                    sm.l_smem[h] += ts;
-                }
-                for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
-                    sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
-                bar_sync_t<2, MATH_THREADS>();
+            if (threadIdx.x < HPB) {
+                int h = threadIdx.x;
+                float ts = 0.f;
+                #pragma unroll
+                for (int w = 0; w < N_MATH_WARPS; w++)
+                    ts += sm.sum_reduce_buf[w * HPB + h];
+                sm.l_smem[h] += ts;
+            }
+            for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
+                sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
+            bar_sync_t<2, MATH_THREADS>();
 
+            // ── XV nope MMA ─────────────────────────────────────────
+            // MODEL1: double-buffered w_fp8+v_trans (N barriers, saves 6)
+            // V32: single-buffered (2N-1 barriers, smem too tight for double)
+            {
+                const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
+
+                // Prologue: transpose chunk 0 into v_trans buf[0]
                 transpose_v_chunk<MT, CM>(sm.v_trans_bufs[0], kv_smem, 0);
 
                 #pragma unroll
                 for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
+                    const int v_off = vc * CT::V_CHUNK;
                     float* vc_sc = sm.w_head_sc_all + vc * HPB;
-                    uint8_t* cur_wfp8 = sm.w_fp8_bufs[0];
+                    const int buf_idx = L::DOUBLE_BUF_XV ? (vc & 1) : 0;
+                    uint8_t* cur_vt = sm.v_trans_bufs[buf_idx];
+                    uint8_t* cur_wfp8 = sm.w_fp8_bufs[buf_idx];
 
+                    // W quantize — V scales from register cache (no smem reload)
                     {
-                        const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
                         float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
                         float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
                         float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
@@ -395,8 +346,10 @@ sparse_mla_decode_kernel(
                         cur_wfp8[(gid + 8) * (BI + 16) + e0i] = f10.__x;
                         cur_wfp8[(gid + 8) * (BI + 16) + e1i] = f11.__x;
                     }
+
                     bar_sync_t<2, MATH_THREADS>();
 
+                    // MMA reads cur_wfp8 + cur_vt
                     #pragma unroll
                     for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
                         int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
@@ -409,7 +362,7 @@ sparse_mla_decode_kernel(
                             ldmatrix_load_A_fp8(a0, a1, a2, a3,
                                 cur_wfp8 + ko, BI + 16, lane);
                             ldmatrix_load_B_fp8(b0, b1,
-                                sm.v_trans_bufs[0] + nl * CT::V_TRANS_STRIDE + ko,
+                                cur_vt + nl * CT::V_TRANS_STRIDE + ko,
                                 CT::V_TRANS_STRIDE, lane);
                             MmaFp8Result r = mma_fp8_m16n8k32(
                                 a0, a1, a2, a3, b0, b1,
@@ -422,21 +375,22 @@ sparse_mla_decode_kernel(
                     }
 
                     if (vc < CT::N_V_CHUNKS - 1) {
-                        transpose_v_chunk<MT, CM>(sm.v_trans_bufs[0], kv_smem, (vc + 1) * CT::V_CHUNK);
-                        bar_sync_t<2, MATH_THREADS>();
+                        const int next_buf = L::DOUBLE_BUF_XV ? ((vc + 1) & 1) : 0;
+                        transpose_v_chunk<MT, CM>(sm.v_trans_bufs[next_buf], kv_smem, (vc + 1) * CT::V_CHUNK);
+                        if constexpr (!L::DOUBLE_BUF_XV)
+                            bar_sync_t<2, MATH_THREADS>();
                     }
                 }
             }
 
             // ── XV rope BF16 MMA (MODEL1 only) ─────────────────────
+            // Barrier: last XV nope MMA reads v_trans_bufs[0]; rope writes bf16 weights there
             if constexpr (KV::V_HAS_ROPE) {
                 bar_sync_t<2, MATH_THREADS>();
-                bf16* rope_weight_smem = L::BF16_XV
-                    ? reinterpret_cast<bf16*>(sm.staging)
-                    : reinterpret_cast<bf16*>(sm.v_trans_bufs[0]);
                 xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
                     ib, KV_cache, mwarp, lane,
-                    stride_kv_block, rope_weight_smem);
+                    stride_kv_block,
+                    reinterpret_cast<bf16*>(sm.v_trans_bufs[0]));
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();

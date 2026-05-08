@@ -1,0 +1,1011 @@
+Obtaining file:///home/scratch.yuasun/codes/sparse_mla_sm120
+  Checking if build backend supports build_editable: started
+  Checking if build backend supports build_editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: flash_mla_sm120
+  Building editable for flash_mla_sm120 (pyproject.toml): started
+  Building editable for flash_mla_sm120 (pyproject.toml): still running...
+  Building editable for flash_mla_sm120 (pyproject.toml): finished with status 'error'
+  error: subprocess-exited-with-error
+  
+  × Building editable for flash_mla_sm120 (pyproject.toml) did not run successfully.
+  │ exit code: 1
+  ╰─> [988 lines of output]
+      running editable_wheel
+      creating /tmp/pip-ephem-wheel-cache-ek_rhqv3/wheels/ee/cf/1b/fdccaa7751f92ddb3b45ee7e150d8bb1c5c2a8a2fbac7f2eab/tmpujuj3rh8/.tmp-fcwwk6_j/flash_mla_sm120.egg-info
+      writing /tmp/pip-ephem-wheel-cache-ek_rhqv3/wheels/ee/cf/1b/fdccaa7751f92ddb3b45ee7e150d8bb1c5c2a8a2fbac7f2eab/tmpujuj3rh8/.tmp-fcwwk6_j/flash_mla_sm120.egg-info/PKG-INFO
+      writing dependency_links to /tmp/pip-ephem-wheel-cache-ek_rhqv3/wheels/ee/cf/1b/fdccaa7751f92ddb3b45ee7e150d8bb1c5c2a8a2fbac7f2eab/tmpujuj3rh8/.tmp-fcwwk6_j/flash_mla_sm120.egg-info/dependency_links.txt
+      writing top-level names to /tmp/pip-ephem-wheel-cache-ek_rhqv3/wheels/ee/cf/1b/fdccaa7751f92ddb3b45ee7e150d8bb1c5c2a8a2fbac7f2eab/tmpujuj3rh8/.tmp-fcwwk6_j/flash_mla_sm120.egg-info/top_level.txt
+      writing manifest file '/tmp/pip-ephem-wheel-cache-ek_rhqv3/wheels/ee/cf/1b/fdccaa7751f92ddb3b45ee7e150d8bb1c5c2a8a2fbac7f2eab/tmpujuj3rh8/.tmp-fcwwk6_j/flash_mla_sm120.egg-info/SOURCES.txt'
+      reading manifest file '/tmp/pip-ephem-wheel-cache-ek_rhqv3/wheels/ee/cf/1b/fdccaa7751f92ddb3b45ee7e150d8bb1c5c2a8a2fbac7f2eab/tmpujuj3rh8/.tmp-fcwwk6_j/flash_mla_sm120.egg-info/SOURCES.txt'
+      writing manifest file '/tmp/pip-ephem-wheel-cache-ek_rhqv3/wheels/ee/cf/1b/fdccaa7751f92ddb3b45ee7e150d8bb1c5c2a8a2fbac7f2eab/tmpujuj3rh8/.tmp-fcwwk6_j/flash_mla_sm120.egg-info/SOURCES.txt'
+      creating '/tmp/pip-ephem-wheel-cache-ek_rhqv3/wheels/ee/cf/1b/fdccaa7751f92ddb3b45ee7e150d8bb1c5c2a8a2fbac7f2eab/tmpujuj3rh8/.tmp-fcwwk6_j/flash_mla_sm120-0.1.0.dist-info'
+      creating /tmp/pip-ephem-wheel-cache-ek_rhqv3/wheels/ee/cf/1b/fdccaa7751f92ddb3b45ee7e150d8bb1c5c2a8a2fbac7f2eab/tmpujuj3rh8/.tmp-fcwwk6_j/flash_mla_sm120-0.1.0.dist-info/WHEEL
+      running build_py
+      running build_ext
+      W0508 13:32:27.510000 596902 torch/utils/cpp_extension.py:556] There are no x86_64-linux-gnu-g++ version bounds defined for CUDA version 13.2
+      building 'flash_mla_sm120.cuda' extension
+      creating /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc
+      creating /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/combine
+      creating /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode
+      creating /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill
+      [1/4] /usr/local/cuda/bin/nvcc -MD -MF /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.o.d -I/home/scratch.yuasun/codes/sparse_mla_sm120/csrc -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c -c /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu -o /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -gencode=arch=compute_120a,code=sm_120a -gencode=arch=compute_120f,code=sm_120f -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --ptxas-options=-v -DNDEBUG -lineinfo --threads 8 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=cuda
+      FAILED: [code=255] /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.o
+      /usr/local/cuda/bin/nvcc -MD -MF /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.o.d -I/home/scratch.yuasun/codes/sparse_mla_sm120/csrc -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c -c /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu -o /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -gencode=arch=compute_120a,code=sm_120a -gencode=arch=compute_120f,code=sm_120f -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --ptxas-options=-v -DNDEBUG -lineinfo --threads 8 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=cuda
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(89): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool view_replay_enabled_ : 1 = false;
+                                        ^
+      
+      Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(90): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool grad_layout_enforcement_enabled_ : 1 = true;
+                                                    ^
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(89): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool view_replay_enabled_ : 1 = false;
+                                        ^
+      
+      Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(90): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool grad_layout_enforcement_enabled_ : 1 = true;
+                                                    ^
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_kernel.cuh(310): error: class "SmemLayout<ModelType::V32, ComputeMode::FP8>" has no member "DOUBLE_BUF_XV"
+                            const int buf_idx = L::DOUBLE_BUF_XV ? (vc & 1) : 0;
+                                                   ^
+                detected during:
+                  instantiation of "void sparse_mla_prefill_kernel<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, PrefillColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+                  instantiation of "void launch_prefill_sg<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 94 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_kernel.cuh(356): error: class "SmemLayout<ModelType::V32, ComputeMode::FP8>" has no member "DOUBLE_BUF_XV"
+                                const int next_buf = L::DOUBLE_BUF_XV ? ((vc + 1) & 1) : 0;
+                                                        ^
+                detected during:
+                  instantiation of "void sparse_mla_prefill_kernel<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, PrefillColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+                  instantiation of "void launch_prefill_sg<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 94 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_kernel.cuh(358): error: class "SmemLayout<ModelType::V32, ComputeMode::FP8>" has no member "DOUBLE_BUF_XV"
+                                if constexpr (!L::DOUBLE_BUF_XV)
+                                                  ^
+                detected during:
+                  instantiation of "void sparse_mla_prefill_kernel<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, PrefillColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+                  instantiation of "void launch_prefill_sg<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 94 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+      
+      3 errors detected in the compilation of "/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu".
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(89): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool view_replay_enabled_ : 1 = false;
+                                        ^
+      
+      Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(90): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool grad_layout_enforcement_enabled_ : 1 = true;
+                                                    ^
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_kernel.cuh(310): error: class "SmemLayout<ModelType::V32, ComputeMode::FP8>" has no member "DOUBLE_BUF_XV"
+                            const int buf_idx = L::DOUBLE_BUF_XV ? (vc & 1) : 0;
+                                                   ^
+                detected during:
+                  instantiation of "void sparse_mla_prefill_kernel<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, PrefillColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+                  instantiation of "void launch_prefill_sg<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 94 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_kernel.cuh(356): error: class "SmemLayout<ModelType::V32, ComputeMode::FP8>" has no member "DOUBLE_BUF_XV"
+                                const int next_buf = L::DOUBLE_BUF_XV ? ((vc + 1) & 1) : 0;
+                                                        ^
+                detected during:
+                  instantiation of "void sparse_mla_prefill_kernel<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, PrefillColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+                  instantiation of "void launch_prefill_sg<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 94 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_kernel.cuh(358): error: class "SmemLayout<ModelType::V32, ComputeMode::FP8>" has no member "DOUBLE_BUF_XV"
+                                if constexpr (!L::DOUBLE_BUF_XV)
+                                                  ^
+                detected during:
+                  instantiation of "void sparse_mla_prefill_kernel<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, PrefillColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+                  instantiation of "void launch_prefill_sg<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, bf16 *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=16, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 94 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu
+      
+      3 errors detected in the compilation of "/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/prefill/prefill_launch.cu".
+      [2/4] c++ -MMD -MF /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/binding.o.d -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -fPIC -I/home/scratch.yuasun/codes/sparse_mla_sm120/csrc -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c -c /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/binding.cpp -o /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/binding.o -O3 -std=c++17 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=cuda
+      In file included from /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/InferenceMode.h:4,
+                       from /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/TensorImpl.h:9,
+                       from /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/GeneratorImpl.h:9,
+                       from /usr/local/lib/python3.12/dist-packages/torch/include/ATen/core/Generator.h:19,
+                       from /usr/local/lib/python3.12/dist-packages/torch/include/ATen/CPUGeneratorImpl.h:4,
+                       from /usr/local/lib/python3.12/dist-packages/torch/include/ATen/Context.h:5,
+                       from /usr/local/lib/python3.12/dist-packages/torch/include/ATen/cuda/CUDAContext.h:7,
+                       from /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/binding.cpp:1:
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h:89:33: warning: default member initializers for bit-fields only available with ‘-std=c++20’ or ‘-std=gnu++20’ [-Wc++20-extensions]
+         89 |   bool view_replay_enabled_ : 1 = false;
+            |                                 ^
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h:90:45: warning: default member initializers for bit-fields only available with ‘-std=c++20’ or ‘-std=gnu++20’ [-Wc++20-extensions]
+         90 |   bool grad_layout_enforcement_enabled_ : 1 = true;
+            |                                             ^
+      [3/4] /usr/local/cuda/bin/nvcc -MD -MF /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/combine/combine_kernel.o.d -I/home/scratch.yuasun/codes/sparse_mla_sm120/csrc -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c -c /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/combine/combine_kernel.cu -o /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/combine/combine_kernel.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -gencode=arch=compute_120a,code=sm_120a -gencode=arch=compute_120f,code=sm_120f -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --ptxas-options=-v -DNDEBUG -lineinfo --threads 8 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=cuda
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(89): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool view_replay_enabled_ : 1 = false;
+                                        ^
+      
+      Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(90): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool grad_layout_enforcement_enabled_ : 1 = true;
+                                                    ^
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(89): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool view_replay_enabled_ : 1 = false;
+                                        ^
+      
+      Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(90): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool grad_layout_enforcement_enabled_ : 1 = true;
+                                                    ^
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(89): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool view_replay_enabled_ : 1 = false;
+                                        ^
+      
+      Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(90): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool grad_layout_enforcement_enabled_ : 1 = true;
+                                                    ^
+      
+      ptxas info    : 46 bytes gmem
+      ptxas info    : Compiling entry function '_ZN3cub17_V_300200_SM_12006detail11EmptyKernelIvEEvv' for 'sm_120a'
+      ptxas info    : Function properties for _ZN3cub17_V_300200_SM_12006detail11EmptyKernelIvEEvv
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 1.615 ms
+      ptxas info    : Compiling entry function '_Z25sparse_mla_combine_kernelILi128EEv13CombineParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z25sparse_mla_combine_kernelILi128EEv13CombineParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 56 registers, used 0 barriers, 4096 bytes smem
+      ptxas info    : Compile time = 15.677 ms
+      ptxas info    : Compiling entry function '_Z25sparse_mla_combine_kernelILi64EEv13CombineParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z25sparse_mla_combine_kernelILi64EEv13CombineParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 56 registers, used 0 barriers, 2048 bytes smem
+      ptxas info    : Compile time = 13.384 ms
+      ptxas info    : Compiling entry function '_Z25sparse_mla_combine_kernelILi32EEv13CombineParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z25sparse_mla_combine_kernelILi32EEv13CombineParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 56 registers, used 0 barriers, 1024 bytes smem
+      ptxas info    : Compile time = 12.312 ms
+      ptxas info    : 46 bytes gmem
+      ptxas info    : Compiling entry function '_ZN3cub17_V_300200_SM_12006detail11EmptyKernelIvEEvv' for 'sm_120f'
+      ptxas info    : Function properties for _ZN3cub17_V_300200_SM_12006detail11EmptyKernelIvEEvv
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 1.247 ms
+      ptxas info    : Compiling entry function '_Z25sparse_mla_combine_kernelILi128EEv13CombineParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z25sparse_mla_combine_kernelILi128EEv13CombineParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 56 registers, used 0 barriers, 4096 bytes smem
+      ptxas info    : Compile time = 15.287 ms
+      ptxas info    : Compiling entry function '_Z25sparse_mla_combine_kernelILi64EEv13CombineParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z25sparse_mla_combine_kernelILi64EEv13CombineParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 56 registers, used 0 barriers, 2048 bytes smem
+      ptxas info    : Compile time = 13.285 ms
+      ptxas info    : Compiling entry function '_Z25sparse_mla_combine_kernelILi32EEv13CombineParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z25sparse_mla_combine_kernelILi32EEv13CombineParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 56 registers, used 0 barriers, 1024 bytes smem
+      ptxas info    : Compile time = 12.265 ms
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h:89:33: warning: default member initializers for bit-fields only available with ‘-std=c++20’ or ‘-std=gnu++20’ [-Wc++20-extensions]
+         89 |   bool view_replay_enabled_ : 1 = false;
+            |                                 ^
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h:90:45: warning: default member initializers for bit-fields only available with ‘-std=c++20’ or ‘-std=gnu++20’ [-Wc++20-extensions]
+         90 |   bool grad_layout_enforcement_enabled_ : 1 = true;
+            |                                             ^
+      [4/4] /usr/local/cuda/bin/nvcc -MD -MF /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.o.d -I/home/scratch.yuasun/codes/sparse_mla_sm120/csrc -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.12 -c -c /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu -o /tmp/tmpupe6p3bc.build-temp/home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -gencode=arch=compute_120a,code=sm_120a -gencode=arch=compute_120f,code=sm_120f -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ --expt-relaxed-constexpr --expt-extended-lambda --ptxas-options=-v -DNDEBUG -lineinfo --threads 8 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=cuda
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(89): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool view_replay_enabled_ : 1 = false;
+                                        ^
+      
+      Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(90): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool grad_layout_enforcement_enabled_ : 1 = true;
+                                                    ^
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(89): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool view_replay_enabled_ : 1 = false;
+                                        ^
+      
+      Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(90): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool grad_layout_enforcement_enabled_ : 1 = true;
+                                                    ^
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=1]" at line 65 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=1]" at line 65 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=1]" at line 66 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=1]" at line 66 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=1]" at line 67 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=1]" at line 67 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=16, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=16, PAGE_BLOCK_SIZE=1]" at line 68 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=16, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=16, PAGE_BLOCK_SIZE=1]" at line 68 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=32, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=32, PAGE_BLOCK_SIZE=1]" at line 69 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=32, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=32, PAGE_BLOCK_SIZE=1]" at line 69 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=64]" at line 65 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=64]" at line 65 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=64]" at line 66 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=64]" at line 66 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=64]" at line 67 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=64]" at line 67 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(89): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool view_replay_enabled_ : 1 = false;
+                                        ^
+      
+      Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+      
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h(90): warning #3306-D: a default bit-field initializer is a C++20 feature
+          bool grad_layout_enforcement_enabled_ : 1 = true;
+                                                    ^
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=1]" at line 65 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=1]" at line 65 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=1]" at line 66 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=1]" at line 66 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=1]" at line 67 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=1]" at line 67 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=16, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=16, PAGE_BLOCK_SIZE=1]" at line 68 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=16, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=16, PAGE_BLOCK_SIZE=1]" at line 68 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=32, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=32, PAGE_BLOCK_SIZE=1]" at line 69 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=32, PAGE_BLOCK_SIZE=1]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, TILES_PER_SPLIT=32, PAGE_BLOCK_SIZE=1]" at line 69 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::V32, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=2048, PAGE_BLOCK_SIZE=1]" at line 103 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=64]" at line 65 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=2, PAGE_BLOCK_SIZE=64]" at line 65 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=64]" at line 66 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=4, PAGE_BLOCK_SIZE=64]" at line 66 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(59): warning #39-D: division by zero
+            const int s_i = blockIdx.x / REPLICATE_H;
+                                         ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=64]" at line 67 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_kernel.cuh(60): warning #179-D: right operand of "%" is zero
+            const int h_tile = blockIdx.x % REPLICATE_H;
+                                            ^
+                detected during:
+                  instantiation of "void sparse_mla_decode_kernel<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, DecodeColdParams) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=64]" at line 23 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void launch_decode<MT,CM,NUM_HEADS,TOPK,TILES_PER_SPLIT,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, TILES_PER_SPLIT=8, PAGE_BLOCK_SIZE=64]" at line 67 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+                  instantiation of "void dispatch_tiles<MT,CM,NUM_HEADS,TOPK,PAGE_BLOCK_SIZE>(const bf16 *, const uint8_t *, const int32_t *, float *, float *, float, int, int, size_t, cudaStream_t) [with MT=ModelType::MODEL1, CM=ComputeMode::FP8, NUM_HEADS=8, TOPK=512, PAGE_BLOCK_SIZE=64]" at line 137 of /home/scratch.yuasun/codes/sparse_mla_sm120/csrc/kernel/decode/decode_launch.cu
+      
+      ptxas info    : 46 bytes gmem
+      ptxas info    : Compiling entry function '_ZN3cub17_V_300200_SM_12006detail11EmptyKernelIvEEvv' for 'sm_120f'
+      ptxas info    : Function properties for _ZN3cub17_V_300200_SM_12006detail11EmptyKernelIvEEvv
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 1.614 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1813.189 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 848.149 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 403.089 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 182.370 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1781.163 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 843.245 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 405.306 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 182.296 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1777.726 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 836.535 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 399.505 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 181.093 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 830.547 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 401.702 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 183.194 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 828.874 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 402.029 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 181.152 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.520 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.676 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.435 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 2826.708 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1279.116 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 605.036 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 291.161 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 145.632 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 2805.184 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1288.076 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 603.699 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 285.598 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 132.479 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 2791.516 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1277.900 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 602.558 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 285.436 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 131.951 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.684 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.511 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.478 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.470 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120f'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.457 ms
+      ptxas info    : 46 bytes gmem
+      ptxas info    : Compiling entry function '_ZN3cub17_V_300200_SM_12006detail11EmptyKernelIvEEvv' for 'sm_120a'
+      ptxas info    : Function properties for _ZN3cub17_V_300200_SM_12006detail11EmptyKernelIvEEvv
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 1.582 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1890.615 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 886.087 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 420.726 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 187.245 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1861.419 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 879.872 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 422.105 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 185.452 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi16ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1862.727 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 871.859 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 416.609 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi16ELi1024ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 185.479 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 868.790 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 419.322 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi128ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 186.230 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 865.493 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 420.250 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi64ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 187.559 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi8ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.545 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi4ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.656 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType1EL11ComputeMode0ELi8ELi512ELi2ELi64EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.454 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 2938.830 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1336.972 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 640.157 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 299.000 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi128ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 133.496 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 2920.236 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1336.594 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 632.137 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 297.654 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi64ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 131.529 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 2905.387 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 1336.049 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 629.967 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 295.224 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi16ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 168 registers, used 4 barriers
+      ptxas info    : Compile time = 132.503 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi32ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.568 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi16ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.557 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi8ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.480 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi4ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.494 ms
+      ptxas info    : Compiling entry function '_Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams' for 'sm_120a'
+      ptxas info    : Function properties for _Z24sparse_mla_decode_kernelIL9ModelType0EL11ComputeMode0ELi8ELi2048ELi2ELi1EEvPK13__nv_bfloat16PKhPKiPfS9_16DecodeColdParams
+          0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+      ptxas info    : Used 4 registers, used 0 barriers
+      ptxas info    : Compile time = 0.450 ms
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h:89:33: warning: default member initializers for bit-fields only available with ‘-std=c++20’ or ‘-std=gnu++20’ [-Wc++20-extensions]
+         89 |   bool view_replay_enabled_ : 1 = false;
+            |                                 ^
+      /usr/local/lib/python3.12/dist-packages/torch/include/c10/core/AutogradState.h:90:45: warning: default member initializers for bit-fields only available with ‘-std=c++20’ or ‘-std=gnu++20’ [-Wc++20-extensions]
+         90 |   bool grad_layout_enforcement_enabled_ : 1 = true;
+            |                                             ^
+      ninja: build stopped: subcommand failed.
+      Traceback (most recent call last):
+        File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2782, in _run_ninja_build
+          subprocess.run(
+        File "/usr/lib/python3.12/subprocess.py", line 571, in run
+          raise CalledProcessError(retcode, process.args,
+      subprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 255.
+      
+      The above exception was the direct cause of the following exception:
+      
+      Traceback (most recent call last):
+        File "/usr/local/lib/python3.12/dist-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>
+          main()
+        File "/usr/local/lib/python3.12/dist-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 373, in main
+          json_out["return_val"] = hook(**hook_input["kwargs"])
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/usr/local/lib/python3.12/dist-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 303, in build_editable
+          return hook(wheel_directory, config_settings, metadata_directory)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/build_meta.py", line 474, in build_editable
+          return self._build_with_temp_dir(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/build_meta.py", line 410, in _build_with_temp_dir
+          self.run_setup()
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/build_meta.py", line 520, in run_setup
+          super().run_setup(setup_script=setup_script)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/build_meta.py", line 317, in run_setup
+          exec(code, locals())
+        File "<string>", line 42, in <module>
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/__init__.py", line 117, in setup
+          return distutils.core.setup(**attrs)  # type: ignore[return-value]
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 186, in setup
+          return run_commands(dist)
+                 ^^^^^^^^^^^^^^^^^^
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/core.py", line 202, in run_commands
+          dist.run_commands()
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1000, in run_commands
+          self.run_command(cmd)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/dist.py", line 1107, in run_command
+          super().run_command(command)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1019, in run_command
+          cmd_obj.run()
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/command/editable_wheel.py", line 140, in run
+          self._create_wheel_file(bdist_wheel)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/command/editable_wheel.py", line 350, in _create_wheel_file
+          files, mapping = self._run_build_commands(dist_name, unpacked, lib, tmp)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/command/editable_wheel.py", line 273, in _run_build_commands
+          self._run_build_subcommands()
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/command/editable_wheel.py", line 300, in _run_build_subcommands
+          self.run_command(name)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/cmd.py", line 341, in run_command
+          self.distribution.run_command(command)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/dist.py", line 1107, in run_command
+          super().run_command(command)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/dist.py", line 1019, in run_command
+          cmd_obj.run()
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 97, in run
+          _build_ext.run(self)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 367, in run
+          self.build_extensions()
+        File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 1184, in build_extensions
+          build_ext.build_extensions(self)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 483, in build_extensions
+          self._build_extensions_serial()
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 509, in _build_extensions_serial
+          self.build_extension(ext)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/command/build_ext.py", line 262, in build_extension
+          _build_ext.build_extension(self, ext)
+        File "/usr/local/lib/python3.12/dist-packages/Cython/Distutils/build_ext.py", line 136, in build_extension
+          super().build_extension(ext)
+        File "/usr/local/lib/python3.12/dist-packages/setuptools/_distutils/command/build_ext.py", line 564, in build_extension
+          objects = self.compiler.compile(
+                    ^^^^^^^^^^^^^^^^^^^^^^
+        File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 924, in unix_wrap_ninja_compile
+          _write_ninja_file_and_compile_objects(
+        File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2364, in _write_ninja_file_and_compile_objects
+          _run_ninja_build(
+        File "/usr/local/lib/python3.12/dist-packages/torch/utils/cpp_extension.py", line 2799, in _run_ninja_build
+          raise RuntimeError(message) from e
+      RuntimeError: Error compiling objects for extension
+      An error occurred when building editable wheel for flash_mla_sm120.
+      See debugging tips in: https://setuptools.pypa.io/en/latest/userguide/development_mode.html#debugging-tips
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  ERROR: Failed building editable for flash_mla_sm120
+Failed to build flash_mla_sm120
+error: failed-wheel-build-for-install
+
+× Failed to build installable wheels for some pyproject.toml based projects
+╰─> flash_mla_sm120
