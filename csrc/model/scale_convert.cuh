@@ -42,6 +42,13 @@ __host__ __device__ __forceinline__ float ue8m0_to_fp32(uint8_t v) {
     return detail::uint_as_float(bits);
 }
 
+// FP8 E4M3 raw byte → FP32
+__device__ __forceinline__ float fp8e4m3_to_fp32(uint8_t raw) {
+    __nv_fp8_e4m3 v;
+    v.__x = raw;
+    return float(v);
+}
+
 // Pack 2 FP32 scales into UE8M0x2 (uint16_t): low byte = first, high byte = second
 __host__ __device__ __forceinline__ uint16_t fp32x2_to_ue8m0x2(float a, float b) {
     uint8_t ea = fp32_to_ue8m0(a);

@@ -87,16 +87,16 @@ __device__ __forceinline__ void ldmatrix_load_A_bf16(
     ldmatrix_x4(a0, a1, a2, a3, smem_base + row * stride_elems + col);
 }
 
-// BF16 B operand [16×8] from row-major [entry][dim] smem, hardware transpose.
-// Uses ldmatrix.x2.trans: smem is [entry × dim] (row-major), MMA gets [dim × entry] (col-major).
-// stride_elems = smem stride in bf16 elements (dim stride, including padding).
+// BF16 B operand [K=16 × N=8] from row-major smem, hardware transpose.
+// Threads 0-7 → matrix 0 (rows 0-7), threads 8-15 → matrix 1 (rows 8-15).
+// N=8 bf16 per row = 16 bytes, fits in one ldmatrix row (no col offset).
+// stride_elems = smem stride in bf16 elements between consecutive rows.
 __device__ __forceinline__ void ldmatrix_load_B_bf16_trans(
     uint32_t& b0, uint32_t& b1,
     const bf16* smem_base, int stride_elems, int lane)
 {
-    int row = lane & 7;
-    int col = ((lane >> 3) & 1) * 8;
-    ldmatrix_x2_trans(b0, b1, smem_base + row * stride_elems + col);
+    int row = (lane & 7) + ((lane >> 3) & 1) * 8;
+    ldmatrix_x2_trans(b0, b1, smem_base + row * stride_elems);
 }
 
 // BF16 B operand [16×8] from col-major [dim][entry] smem (no transpose needed).

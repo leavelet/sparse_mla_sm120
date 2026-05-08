@@ -307,9 +307,8 @@ sparse_mla_prefill_kernel(
                 for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
                     const int v_off = vc * CT::V_CHUNK;
                     float* vc_sc = sm.w_head_sc_all + vc * HPB;
-                    const int buf_idx = L::DOUBLE_BUF_XV ? (vc & 1) : 0;
-                    uint8_t* cur_vt = sm.v_trans_bufs[buf_idx];
-                    uint8_t* cur_wfp8 = sm.w_fp8_bufs[buf_idx];
+                    uint8_t* cur_vt = sm.v_trans_bufs[0];
+                    uint8_t* cur_wfp8 = sm.w_fp8_bufs[0];
 
                     {
                         float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
@@ -353,10 +352,8 @@ sparse_mla_prefill_kernel(
                     }
 
                     if (vc < CT::N_V_CHUNKS - 1) {
-                        const int next_buf = L::DOUBLE_BUF_XV ? ((vc + 1) & 1) : 0;
-                        transpose_v_chunk<MT, CM>(sm.v_trans_bufs[next_buf], kv_smem, (vc + 1) * CT::V_CHUNK);
-                        if constexpr (!L::DOUBLE_BUF_XV)
-                            bar_sync_t<2, MATH_THREADS>();
+                        transpose_v_chunk<MT, CM>(sm.v_trans_bufs[0], kv_smem, (vc + 1) * CT::V_CHUNK);
+                        bar_sync_t<2, MATH_THREADS>();
                     }
                 }
             }
@@ -776,7 +773,7 @@ sparse_mla_prefill_mg_kernel(
                         int entry = idx / KV::QUANT_TILE;
                         int dim = idx % KV::QUANT_TILE;
                         uint8_t fp8_byte = kv_smem[entry * KV::KV_SMEM_STRIDE + v_off + dim];
-                        float fp8_val = __nv_cvt_fp8_to_fp32(fp8_byte, __NV_E4M3);
+                        float fp8_val = fp8e4m3_to_fp32(fp8_byte);
                         uint8_t sc_byte = sm.kv_scale_bufs[ti & 1][entry * KV::SCALE_BYTES_PER_TOKEN + vc];
                         float scale = ue8m0_to_fp32(sc_byte);
                         sm.staging[entry * LMG::STAGING_STRIDE + dim] = __float2bfloat16(fp8_val * scale);

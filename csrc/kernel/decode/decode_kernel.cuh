@@ -301,7 +301,7 @@ sparse_mla_decode_kernel(
                         int entry = idx / KV::QUANT_TILE;
                         int dim = idx % KV::QUANT_TILE;
                         uint8_t fp8_byte = kv_smem[entry * KV::KV_SMEM_STRIDE + v_off + dim];
-                        float fp8_val = __nv_cvt_fp8_to_fp32(fp8_byte, __NV_E4M3);
+                        float fp8_val = fp8e4m3_to_fp32(fp8_byte);
                         uint8_t sc_byte = sm.kv_scale_bufs[ti & 1][entry * KV::SCALE_BYTES_PER_TOKEN + vc];
                         float scale = ue8m0_to_fp32(sc_byte);
                         sm.staging[entry * L::STAGING_STRIDE + dim] = __float2bfloat16(fp8_val * scale);
