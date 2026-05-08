@@ -119,7 +119,59 @@ struct SmemLayoutMG {
     static_assert(TOTAL <= 101376, "MG smem exceeds 99KB per-block limit");
 };
 
-// Convenience accessor struct (initialized from smem base pointer)
+// MG convenience accessor
+template <ModelType MT, ComputeMode CM>
+struct SmemPtrsMG {
+    using LMG = SmemLayoutMG<MT, CM>;
+    using CT = ComputeTraits<MT, CM>;
+
+    static constexpr int N_HG = LMG::N_HG;
+    static constexpr int REDUCE_GRP_STRIDE = N_MATH_WARPS * HPB;
+    static constexpr int ML_GRP_STRIDE = HPB;
+    static constexpr int WSC_GRP_STRIDE = CT::N_V_CHUNKS * HPB;
+    static constexpr int WFP8_GRP_SIZE = HPB * (BI + 16);
+
+    uint8_t* q_nope_fp8[N_HG];
+    float*   q_nope_sc[N_HG];
+    bf16*    q_rope;           // O2: both groups stored sequentially in v_trans area
+    uint8_t* kv_bufs[2];
+    uint8_t* kv_scale_bufs[2];
+    float*   reduce_buf;       // [N_HG * N_MATH_WARPS * HPB]
+    float*   m_smem;           // [N_HG * HPB]
+    float*   l_smem;           // [N_HG * HPB]
+    float*   w_head_sc_all;    // [N_HG * N_V_CHUNKS * HPB]
+    uint8_t* w_fp8;            // [N_HG * HPB * (BI+16)]
+    uint8_t* v_trans;          // shared
+    uint64_t* mbar_kv;
+
+    __device__ static SmemPtrsMG init(char* base) {
+        SmemPtrsMG s;
+        s.q_nope_fp8[0]  = (uint8_t*)(base + LMG::OFF_Q_NOPE0);
+        s.q_nope_fp8[1]  = (uint8_t*)(base + LMG::OFF_Q_NOPE1);
+        s.q_nope_sc[0]   = (float*)  (base + LMG::OFF_Q_SC0);
+        s.q_nope_sc[1]   = (float*)  (base + LMG::OFF_Q_SC1);
+        s.q_rope         = (bf16*)   (base + LMG::OFF_V_TRANS);
+        s.kv_bufs[0]     = (uint8_t*)(base + LMG::OFF_KV0);
+        s.kv_bufs[1]     = (uint8_t*)(base + LMG::OFF_KV1);
+        if constexpr (SmemLayout<MT,CM>::NEED_SCALE_BUF) {
+            s.kv_scale_bufs[0] = (uint8_t*)(base + LMG::OFF_KV_SC0);
+            s.kv_scale_bufs[1] = (uint8_t*)(base + LMG::OFF_KV_SC1);
+        } else {
+            s.kv_scale_bufs[0] = nullptr;
+            s.kv_scale_bufs[1] = nullptr;
+        }
+        s.reduce_buf     = (float*)  (base + LMG::OFF_REDUCE);
+        s.m_smem         = (float*)  (base + LMG::OFF_M);
+        s.l_smem         = (float*)  (base + LMG::OFF_L);
+        s.w_head_sc_all  = (float*)  (base + LMG::OFF_W_SC_ALL);
+        s.w_fp8          = (uint8_t*)(base + LMG::OFF_W_FP8);
+        s.v_trans        = (uint8_t*)(base + LMG::OFF_V_TRANS);
+        s.mbar_kv        = (uint64_t*)(base + LMG::OFF_MBAR_KV);
+        return s;
+    }
+};
+
+// SG convenience accessor (initialized from smem base pointer)
 template <ModelType MT, ComputeMode CM>
 struct SmemPtrs {
     using L = SmemLayout<MT, CM>;

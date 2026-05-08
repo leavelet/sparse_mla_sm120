@@ -3,11 +3,12 @@
 
 // ============================================================================
 // Sparse MLA prefill: launch helpers and dispatch.
-// No split-KV, no tiles_per_split dispatch — each CTA processes full topk.
+// SG (single-group, 16 heads/CTA) for h<=16.
+// MG (multi-group, 32 heads/CTA) for h>16 — 2x KV reuse + deferred row_sum.
 // ============================================================================
 
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
-void launch_prefill(
+void launch_prefill_sg(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     bf16* output, float* out_lse,
     float sm_scale, int num_tokens,
@@ -35,8 +36,37 @@ void launch_prefill(
     CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+void launch_prefill_mg(
+    const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+    bf16* output, float* out_lse,
+    float sm_scale, int num_tokens,
+    size_t stride_kv_block,
+    cudaStream_t stream)
+{
+    constexpr size_t smem_bytes = SmemLayoutMG<MT, CM>::TOTAL;
+    constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA;
+    dim3 grid(num_tokens * REPLICATE_H);
+    dim3 block(BLOCK_THREADS);
+
+    auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
+    static bool configured = false;
+    if (!configured && smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        configured = true;
+    }
+
+    PrefillColdParams cold{sm_scale, num_tokens, stride_kv_block};
+    cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
+    void* args[] = {
+        (void*)&Q, (void*)&KV_cache, (void*)&indices,
+        (void*)&output, (void*)&out_lse, (void*)&cold
+    };
+    CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
+}
+
 // ============================================================================
-// External entry points
+// External entry points — dispatch SG (h<=16) vs MG (h>16)
 // ============================================================================
 
 void sparse_mla_prefill_launch_v32(
@@ -55,18 +85,28 @@ void sparse_mla_prefill_launch_v32(
 
     TORCH_CHECK(topk == 2048, "V32 prefill requires topk=2048, got ", topk);
 
-    #define DISPATCH(NH) \
-        launch_prefill<ModelType::V32, ComputeMode::FP8, NH, 2048, 1>( \
-            Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, \
-            sm_scale, num_tokens, stride_kv_block, stream)
-
-    switch (num_heads) {
-    case 16:  DISPATCH(16); break;
-    case 64:  DISPATCH(64); break;
-    case 128: DISPATCH(128); break;
-    default:  TORCH_CHECK(false, "V32 prefill: unsupported num_heads=", num_heads);
+    if (num_heads <= HPB) {
+        #define DISPATCH_SG(NH) \
+            launch_prefill_sg<ModelType::V32, ComputeMode::FP8, NH, 2048, 1>( \
+                Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, \
+                sm_scale, num_tokens, stride_kv_block, stream)
+        switch (num_heads) {
+        case 16:  DISPATCH_SG(16); break;
+        default:  TORCH_CHECK(false, "V32 prefill SG: unsupported num_heads=", num_heads);
+        }
+        #undef DISPATCH_SG
+    } else {
+        #define DISPATCH_MG(NH) \
+            launch_prefill_mg<ModelType::V32, ComputeMode::FP8, NH, 2048, 1>( \
+                Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, \
+                sm_scale, num_tokens, stride_kv_block, stream)
+        switch (num_heads) {
+        case 64:  DISPATCH_MG(64); break;
+        case 128: DISPATCH_MG(128); break;
+        default:  TORCH_CHECK(false, "V32 prefill MG: unsupported num_heads=", num_heads);
+        }
+        #undef DISPATCH_MG
     }
-    #undef DISPATCH
 }
 
 void sparse_mla_prefill_launch_model1(
@@ -85,25 +125,26 @@ void sparse_mla_prefill_launch_model1(
 
     TORCH_CHECK(page_block_size == 64, "MODEL1 prefill: page_block_size must be 64, got ", page_block_size);
 
-    #define DISPATCH(NH, TK) \
-        launch_prefill<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64>( \
+    // MODEL1 always uses MG (h=64 or h=128, both > HPB)
+    #define DISPATCH_MG(NH, TK) \
+        launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64>( \
             Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, \
             sm_scale, num_tokens, stride_kv_block, stream)
 
     if (topk == 512) {
         switch (num_heads) {
-        case 64:  DISPATCH(64, 512); break;
-        case 128: DISPATCH(128, 512); break;
+        case 64:  DISPATCH_MG(64, 512); break;
+        case 128: DISPATCH_MG(128, 512); break;
         default:  TORCH_CHECK(false, "MODEL1 prefill: unsupported num_heads=", num_heads);
         }
     } else if (topk == 1024) {
         switch (num_heads) {
-        case 64:  DISPATCH(64, 1024); break;
-        case 128: DISPATCH(128, 1024); break;
+        case 64:  DISPATCH_MG(64, 1024); break;
+        case 128: DISPATCH_MG(128, 1024); break;
         default:  TORCH_CHECK(false, "MODEL1 prefill: unsupported num_heads=", num_heads);
         }
     } else {
         TORCH_CHECK(false, "MODEL1 prefill: unsupported topk=", topk);
     }
-    #undef DISPATCH
+    #undef DISPATCH_MG
 }
