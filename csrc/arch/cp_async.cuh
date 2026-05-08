@@ -43,3 +43,36 @@ __device__ __forceinline__ void cp_async_bulk_g2s(
         " [%0], [%1], %2, [%3];\n"
         :: "r"(dst_addr), "l"(gmem_src), "r"(bytes), "r"(mbar_addr));
 }
+
+// cp.async.bulk with L2 cache hint (evict_first for streaming KV data)
+__device__ __forceinline__ void cp_async_bulk_g2s_l2hint(
+    void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* mbar,
+    uint64_t cache_policy)
+{
+    uint32_t dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+    asm volatile(
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+        " [%0], [%1], %2, [%3], %4;\n"
+        :: "r"(dst_addr), "l"(gmem_src), "r"(bytes), "r"(mbar_addr), "l"(cache_policy));
+}
+
+// Create L2 evict-first cache policy (streaming data consumed once)
+__device__ __forceinline__ uint64_t create_l2_evict_first_policy() {
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    return policy;
+}
+
+// Store 8 floats (256-bit) with L2::evict_last hint.
+// L2::evict_last requires .v8.b32 or .v4.b64 — 128-bit stores are not supported.
+__device__ __forceinline__ void store_8f_evict_last(float* addr, float4 v0, float4 v1) {
+    asm volatile(
+        "st.global.L2::evict_last.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+        :: "l"(addr),
+           "r"(__float_as_int(v0.x)), "r"(__float_as_int(v0.y)),
+           "r"(__float_as_int(v0.z)), "r"(__float_as_int(v0.w)),
+           "r"(__float_as_int(v1.x)), "r"(__float_as_int(v1.y)),
+           "r"(__float_as_int(v1.z)), "r"(__float_as_int(v1.w))
+        : "memory");
+}

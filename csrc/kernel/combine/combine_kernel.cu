@@ -3,109 +3,204 @@
 #include <torch/extension.h>
 
 // ============================================================================
-// Sparse MLA Combine Kernel
+// Sparse MLA Combine Kernel — FlashMLA-style vectorized implementation
 //
 // Merges partial outputs from split-KV decode into final output.
-// Separate kernel (FlashMLA compatible), launched after splitkv decode.
+// 8 warps × 32 lanes = 256 threads. 1 warp per head.
+// float4 vectorized loads with split-level prefetch.
 //
 // Input:
-//   partial_O:   [num_tokens, nsplits, num_heads, d_v] float32
+//   partial_O:   [num_tokens, nsplits, num_heads, D_V] float32
 //   partial_LSE: [num_tokens, nsplits, num_heads]      float32
 //
 // Output:
-//   output: [num_tokens, num_heads, d_v] bfloat16
+//   output: [num_tokens, num_heads, D_V] bfloat16
 //   lse:    [num_tokens, num_heads]      float32
 //
-// Grid: (num_tokens, num_heads / BLOCK_H)
-// Each thread block processes BLOCK_H heads for one token.
+// Grid: (num_tokens, 1, ceil(num_heads / BLOCK_H))
 // ============================================================================
 
 static constexpr int COMBINE_BLOCK_H = 8;
-static constexpr int COMBINE_THREADS = 256;
+static constexpr int COMBINE_THREADS = COMBINE_BLOCK_H * 32;  // 256
+static constexpr int COMBINE_ELEMS_PER_THREAD = D_V / (32 * 4);  // 512/(32*4) = 4
 
+struct CombineParams {
+    const float* partial_O;
+    const float* partial_LSE;
+    bf16* output;
+    float* out_lse;
+    int num_heads;
+    int nsplits;
+};
+
+template <int MAX_SPLITS>
 __global__ void __launch_bounds__(COMBINE_THREADS)
-sparse_mla_combine_kernel(
-    const float* __restrict__ partial_O,
-    const float* __restrict__ partial_LSE,
-    bf16* __restrict__ output,
-    float* __restrict__ out_lse,
-    int num_heads,
-    int nsplits,
-    int d_v)
+sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
 {
+    cudaGridDependencySynchronize();
+
+    const float* __restrict__ partial_O = params.partial_O;
+    const float* __restrict__ partial_LSE = params.partial_LSE;
+    bf16* __restrict__ output = params.output;
+    float* __restrict__ out_lse = params.out_lse;
+    const int num_heads = params.num_heads;
+    const int nsplits = params.nsplits;
+
     const int token_idx = blockIdx.x;
-    const int h_block = blockIdx.y;
-    const int h_start = h_block * COMBINE_BLOCK_H;
-    const int tid = threadIdx.x;
+    const int h_block = blockIdx.z;
+    const int warp_idx = threadIdx.x / 32;
+    const int lane_idx = threadIdx.x % 32;
 
-    // Each thread handles a subset of (head, dim) within the BLOCK_H heads
-    // Total work = BLOCK_H * d_v = 8 * 512 = 4096 elements
-    // With 256 threads: 16 elements per thread
+    const int h = h_block * COMBINE_BLOCK_H + warp_idx;
+    if (h >= num_heads) return;
 
-    constexpr int ELEMS_PER_THREAD = COMBINE_BLOCK_H * D_V / COMBINE_THREADS;  // 16
+    if (nsplits == 1) {
+        // Single split: just convert float32 → bf16, no combine needed
+        const float* src = partial_O
+            + (size_t)token_idx * nsplits * num_heads * D_V
+            + (size_t)h * D_V;
+        bf16* dst = output
+            + (size_t)token_idx * num_heads * D_V
+            + (size_t)h * D_V;
 
-    // Step 1: Find max LSE across all splits for each head in this block
-    // Use shared memory for LSE values
-    extern __shared__ char smem[];
-    float* lse_smem = reinterpret_cast<float*>(smem);  // [nsplits, BLOCK_H]
+        #pragma unroll
+        for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i) {
+            float4 v = *(const float4*)(src + lane_idx * 4 + i * 128);
+            bf16 b[4];
+            b[0] = __float2bfloat16(v.x);
+            b[1] = __float2bfloat16(v.y);
+            b[2] = __float2bfloat16(v.z);
+            b[3] = __float2bfloat16(v.w);
+            *(uint64_t*)(dst + lane_idx * 4 + i * 128) = *(const uint64_t*)b;
+        }
 
-    // Load all LSE values cooperatively
-    for (int i = tid; i < nsplits * COMBINE_BLOCK_H; i += COMBINE_THREADS) {
-        int sp = i / COMBINE_BLOCK_H;
-        int h_local = i % COMBINE_BLOCK_H;
-        int h = h_start + h_local;
-        if (h < num_heads) {
-            size_t lse_idx = (size_t)token_idx * nsplits * num_heads
-                           + (size_t)sp * num_heads + h;
-            lse_smem[sp * COMBINE_BLOCK_H + h_local] = partial_LSE[lse_idx];
-        } else {
-            lse_smem[sp * COMBINE_BLOCK_H + h_local] = -1e30f;
+        if (lane_idx == 0) {
+            size_t lse_idx = (size_t)token_idx * nsplits * num_heads + h;
+            size_t lse_out_idx = (size_t)token_idx * num_heads + h;
+            out_lse[lse_out_idx] = partial_LSE[lse_idx];
+        }
+        return;
+    }
+
+    // Stride for partial_O: [num_tokens, nsplits, num_heads, D_V]
+    const size_t split_stride = (size_t)num_heads * D_V;  // stride across splits (in floats)
+    const float* oaccum_ptr = partial_O
+        + (size_t)token_idx * nsplits * num_heads * D_V
+        + (size_t)h * D_V;
+
+    // LSE stride: [num_tokens, nsplits, num_heads]
+    const size_t lse_split_stride = (size_t)num_heads;
+    const float* lse_ptr = partial_LSE
+        + (size_t)token_idx * nsplits * num_heads
+        + h;
+
+    // ── LSE reduction via warp shuffle ──────────────────────────────
+    __shared__ float smem_buf[COMBINE_BLOCK_H][MAX_SPLITS];
+
+    constexpr int NUM_LSE_PER_THREAD = (MAX_SPLITS + 31) / 32;
+    float local_lse[NUM_LSE_PER_THREAD];
+
+    #pragma unroll
+    for (int i = 0; i < NUM_LSE_PER_THREAD; ++i) {
+        int sp = i * 32 + lane_idx;
+        local_lse[i] = (sp < nsplits) ? lse_ptr[sp * lse_split_stride] : -1e30f;
+    }
+
+    // Warp-wide max
+    float max_lse = -1e30f;
+    #pragma unroll
+    for (int i = 0; i < NUM_LSE_PER_THREAD; ++i)
+        max_lse = fmaxf(max_lse, local_lse[i]);
+    max_lse = warp_reduce_max(max_lse);
+    if (max_lse == -1e30f) max_lse = 0.f;
+
+    // Warp-wide sum of exp2(lse - max)
+    float sum_lse = 0.f;
+    #pragma unroll
+    for (int i = 0; i < NUM_LSE_PER_THREAD; ++i)
+        sum_lse += exp2f(local_lse[i] - max_lse);
+    sum_lse = warp_reduce_sum(sum_lse);
+
+    // Global LSE and per-split scale factors
+    float global_lse = (sum_lse > 0.f) ? (log2f(sum_lse) + max_lse) : -1e30f;
+
+    if (lane_idx == 0) {
+        size_t lse_out_idx = (size_t)token_idx * num_heads + h;
+        out_lse[lse_out_idx] = global_lse;
+    }
+
+    // Write per-split scale factors to smem
+    #pragma unroll
+    for (int i = 0; i < NUM_LSE_PER_THREAD; ++i) {
+        int sp = i * 32 + lane_idx;
+        if (sp < MAX_SPLITS)
+            smem_buf[warp_idx][sp] = exp2f(local_lse[i] - global_lse);
+    }
+    __syncwarp();
+
+    // ── Accumulation with prefetch ──────────────────────────────────
+    // Prefetch split 0 data
+    float4 datas[COMBINE_ELEMS_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i)
+        datas[i] = *(const float4*)(oaccum_ptr + lane_idx * 4 + i * 128);
+
+    float4 result[COMBINE_ELEMS_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i)
+        result[i] = {0.f, 0.f, 0.f, 0.f};
+
+    #pragma unroll 1
+    for (int sp = 0; sp < nsplits; ++sp) {
+        float lse_scale = smem_buf[warp_idx][sp];
+        #pragma unroll
+        for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i) {
+            result[i].x += lse_scale * datas[i].x;
+            result[i].y += lse_scale * datas[i].y;
+            result[i].z += lse_scale * datas[i].z;
+            result[i].w += lse_scale * datas[i].w;
+            // Prefetch next split
+            if (sp != nsplits - 1) {
+                datas[i] = *(const float4*)(oaccum_ptr + (size_t)(sp + 1) * split_stride + lane_idx * 4 + i * 128);
+            }
         }
     }
-    __syncthreads();
 
-    // Each thread processes its assigned (head, dim) pairs
-    for (int elem = tid; elem < COMBINE_BLOCK_H * D_V; elem += COMBINE_THREADS) {
-        int h_local = elem / D_V;
-        int d = elem % D_V;
-        int h = h_start + h_local;
+    // ── Write output (bf16, packed uint64_t) ────────────────────────
+    bf16* o_ptr = output
+        + (size_t)token_idx * num_heads * D_V
+        + (size_t)h * D_V;
 
-        if (h >= num_heads) continue;
-
-        // Find max LSE for this head
-        float max_lse = -1e30f;
-        for (int sp = 0; sp < nsplits; sp++)
-            max_lse = fmaxf(max_lse, lse_smem[sp * COMBINE_BLOCK_H + h_local]);
-
-        // Weighted sum
-        float acc = 0.f;
-        float scale_sum = 0.f;
-        for (int sp = 0; sp < nsplits; sp++) {
-            float lse_val = lse_smem[sp * COMBINE_BLOCK_H + h_local];
-            float scale = exp2f(lse_val - max_lse);
-            scale_sum += scale;
-
-            size_t po_idx = (size_t)token_idx * nsplits * num_heads * D_V
-                          + (size_t)sp * num_heads * D_V
-                          + (size_t)h * D_V + d;
-            acc += scale * partial_O[po_idx];
-        }
-
-        // Normalize and write
-        float inv_scale = (scale_sum > 0.f) ? (1.f / scale_sum) : 0.f;
-        size_t out_idx = (size_t)token_idx * num_heads * D_V + (size_t)h * D_V + d;
-        output[out_idx] = __float2bfloat16(acc * inv_scale);
-
-        // Write LSE (only once per head, use d==0)
-        if (d == 0) {
-            float final_lse = (scale_sum > 0.f) ? (log2f(scale_sum) + max_lse) : -1e30f;
-            size_t lse_out_idx = (size_t)token_idx * num_heads + h;
-            out_lse[lse_out_idx] = final_lse;
-        }
+    #pragma unroll
+    for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i) {
+        bf16 b[4];
+        b[0] = __float2bfloat16(result[i].x);
+        b[1] = __float2bfloat16(result[i].y);
+        b[2] = __float2bfloat16(result[i].z);
+        b[3] = __float2bfloat16(result[i].w);
+        *(uint64_t*)(o_ptr + lane_idx * 4 + i * 128) = *(const uint64_t*)b;
     }
 }
 
-// Launch wrapper
+// ── MAX_SPLITS dispatch macro ───────────────────────────────────────
+#define COMBINE_SPLITS_SWITCH(NSPLITS, NAME, ...)       \
+    [&] {                                               \
+        if ((NSPLITS) <= 32) {                          \
+            constexpr int NAME = 32;                    \
+            return __VA_ARGS__();                        \
+        } else if ((NSPLITS) <= 64) {                   \
+            constexpr int NAME = 64;                    \
+            return __VA_ARGS__();                        \
+        } else if ((NSPLITS) <= 128) {                  \
+            constexpr int NAME = 128;                   \
+            return __VA_ARGS__();                        \
+        } else {                                        \
+            TORCH_CHECK(false, "nsplits=", (NSPLITS),   \
+                        " exceeds MAX_SPLITS=128");     \
+        }                                               \
+    }()
+
+// ── Launch wrapper ──────────────────────────────────────────────────
 void sparse_mla_combine_launch(
     torch::Tensor partial_O,
     torch::Tensor partial_LSE,
@@ -116,16 +211,31 @@ void sparse_mla_combine_launch(
 {
     int num_tokens = partial_O.size(0);
     int num_heads = partial_O.size(2);
-    int d_v = partial_O.size(3);
 
-    dim3 grid(num_tokens, (num_heads + COMBINE_BLOCK_H - 1) / COMBINE_BLOCK_H);
-    dim3 block(COMBINE_THREADS);
-    int smem_bytes = nsplits * COMBINE_BLOCK_H * sizeof(float);
+    COMBINE_SPLITS_SWITCH(nsplits, MAX_SPLITS, [&] {
+        dim3 grid(num_tokens, 1, (num_heads + COMBINE_BLOCK_H - 1) / COMBINE_BLOCK_H);
+        dim3 block(COMBINE_THREADS);
+        size_t smem_bytes = COMBINE_BLOCK_H * MAX_SPLITS * sizeof(float);
 
-    sparse_mla_combine_kernel<<<grid, block, smem_bytes, stream>>>(
-        partial_O.data_ptr<float>(),
-        partial_LSE.data_ptr<float>(),
-        reinterpret_cast<bf16*>(output.data_ptr()),
-        out_lse.data_ptr<float>(),
-        num_heads, nsplits, d_v);
+        auto kernel = sparse_mla_combine_kernel<MAX_SPLITS>;
+        if (smem_bytes > 48 * 1024) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+        }
+
+        CombineParams params{
+            partial_O.data_ptr<float>(),
+            partial_LSE.data_ptr<float>(),
+            reinterpret_cast<bf16*>(output.data_ptr()),
+            out_lse.data_ptr<float>(),
+            num_heads, nsplits
+        };
+
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t config{grid, block, smem_bytes, stream, attrs, 1};
+        void* args[] = { (void*)&params };
+        CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
+    });
 }

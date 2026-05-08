@@ -1,4 +1,5 @@
 import os
+import glob
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
@@ -10,6 +11,13 @@ cuda_sources = [
     os.path.join(csrc_dir, "kernel", "combine", "combine_kernel.cu"),
     os.path.join(csrc_dir, "kernel", "prefill", "prefill_stub.cu"),
 ]
+
+# Track all headers so setuptools recompiles when .cuh/.h files change
+# Paths must be relative for the manifest
+header_depends = (
+    glob.glob(os.path.join("csrc", "**", "*.cuh"), recursive=True)
+    + glob.glob(os.path.join("csrc", "**", "*.h"), recursive=True)
+)
 
 extra_compile_args = {
     "cxx": ["-O3", "-std=c++17"],
@@ -41,6 +49,7 @@ setup(
             sources=cuda_sources,
             include_dirs=[csrc_dir],
             extra_compile_args=extra_compile_args,
+            depends=header_depends,
         ),
     ],
     cmdclass={"build_ext": BuildExtension},

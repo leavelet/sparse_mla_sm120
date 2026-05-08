@@ -26,9 +26,18 @@ void launch_decode(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         configured = true;
     }
-    kernel<<<grid, block, smem_bytes, stream>>>(
-        Q, KV_cache, indices, partial_O, partial_LSE,
-        sm_scale, num_tokens, page_block_size, stride_kv_block);
+
+    DecodeColdParams cold{sm_scale, num_tokens, page_block_size, stride_kv_block};
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t config{grid, block, smem_bytes, stream, attrs, 1};
+    void* args[] = {
+        (void*)&Q, (void*)&KV_cache, (void*)&indices,
+        (void*)&partial_O, (void*)&partial_LSE, (void*)&cold
+    };
+    CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK>

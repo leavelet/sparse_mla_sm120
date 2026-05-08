@@ -26,6 +26,13 @@
 //   TILES_PER_SPLIT: 2, 4, 8, 16, 32 (must divide NI = TOPK/BI)
 // ============================================================================
 
+struct DecodeColdParams {
+    float sm_scale;
+    int num_tokens;
+    int page_block_size;
+    size_t stride_kv_block;
+};
+
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int TILES_PER_SPLIT>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_decode_kernel(
@@ -34,11 +41,12 @@ sparse_mla_decode_kernel(
     const int32_t* __restrict__ indices,
     float* __restrict__ partial_O,
     float* __restrict__ partial_LSE,
-    float sm_scale,
-    int num_tokens,
-    int page_block_size,
-    size_t stride_kv_block)
+    __grid_constant__ const DecodeColdParams cold)
 {
+    const float sm_scale = cold.sm_scale;
+    const int num_tokens = cold.num_tokens;
+    const int page_block_size = cold.page_block_size;
+    const size_t stride_kv_block = cold.stride_kv_block;
     using KV = KVCacheTraits<MT>;
     using CT = ComputeTraits<MT, CM>;
     using L = SmemLayout<MT, CM>;
@@ -75,11 +83,12 @@ sparse_mla_decode_kernel(
 
         const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
         const int32_t* idx_base = indices + (size_t)s_i * TOPK + split_idx * tile_start_stride;
+        const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
         // Prologue: gather tile 0
-        io_bulk_gather_tile<MT>(
+        io_bulk_gather_tile<MT, true>(
             sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid,
-            page_block_size, stride_kv_block);
+            page_block_size, stride_kv_block, kv_l2_policy);
         io_gather_scales<MT>(
             sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid,
             page_block_size, stride_kv_block);
@@ -89,11 +98,11 @@ sparse_mla_decode_kernel(
         #pragma unroll
         for (int ti = 0; ti < TILES_PER_SPLIT; ti++) {
             if (ti + 1 < TILES_PER_SPLIT) {
-                io_bulk_gather_tile<MT>(
+                io_bulk_gather_tile<MT, true>(
                     sm.kv_bufs[(ti + 1) & 1],
                     idx_base + (ti + 1) * BI, KV_cache,
                     sm.mbar_kv + ((ti + 1) & 1), io_tid,
-                    page_block_size, stride_kv_block);
+                    page_block_size, stride_kv_block, kv_l2_policy);
                 io_gather_scales<MT>(
                     sm.kv_scale_bufs[(ti + 1) & 1],
                     idx_base + (ti + 1) * BI, KV_cache, io_tid,
@@ -422,15 +431,16 @@ sparse_mla_decode_kernel(
             const size_t po_base = (size_t)s_i * token_stride
                                  + (size_t)split_idx * split_stride
                                  + (size_t)h_start * h_stride;
-            constexpr int FLOATS_PER_STORE = 4;  // float4 = 16 bytes
-            constexpr int STORES_PER_HEAD = D_V / FLOATS_PER_STORE;  // 128
-            for (int idx = threadIdx.x; idx < HPB * STORES_PER_HEAD; idx += MATH_THREADS) {
-                int h = idx / STORES_PER_HEAD;
-                int d4 = (idx - h * STORES_PER_HEAD) * FLOATS_PER_STORE;
-                float4 val = *reinterpret_cast<const float4*>(
-                    &staging_f32[h * F32_STAGING_STRIDE + d4]);
-                *reinterpret_cast<float4*>(
-                    &partial_O[po_base + h * h_stride + d4]) = val;
+            constexpr int FLOATS_PER_WIDE_STORE = 8;  // v8.b32 = 256-bit for L2::evict_last
+            constexpr int WIDE_STORES_PER_HEAD = D_V / FLOATS_PER_WIDE_STORE;  // 64
+            for (int idx = threadIdx.x; idx < HPB * WIDE_STORES_PER_HEAD; idx += MATH_THREADS) {
+                int h = idx / WIDE_STORES_PER_HEAD;
+                int d8 = (idx - h * WIDE_STORES_PER_HEAD) * FLOATS_PER_WIDE_STORE;
+                float4 v0 = *reinterpret_cast<const float4*>(
+                    &staging_f32[h * F32_STAGING_STRIDE + d8]);
+                float4 v1 = *reinterpret_cast<const float4*>(
+                    &staging_f32[h * F32_STAGING_STRIDE + d8 + 4]);
+                store_8f_evict_last(&partial_O[po_base + h * h_stride + d8], v0, v1);
             }
         }
 
@@ -445,5 +455,7 @@ sparse_mla_decode_kernel(
                            + (h_start + h);
             partial_LSE[lse_idx] = lse;
         }
+
+        cudaTriggerProgrammaticLaunchCompletion();
     }
 }

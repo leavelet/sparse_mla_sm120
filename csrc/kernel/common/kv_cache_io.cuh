@@ -32,7 +32,7 @@ struct KVIOTraits {
 
 // Bulk gather token nope data (and inline scales for V32) from global to smem.
 // V32: flat addressing (idx * 656). MODEL1: block-structured (footer layout).
-template <ModelType MT>
+template <ModelType MT, bool USE_L2_HINT = false>
 __device__ __forceinline__ void io_bulk_gather_tile(
     uint8_t* dst,
     const int32_t* indices,
@@ -40,7 +40,8 @@ __device__ __forceinline__ void io_bulk_gather_tile(
     uint64_t* mbar,
     int io_tid,
     int page_block_size,
-    size_t stride_kv_block)
+    size_t stride_kv_block,
+    uint64_t cache_policy = 0)
 {
     using KV = KVCacheTraits<MT>;
     using IO = KVIOTraits<MT>;
@@ -64,7 +65,10 @@ __device__ __forceinline__ void io_bulk_gather_tile(
             src = kv_ptr + (size_t)block_idx * stride_kv_block
                          + (size_t)local_idx * IO::IO_STRIDE;
         }
-        cp_async_bulk_g2s(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar);
+        if constexpr (USE_L2_HINT)
+            cp_async_bulk_g2s_l2hint(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar, cache_policy);
+        else
+            cp_async_bulk_g2s(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar);
     }
 }
 
