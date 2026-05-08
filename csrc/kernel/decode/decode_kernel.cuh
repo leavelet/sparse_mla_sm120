@@ -29,11 +29,10 @@
 struct DecodeColdParams {
     float sm_scale;
     int num_tokens;
-    int page_block_size;
     size_t stride_kv_block;
 };
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int TILES_PER_SPLIT>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int TILES_PER_SPLIT, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_decode_kernel(
     const bf16* __restrict__ Q,
@@ -45,7 +44,7 @@ sparse_mla_decode_kernel(
 {
     const float sm_scale = cold.sm_scale;
     const int num_tokens = cold.num_tokens;
-    const int page_block_size = cold.page_block_size;
+    constexpr int page_block_size = PAGE_BLOCK_SIZE;
     const size_t stride_kv_block = cold.stride_kv_block;
     using KV = KVCacheTraits<MT>;
     using CT = ComputeTraits<MT, CM>;
@@ -86,27 +85,26 @@ sparse_mla_decode_kernel(
         const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
         // Prologue: gather tile 0
-        io_bulk_gather_tile<MT, true>(
+        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
             sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid,
-            page_block_size, stride_kv_block, kv_l2_policy);
-        io_gather_scales<MT>(
+            stride_kv_block, kv_l2_policy);
+        io_gather_scales<MT, PAGE_BLOCK_SIZE>(
             sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid,
-            page_block_size, stride_kv_block);
-        // [F3] Ensure scale stores visible to math warps (mbarrier only tracks cp.async.bulk)
+            stride_kv_block);
         __threadfence_block();
 
         #pragma unroll
         for (int ti = 0; ti < TILES_PER_SPLIT; ti++) {
             if (ti + 1 < TILES_PER_SPLIT) {
-                io_bulk_gather_tile<MT, true>(
+                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
                     sm.kv_bufs[(ti + 1) & 1],
                     idx_base + (ti + 1) * BI, KV_cache,
                     sm.mbar_kv + ((ti + 1) & 1), io_tid,
-                    page_block_size, stride_kv_block, kv_l2_policy);
-                io_gather_scales<MT>(
+                    stride_kv_block, kv_l2_policy);
+                io_gather_scales<MT, PAGE_BLOCK_SIZE>(
                     sm.kv_scale_bufs[(ti + 1) & 1],
                     idx_base + (ti + 1) * BI, KV_cache, io_tid,
-                    page_block_size, stride_kv_block);
+                    stride_kv_block);
                 // [F3] threadfence for scale visibility in main loop
                 __threadfence_block();
             }
@@ -150,6 +148,29 @@ sparse_mla_decode_kernel(
             uint8_t* kv_smem = sm.kv_bufs[ti & 1];
             const int32_t* ib = idx_base + ti * BI;
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
+            uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
+
+            // Precompute entry base pointers for global KV access.
+            // V32 (flat addressing): only gid's entry needed (for QK rope).
+            // MODEL1 (block-structured): all 8 entries precomputed (div/mod expensive).
+            const uint8_t* entry_base[ENTRIES_PER_WARP];
+            if constexpr (KV::V_HAS_ROPE) {
+                // MODEL1: precompute all 8 — used by QK rope + XV rope
+                #pragma unroll
+                for (int e = 0; e < ENTRIES_PER_WARP; e++) {
+                    int idx = ib[qk_nb + e];
+                    idx = (idx >= 0) ? idx : 0;
+                    int bi_e = idx / page_block_size;
+                    int li_e = idx % page_block_size;
+                    entry_base[e] = KV_cache + (size_t)bi_e * stride_kv_block
+                                             + (size_t)li_e * IO::IO_STRIDE;
+                }
+            } else {
+                // V32: only precompute gid's entry (QK rope needs only this one)
+                int idx = ib[qk_nb + gid];
+                idx = (idx >= 0) ? idx : 0;
+                entry_base[gid] = KV_cache + (size_t)idx * IO::IO_STRIDE;
+            }
 
             for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = 0.f;
@@ -159,6 +180,8 @@ sparse_mla_decode_kernel(
             // sfb: UE8M0 K scale for N-row = gid (entry gid in this warp)
             // Hardware applies: D[m][n] = scale_A[m] * scale_B[n] * (A×B) + C
             float qk[4] = {0.f, 0.f, 0.f, 0.f};
+            // Precompute gid's scale buffer base for this warp
+            const uint8_t* kv_gid_base = kv_warp_base + gid * KV::KV_SMEM_STRIDE;
             #pragma unroll
             for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
                 uint8_t sfa = fp32_to_ue8m0(
@@ -166,7 +189,7 @@ sparse_mla_decode_kernel(
                 uint8_t sfb;
                 if constexpr (KV::SCALE_IN_KV_SMEM) {
                     sfb = fp32_to_ue8m0(
-                        reinterpret_cast<const float*>(kv_smem + (qk_nb + gid) * KV::KV_SMEM_STRIDE + KV::D_NOPE)[blk]);
+                        reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk]);
                 } else {
                     sfb = sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk];
                 }
@@ -178,7 +201,7 @@ sparse_mla_decode_kernel(
                     ldmatrix_load_A_fp8(a0, a1, a2, a3,
                         sm.q_nope_fp8 + ko, KV::Q_NOPE_STRIDE, lane);
                     ldmatrix_load_B_fp8(b0, b1,
-                        kv_smem + qk_nb * KV::KV_SMEM_STRIDE + ko, KV::KV_SMEM_STRIDE, lane);
+                        kv_warp_base + ko, KV::KV_SMEM_STRIDE, lane);
                     MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(
                         a0, a1, a2, a3, b0, b1,
                         qk[0], qk[1], qk[2], qk[3], sfa, sfb);
@@ -188,19 +211,8 @@ sparse_mla_decode_kernel(
 
             // ── QK rope (BF16 MMA) ─────────────────────────────────
             {
-                int entry_idx = ib[qk_nb + gid];
-                entry_idx = (entry_idx >= 0) ? entry_idx : 0;
-                const uint8_t* rope_base;
-                if constexpr (KV::SCALE_IN_KV_SMEM) {
-                    rope_base = KV_cache + (size_t)entry_idx * IO::IO_STRIDE;
-                } else {
-                    int bi = entry_idx / page_block_size;
-                    int li = entry_idx % page_block_size;
-                    rope_base = KV_cache + (size_t)bi * stride_kv_block
-                                         + (size_t)li * IO::IO_STRIDE;
-                }
                 const bf16* rope_ptr = reinterpret_cast<const bf16*>(
-                    rope_base + KV::KV_ROPE_GMEM_OFFSET);
+                    entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET);
                 compute_qk_rope(qk, q_rope_regs, rope_ptr, lane);
             }
 
@@ -263,22 +275,24 @@ sparse_mla_decode_kernel(
                 sm.sum_reduce_buf[mwarp * HPB + gid + 8] = ls1;
             }
 
-            // ── V scale atomicMax ───────────────────────────────────
-            // V_CHUNK = QUANT_TILE → 1:1 scale mapping, no max-of-tiles.
+            // ── V scale cache + atomicMax ───────────────────────────
+            // Pre-load V scales into registers — reused in W quantize below.
+            float vsc_cache[CT::N_V_CHUNKS][2];
             {
-                int e0i = qk_nb + tid * 2, e1i = e0i + 1;
+                const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
+                const uint8_t* e0_base = kv_warp_base + tid * 2 * KV::KV_SMEM_STRIDE;
+                const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
                 #pragma unroll
                 for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-                    float vsc0, vsc1;
                     if constexpr (KV::SCALE_IN_KV_SMEM) {
-                        vsc0 = reinterpret_cast<const float*>(kv_smem + e0i * KV::KV_SMEM_STRIDE + KV::D_NOPE)[vc];
-                        vsc1 = reinterpret_cast<const float*>(kv_smem + e1i * KV::KV_SMEM_STRIDE + KV::D_NOPE)[vc];
+                        vsc_cache[vc][0] = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
+                        vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
                     } else {
-                        vsc0 = ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-                        vsc1 = ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+                        vsc_cache[vc][0] = ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+                        vsc_cache[vc][1] = ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
                     }
-                    float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
-                    float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
+                    float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
+                    float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
                     atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid]),
                         __float_as_int(fmaxf(fabsf(ws00), fabsf(ws01))));
                     atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid + 8]),
@@ -303,7 +317,7 @@ sparse_mla_decode_kernel(
             // MODEL1: double-buffered w_fp8+v_trans (N barriers, saves 6)
             // V32: single-buffered (2N-1 barriers, smem too tight for double)
             {
-                int e0i = qk_nb + tid * 2, e1i = e0i + 1;
+                const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
 
                 // Prologue: transpose chunk 0 into v_trans buf[0]
                 transpose_v_chunk<MT, CM>(sm.v_trans_bufs[0], kv_smem, 0);
@@ -316,17 +330,10 @@ sparse_mla_decode_kernel(
                     uint8_t* cur_vt = sm.v_trans_bufs[buf_idx];
                     uint8_t* cur_wfp8 = sm.w_fp8_bufs[buf_idx];
 
-                    // W quantize
+                    // W quantize — V scales from register cache (no smem reload)
                     {
                         float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
-                        float vsc0, vsc1;
-                        if constexpr (KV::SCALE_IN_KV_SMEM) {
-                            vsc0 = reinterpret_cast<const float*>(kv_smem + e0i * KV::KV_SMEM_STRIDE + KV::D_NOPE)[vc];
-                            vsc1 = reinterpret_cast<const float*>(kv_smem + e1i * KV::KV_SMEM_STRIDE + KV::D_NOPE)[vc];
-                        } else {
-                            vsc0 = ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-                            vsc1 = ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-                        }
+                        float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
                         float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
                         float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
                         __nv_fp8_e4m3 f00(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws00 * si0)));
@@ -379,9 +386,9 @@ sparse_mla_decode_kernel(
             // Barrier: last XV nope MMA reads v_trans_bufs[0]; rope writes bf16 weights there
             if constexpr (KV::V_HAS_ROPE) {
                 bar_sync_t<2, MATH_THREADS>();
-                xv_rope_mma<MT>(acc_rope, w0, w1, w2, w3,
+                xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
                     ib, KV_cache, mwarp, lane,
-                    page_block_size, stride_kv_block,
+                    stride_kv_block,
                     reinterpret_cast<bf16*>(sm.v_trans_bufs[0]));
             }
 

@@ -32,14 +32,13 @@ struct KVIOTraits {
 
 // Bulk gather token nope data (and inline scales for V32) from global to smem.
 // V32: flat addressing (idx * 656). MODEL1: block-structured (footer layout).
-template <ModelType MT, bool USE_L2_HINT = false>
+template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false>
 __device__ __forceinline__ void io_bulk_gather_tile(
     uint8_t* dst,
     const int32_t* indices,
     const uint8_t* __restrict__ kv_ptr,
     uint64_t* mbar,
     int io_tid,
-    int page_block_size,
     size_t stride_kv_block,
     uint64_t cache_policy = 0)
 {
@@ -60,8 +59,9 @@ __device__ __forceinline__ void io_bulk_gather_tile(
         if constexpr (KV::SCALE_IN_KV_SMEM) {
             src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
         } else {
-            int block_idx = idx / page_block_size;
-            int local_idx = idx % page_block_size;
+            constexpr int pbs = PAGE_BLOCK_SIZE;
+            int block_idx = idx / pbs;
+            int local_idx = idx % pbs;
             src = kv_ptr + (size_t)block_idx * stride_kv_block
                          + (size_t)local_idx * IO::IO_STRIDE;
         }
@@ -72,32 +72,29 @@ __device__ __forceinline__ void io_bulk_gather_tile(
     }
 }
 
-// Gather MODEL1 footer scales to separate smem buffer.
-// V32: no-op (scales already in bulk-copied kv_smem).
-// MODEL1 footer: scale at block_base + page_block_size * DATA_STRIDE + local_idx * 8.
-template <ModelType MT>
+template <ModelType MT, int PAGE_BLOCK_SIZE>
 __device__ __forceinline__ void io_gather_scales(
     uint8_t* scale_dst,
     const int32_t* indices,
     const uint8_t* __restrict__ kv_ptr,
     int io_tid,
-    int page_block_size,
     size_t stride_kv_block)
 {
     using KV = KVCacheTraits<MT>;
     using IO = KVIOTraits<MT>;
     if constexpr (KV::SCALE_IN_KV_SMEM) return;
 
+    constexpr int pbs = PAGE_BLOCK_SIZE;
     constexpr int SCALE_BYTES = KV::SCALE_BYTES_PER_TOKEN;
 
     for (int bi = io_tid; bi < BI; bi += IO_THREADS) {
         int idx = indices[bi];
         idx = (idx >= 0) ? idx : 0;
 
-        int block_idx = idx / page_block_size;
-        int local_idx = idx % page_block_size;
+        int block_idx = idx / pbs;
+        int local_idx = idx % pbs;
         const uint8_t* src = kv_ptr + (size_t)block_idx * stride_kv_block
-                                     + (size_t)page_block_size * IO::IO_STRIDE
+                                     + (size_t)pbs * IO::IO_STRIDE
                                      + (size_t)local_idx * SCALE_BYTES;
         *reinterpret_cast<uint64_t*>(scale_dst + bi * SCALE_BYTES) =
             __ldg(reinterpret_cast<const uint64_t*>(src));

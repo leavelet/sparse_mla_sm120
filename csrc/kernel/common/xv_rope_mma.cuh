@@ -23,7 +23,7 @@
 // Replaces xv_rope_scalar which had a coverage bug (gid-d_base coupling,
 // each head got only 8/64 rope dims). Verified by micro benchmark M7.
 
-template <ModelType MT>
+template <ModelType MT, int PAGE_BLOCK_SIZE>
 __device__ __forceinline__ void xv_rope_mma(
     float acc_rope[4],
     float w0, float w1, float w2, float w3,
@@ -31,7 +31,6 @@ __device__ __forceinline__ void xv_rope_mma(
     const uint8_t* __restrict__ KV_cache,
     int mwarp,
     int lane,
-    int page_block_size,
     size_t stride_kv_block,
     bf16* weight_smem)
 {
@@ -64,8 +63,6 @@ __device__ __forceinline__ void xv_rope_mma(
             weight_smem + k_base, BI, lane);
 
         // B operand: 4 scalar loads from global (L2 cached)
-        // b0 = {rope[entry_at(k_base+tid*2)][dim_n], rope[entry_at(k_base+tid*2+1)][dim_n]}
-        // b1 = {rope[entry_at(k_base+tid*2+8)][dim_n], rope[entry_at(k_base+tid*2+9)][dim_n]}
         auto get_rope_ptr = [&](int entry_offset) -> const bf16* {
             int idx = tile_indices[entry_offset];
             idx = (idx >= 0) ? idx : 0;
@@ -73,8 +70,9 @@ __device__ __forceinline__ void xv_rope_mma(
             if constexpr (KV::SCALE_IN_KV_SMEM) {
                 base = KV_cache + (size_t)idx * IO::IO_STRIDE;
             } else {
-                int bi = idx / page_block_size;
-                int li = idx % page_block_size;
+                constexpr int pbs = PAGE_BLOCK_SIZE;
+                int bi = idx / pbs;
+                int li = idx % pbs;
                 base = KV_cache + (size_t)bi * stride_kv_block
                                 + (size_t)li * IO::IO_STRIDE;
             }

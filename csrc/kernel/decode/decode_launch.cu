@@ -5,12 +5,12 @@
 // Split-KV decode: launch helpers and dispatch.
 // ============================================================================
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int TILES_PER_SPLIT>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int TILES_PER_SPLIT, int PAGE_BLOCK_SIZE>
 void launch_decode(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     float* partial_O, float* partial_LSE,
     float sm_scale, int num_tokens,
-    int page_block_size, size_t stride_kv_block,
+    size_t stride_kv_block,
     cudaStream_t stream)
 {
     constexpr size_t smem_bytes = SmemLayout<MT, CM>::TOTAL;
@@ -20,14 +20,14 @@ void launch_decode(
     dim3 grid(num_tokens * REPLICATE_H, NSPLITS);
     dim3 block(BLOCK_THREADS);
 
-    auto kernel = sparse_mla_decode_kernel<MT, CM, NUM_HEADS, TOPK, TILES_PER_SPLIT>;
+    auto kernel = sparse_mla_decode_kernel<MT, CM, NUM_HEADS, TOPK, TILES_PER_SPLIT, PAGE_BLOCK_SIZE>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         configured = true;
     }
 
-    DecodeColdParams cold{sm_scale, num_tokens, page_block_size, stride_kv_block};
+    DecodeColdParams cold{sm_scale, num_tokens, stride_kv_block};
 
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -40,12 +40,12 @@ void launch_decode(
     CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 void dispatch_tiles(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     float* partial_O, float* partial_LSE,
     float sm_scale, int num_tokens, int tiles_per_split,
-    int page_block_size, size_t stride_kv_block,
+    size_t stride_kv_block,
     cudaStream_t stream)
 {
     constexpr int NI = TOPK / BI;
@@ -53,9 +53,9 @@ void dispatch_tiles(
     #define CASE(TPS) \
         case TPS: \
             if constexpr (NI >= TPS && NI % TPS == 0) { \
-                launch_decode<MT, CM, NUM_HEADS, TOPK, TPS>( \
+                launch_decode<MT, CM, NUM_HEADS, TOPK, TPS, PAGE_BLOCK_SIZE>( \
                     Q, KV_cache, indices, partial_O, partial_LSE, \
-                    sm_scale, num_tokens, page_block_size, stride_kv_block, stream); \
+                    sm_scale, num_tokens, stride_kv_block, stream); \
             } else { \
                 TORCH_CHECK(false, "Invalid tiles_per_split=", TPS, " for TOPK=", TOPK); \
             } \
@@ -92,11 +92,12 @@ void sparse_mla_splitkv_launch_v32(
 
     TORCH_CHECK(topk == 2048, "V32 decode requires topk=2048, got ", topk);
 
+    // V32: page_block_size=1 (flat addressing), but template it anyway for consistency
     #define DISPATCH(NH) \
-        dispatch_tiles<ModelType::V32, ComputeMode::FP8, NH, 2048>( \
+        dispatch_tiles<ModelType::V32, ComputeMode::FP8, NH, 2048, 1>( \
             Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, \
             sm_scale, num_tokens, tiles_per_split, \
-            page_block_size, stride_kv_block, stream)
+            stride_kv_block, stream)
 
     switch (num_heads) {
     case 8:   DISPATCH(8); break;
@@ -122,11 +123,14 @@ void sparse_mla_splitkv_launch_model1(
     auto LSE_ptr = partial_LSE.data_ptr<float>();
     size_t stride_kv_block = (size_t)page_block_size * stride_kv_row;
 
+    // MODEL1: page_block_size=64 (power-of-2, compiles to shift+mask)
+    TORCH_CHECK(page_block_size == 64, "MODEL1 decode: page_block_size must be 64, got ", page_block_size);
+
     #define DISPATCH(NH, TK) \
-        dispatch_tiles<ModelType::MODEL1, ComputeMode::FP8, NH, TK>( \
+        dispatch_tiles<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64>( \
             Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, \
             sm_scale, num_tokens, tiles_per_split, \
-            page_block_size, stride_kv_block, stream)
+            stride_kv_block, stream)
 
     if (topk == 512) {
         switch (num_heads) {
