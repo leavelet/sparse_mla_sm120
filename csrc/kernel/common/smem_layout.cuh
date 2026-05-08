@@ -31,38 +31,45 @@ struct SmemLayout {
     static constexpr bool NEED_SCALE_BUF = (KV::KV_SMEM_COPY_BYTES < KV::KV_SCALE_GMEM_OFFSET + KV::SCALE_BYTES_PER_TOKEN);
     static constexpr size_t SMEM_KV_SCALE_BUF = NEED_SCALE_BUF ? BI * KV::SCALE_BYTES_PER_TOKEN : 0;
 
-    // Cross-warp reduction
+    // Cross-warp reduction (O1 overlap: reduce_buf and sum_reduce_buf share memory)
     static constexpr size_t SMEM_REDUCE     = N_MATH_WARPS * HPB * sizeof(float);
 
     // Per-head online softmax state
     static constexpr size_t SMEM_M          = HPB * sizeof(float);
     static constexpr size_t SMEM_L          = HPB * sizeof(float);
 
-    // XV phase
+    // XV phase — MODEL1 gets double-buffered w_fp8+v_trans (saves 6 barriers/tile)
+    // V32 stays single-buffered (smem too tight for double)
+    static constexpr bool DOUBLE_BUF_XV = KV::V_HAS_ROPE;  // MODEL1 only
+    static constexpr int XV_BUF_COUNT = DOUBLE_BUF_XV ? 2 : 1;
+
     static constexpr size_t SMEM_W_SC_ALL   = CT::N_V_CHUNKS * HPB * sizeof(float);
-    static constexpr size_t SMEM_W_FP8      = (CM == ComputeMode::FP8) ? HPB * (BI + 16) : 0;
-    static constexpr size_t SMEM_V_TRANS    = CT::V_CHUNK * CT::V_TRANS_STRIDE;
+    static constexpr size_t SMEM_W_FP8_ONE  = (CM == ComputeMode::FP8) ? HPB * (BI + 16) : 0;
+    static constexpr size_t SMEM_W_FP8      = SMEM_W_FP8_ONE * XV_BUF_COUNT;
+    static constexpr size_t SMEM_V_TRANS_ONE = CT::V_CHUNK * CT::V_TRANS_STRIDE;
+    static constexpr size_t SMEM_V_TRANS    = SMEM_V_TRANS_ONE * XV_BUF_COUNT;
 
     // Mbarrier (double-buffered)
     static constexpr size_t SMEM_MBAR_KV    = 2 * sizeof(uint64_t);
 
-    // Offsets
+    // Offsets — O1 overlap: reduce_buf and sum_reduce_buf share the same memory
     static constexpr size_t OFF_Q_NOPE    = 0;
     static constexpr size_t OFF_Q_SC      = OFF_Q_NOPE    + SMEM_Q_NOPE;
     static constexpr size_t OFF_Q_ROPE    = OFF_Q_SC      + SMEM_Q_SC;
     static constexpr size_t OFF_KV0       = OFF_Q_ROPE    + SMEM_Q_ROPE;
     static constexpr size_t OFF_KV1       = OFF_KV0       + SMEM_KV_BUF;
-    // MODEL1: scale buffers after KV buffers; V32: these are zero-size
     static constexpr size_t OFF_KV_SC0    = OFF_KV1       + SMEM_KV_BUF;
     static constexpr size_t OFF_KV_SC1    = OFF_KV_SC0    + SMEM_KV_SCALE_BUF;
     static constexpr size_t OFF_REDUCE    = OFF_KV_SC1    + SMEM_KV_SCALE_BUF;
-    static constexpr size_t OFF_SUM_RED   = OFF_REDUCE    + SMEM_REDUCE;
-    static constexpr size_t OFF_M         = OFF_SUM_RED   + SMEM_REDUCE;  // sum_reduce same size
+    static constexpr size_t OFF_SUM_RED   = OFF_REDUCE;  // O1: shares memory with reduce_buf
+    static constexpr size_t OFF_M         = OFF_REDUCE    + SMEM_REDUCE;
     static constexpr size_t OFF_L         = OFF_M         + SMEM_M;
     static constexpr size_t OFF_W_SC_ALL  = OFF_L         + SMEM_L;
-    static constexpr size_t OFF_W_FP8     = OFF_W_SC_ALL  + SMEM_W_SC_ALL;
-    static constexpr size_t OFF_V_TRANS   = OFF_W_FP8     + SMEM_W_FP8;
-    static constexpr size_t OFF_MBAR_KV   = (OFF_V_TRANS + SMEM_V_TRANS + 7) / 8 * 8;  // 8B align
+    static constexpr size_t OFF_W_FP8_0   = OFF_W_SC_ALL  + SMEM_W_SC_ALL;
+    static constexpr size_t OFF_W_FP8_1   = OFF_W_FP8_0   + SMEM_W_FP8_ONE;
+    static constexpr size_t OFF_V_TRANS0  = OFF_W_FP8_0   + SMEM_W_FP8;
+    static constexpr size_t OFF_V_TRANS1  = OFF_V_TRANS0   + SMEM_V_TRANS_ONE;
+    static constexpr size_t OFF_MBAR_KV   = (OFF_V_TRANS0 + SMEM_V_TRANS + 7) / 8 * 8;
     static constexpr size_t TOTAL         = OFF_MBAR_KV   + SMEM_MBAR_KV;
 
     static_assert(TOTAL <= 101376, "SG smem exceeds 99KB per-block limit");
@@ -127,8 +134,8 @@ struct SmemPtrs {
     float*   m_smem;
     float*   l_smem;
     float*   w_head_sc_all;
-    uint8_t* w_fp8;
-    uint8_t* v_trans;
+    uint8_t* w_fp8_bufs[2];
+    uint8_t* v_trans_bufs[2];
     uint64_t* mbar_kv;
 
     __device__ static SmemPtrs init(char* base) {
@@ -150,8 +157,10 @@ struct SmemPtrs {
         s.m_smem         = (float*)  (base + L::OFF_M);
         s.l_smem         = (float*)  (base + L::OFF_L);
         s.w_head_sc_all  = (float*)  (base + L::OFF_W_SC_ALL);
-        s.w_fp8          = (uint8_t*)(base + L::OFF_W_FP8);
-        s.v_trans        = (uint8_t*)(base + L::OFF_V_TRANS);
+        s.w_fp8_bufs[0]  = (uint8_t*)(base + L::OFF_W_FP8_0);
+        s.w_fp8_bufs[1]  = (uint8_t*)(base + (L::DOUBLE_BUF_XV ? L::OFF_W_FP8_1 : L::OFF_W_FP8_0));
+        s.v_trans_bufs[0] = (uint8_t*)(base + L::OFF_V_TRANS0);
+        s.v_trans_bufs[1] = (uint8_t*)(base + (L::DOUBLE_BUF_XV ? L::OFF_V_TRANS1 : L::OFF_V_TRANS0));
         s.mbar_kv        = (uint64_t*)(base + L::OFF_MBAR_KV);
         return s;
     }
