@@ -175,6 +175,11 @@ sparse_mla_decode_kernel(
             for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = 0.f;
 
+            // Prefetch KV rope B operands into registers — loads issue now,
+            // data arrives during the ~16 QK nope MMAs below (~300 cycle overlap).
+            KVRopePrefetch rope_pf = prefetch_kv_rope(
+                reinterpret_cast<const bf16*>(entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET), lane);
+
             // ── QK nope (block-scaled FP8 MMA) ─────────────────────
             // sfa: UE8M0 Q scale for M-row = gid + (lane&1)*8
             // sfb: UE8M0 K scale for N-row = gid (entry gid in this warp)
@@ -209,12 +214,8 @@ sparse_mla_decode_kernel(
                 }
             }
 
-            // ── QK rope (BF16 MMA) ─────────────────────────────────
-            {
-                const bf16* rope_ptr = reinterpret_cast<const bf16*>(
-                    entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET);
-                compute_qk_rope(qk, q_rope_regs, rope_ptr, lane);
-            }
+            // ── QK rope (BF16 MMA, uses prefetched B operands) ──────
+            compute_qk_rope(qk, q_rope_regs, rope_pf);
 
             // ── Invalid index masking ──────────────────────────────
             {
