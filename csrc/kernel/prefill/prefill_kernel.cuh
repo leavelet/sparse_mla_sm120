@@ -126,10 +126,8 @@ sparse_mla_prefill_kernel(
             sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, sm.reduce_buf);
         QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
-        for (int h = threadIdx.x; h < HPB; h += MATH_THREADS) {
+        for (int h = threadIdx.x; h < HPB; h += MATH_THREADS)
             sm.m_smem[h] = -1e30f;
-            sm.l_smem[h] = 0.f;
-        }
 
         float acc_o[CT::ACC_TILES][4];
         #pragma unroll
@@ -137,6 +135,7 @@ sparse_mla_prefill_kernel(
             acc_o[t][0] = acc_o[t][1] = acc_o[t][2] = acc_o[t][3] = 0.f;
 
         float acc_rope[4] = {0.f, 0.f, 0.f, 0.f};
+        float warp_l[2] = {0.f, 0.f};
 
         bar_sync_t<2, MATH_THREADS>();
         mbarrier_wait_parity(sm.mbar_kv + 0, 0);
@@ -212,7 +211,7 @@ sparse_mla_prefill_kernel(
                 if (ib[e1] < 0) { qk[1] = -1e30f; qk[3] = -1e30f; }
             }
 
-            // ── Online softmax ──────────────────────────────────────
+            // ── Online softmax (deferred sum, conditional rescale) ──
             float s[4] = { qk[0] * sm_scale_log2e, qk[1] * sm_scale_log2e,
                            qk[2] * sm_scale_log2e, qk[3] * sm_scale_log2e };
 
@@ -233,7 +232,6 @@ sparse_mla_prefill_kernel(
                 float nm = fmaxf(old_m, tm);
                 float alpha = exp2f(old_m - nm);
                 sm.m_smem[h] = nm;
-                sm.l_smem[h] *= alpha;
                 sm.reduce_buf[h] = alpha;
                 sm.reduce_buf[HPB + h] = nm;
             }
@@ -242,14 +240,18 @@ sparse_mla_prefill_kernel(
             float alpha0 = sm.reduce_buf[gid], alpha1 = sm.reduce_buf[gid + 8];
             float nm0 = sm.reduce_buf[HPB + gid], nm1 = sm.reduce_buf[HPB + gid + 8];
 
-            #pragma unroll
-            for (int t = 0; t < CT::ACC_TILES; t++) {
-                acc_o[t][0] *= alpha0; acc_o[t][1] *= alpha0;
-                acc_o[t][2] *= alpha1; acc_o[t][3] *= alpha1;
-            }
-            if constexpr (KV::V_HAS_ROPE) {
-                acc_rope[0] *= alpha0; acc_rope[1] *= alpha0;
-                acc_rope[2] *= alpha1; acc_rope[3] *= alpha1;
+            if (alpha0 < 1.0f || alpha1 < 1.0f) {
+                #pragma unroll
+                for (int t = 0; t < CT::ACC_TILES; t++) {
+                    acc_o[t][0] *= alpha0; acc_o[t][1] *= alpha0;
+                    acc_o[t][2] *= alpha1; acc_o[t][3] *= alpha1;
+                }
+                if constexpr (KV::V_HAS_ROPE) {
+                    acc_rope[0] *= alpha0; acc_rope[1] *= alpha0;
+                    acc_rope[2] *= alpha1; acc_rope[3] *= alpha1;
+                }
+                warp_l[0] *= alpha0;
+                warp_l[1] *= alpha1;
             }
 
             float w0 = exp2f(s[0] - nm0), w1 = exp2f(s[1] - nm0);
@@ -257,11 +259,8 @@ sparse_mla_prefill_kernel(
 
             float ls0, ls1;
             softmax_warp_sum(w0, w1, w2, w3, ls0, ls1);
-            bar_sync_t<2, MATH_THREADS>();
-            if (tid == 0) {
-                sm.sum_reduce_buf[mwarp * HPB + gid] = ls0;
-                sm.sum_reduce_buf[mwarp * HPB + gid + 8] = ls1;
-            }
+            warp_l[0] += ls0;
+            warp_l[1] += ls1;
 
             // ── V scale cache + atomicMax ───────────────────────────
             float vsc_cache[CT::N_V_CHUNKS][2];
@@ -288,14 +287,6 @@ sparse_mla_prefill_kernel(
             }
             bar_sync_t<2, MATH_THREADS>();
 
-            if (threadIdx.x < HPB) {
-                int h = threadIdx.x;
-                float ts = 0.f;
-                #pragma unroll
-                for (int w = 0; w < N_MATH_WARPS; w++)
-                    ts += sm.sum_reduce_buf[w * HPB + h];
-                sm.l_smem[h] += ts;
-            }
             for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
             bar_sync_t<2, MATH_THREADS>();
@@ -367,13 +358,23 @@ sparse_mla_prefill_kernel(
             }
         }
 
-        // ── Write BF16 output and LSE ────────────────────────────────
-        // output layout: [num_tokens, NUM_HEADS, D_V] bfloat16
-        // out_lse layout: [num_tokens, NUM_HEADS] float32
-        //
-        // Stage normalized BF16 to kv_bufs[0] for coalesced writes.
-        // kv_bufs[0] capacity: V32=33792B, MODEL1=29696B; need HPB*D_V*2=16384B ✓
+        // ── Finalize deferred row_sum ────────────────────────────────
+        if (tid == 0) {
+            sm.reduce_buf[mwarp * HPB + gid] = warp_l[0];
+            sm.reduce_buf[mwarp * HPB + gid + 8] = warp_l[1];
+        }
+        bar_sync_t<2, MATH_THREADS>();
+        if (threadIdx.x < HPB) {
+            int h = threadIdx.x;
+            float ts = 0.f;
+            #pragma unroll
+            for (int w = 0; w < N_MATH_WARPS; w++)
+                ts += sm.reduce_buf[w * HPB + h];
+            sm.l_smem[h] = ts;
+        }
+        bar_sync_t<2, MATH_THREADS>();
 
+        // ── Write BF16 output and LSE ────────────────────────────────
         float il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
         float il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
 
@@ -543,11 +544,8 @@ sparse_mla_prefill_mg_kernel(
         for (int g = 0; g < MG_N_HG; g++)
             q_rope_regs[g] = preload_q_rope_regs(sm.q_rope + g * HPB * D_ROPE, lane);
 
-        // Init per-group softmax state
-        for (int i = threadIdx.x; i < MG_N_HG * HPB; i += MATH_THREADS) {
+        for (int i = threadIdx.x; i < MG_N_HG * HPB; i += MATH_THREADS)
             sm.m_smem[i] = -1e30f;
-            sm.l_smem[i] = 0.f;
-        }
 
         // Per-group accumulators
         float acc_o[MG_N_HG][CT::ACC_TILES][4];
@@ -674,7 +672,6 @@ sparse_mla_prefill_mg_kernel(
                 float nm = fmaxf(old_m, tm);
                 float alpha = exp2f(old_m - nm);
                 sm.m_smem[g * SMG::ML_GRP_STRIDE + h] = nm;
-                sm.l_smem[g * SMG::ML_GRP_STRIDE + h] *= alpha;
                 sm.reduce_buf[g * SMG::REDUCE_GRP_STRIDE + h] = alpha;
                 sm.reduce_buf[g * SMG::REDUCE_GRP_STRIDE + HPB + h] = nm;
             }
@@ -688,14 +685,18 @@ sparse_mla_prefill_mg_kernel(
                 float nm0 = sm.reduce_buf[g * SMG::REDUCE_GRP_STRIDE + HPB + gid];
                 float nm1 = sm.reduce_buf[g * SMG::REDUCE_GRP_STRIDE + HPB + gid + 8];
 
-                #pragma unroll
-                for (int t = 0; t < CT::ACC_TILES; t++) {
-                    acc_o[g][t][0] *= alpha0; acc_o[g][t][1] *= alpha0;
-                    acc_o[g][t][2] *= alpha1; acc_o[g][t][3] *= alpha1;
-                }
-                if constexpr (KV::V_HAS_ROPE) {
-                    acc_rope[g][0] *= alpha0; acc_rope[g][1] *= alpha0;
-                    acc_rope[g][2] *= alpha1; acc_rope[g][3] *= alpha1;
+                if (alpha0 < 1.0f || alpha1 < 1.0f) {
+                    #pragma unroll
+                    for (int t = 0; t < CT::ACC_TILES; t++) {
+                        acc_o[g][t][0] *= alpha0; acc_o[g][t][1] *= alpha0;
+                        acc_o[g][t][2] *= alpha1; acc_o[g][t][3] *= alpha1;
+                    }
+                    if constexpr (KV::V_HAS_ROPE) {
+                        acc_rope[g][0] *= alpha0; acc_rope[g][1] *= alpha0;
+                        acc_rope[g][2] *= alpha1; acc_rope[g][3] *= alpha1;
+                    }
+                    warp_l_partial[g][0] *= alpha0;
+                    warp_l_partial[g][1] *= alpha1;
                 }
 
                 float w0 = exp2f(w_grp[g][0] - nm0), w1 = exp2f(w_grp[g][1] - nm0);
@@ -703,7 +704,6 @@ sparse_mla_prefill_mg_kernel(
                 w_grp[g][0] = w0; w_grp[g][1] = w1;
                 w_grp[g][2] = w2; w_grp[g][3] = w3;
 
-                // Deferred row_sum: accumulate in registers
                 float ls0, ls1;
                 softmax_warp_sum(w0, w1, w2, w3, ls0, ls1);
                 warp_l_partial[g][0] += ls0;
@@ -830,7 +830,7 @@ sparse_mla_prefill_mg_kernel(
             #pragma unroll
             for (int w = 0; w < N_MATH_WARPS; w++)
                 ts += sm.reduce_buf[g * SMG::REDUCE_GRP_STRIDE + w * HPB + h];
-            sm.l_smem[g * SMG::ML_GRP_STRIDE + h] += ts;
+            sm.l_smem[g * SMG::ML_GRP_STRIDE + h] = ts;
         }
         bar_sync_t<2, MATH_THREADS>();
 
