@@ -126,18 +126,16 @@ sparse_mla_decode_kernel(
             sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, sm.reduce_buf);
         QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
-        for (int h = threadIdx.x; h < HPB; h += MATH_THREADS) {
+        for (int h = threadIdx.x; h < HPB; h += MATH_THREADS)
             sm.m_smem[h] = -1e30f;
-            sm.l_smem[h] = 0.f;
-        }
 
         float acc_o[CT::ACC_TILES][4];
         #pragma unroll
         for (int t = 0; t < CT::ACC_TILES; t++)
             acc_o[t][0] = acc_o[t][1] = acc_o[t][2] = acc_o[t][3] = 0.f;
 
-        // MODEL1 rope output accumulator (dims D_NOPE..D_NOPE+D_ROPE-1)
         float acc_rope[4] = {0.f, 0.f, 0.f, 0.f};
+        float warp_l[2] = {0.f, 0.f};
 
         bar_sync_t<2, MATH_THREADS>();
         mbarrier_wait_parity(sm.mbar_kv + 0, 0);
@@ -224,7 +222,7 @@ sparse_mla_decode_kernel(
                 if (ib[e1] < 0) { qk[1] = -1e30f; qk[3] = -1e30f; }
             }
 
-            // ── Online softmax ──────────────────────────────────────
+            // ── Online softmax (deferred sum, conditional rescale) ──
             float s[4] = { qk[0] * sm_scale_log2e, qk[1] * sm_scale_log2e,
                            qk[2] * sm_scale_log2e, qk[3] * sm_scale_log2e };
 
@@ -245,7 +243,6 @@ sparse_mla_decode_kernel(
                 float nm = fmaxf(old_m, tm);
                 float alpha = exp2f(old_m - nm);
                 sm.m_smem[h] = nm;
-                sm.l_smem[h] *= alpha;
                 sm.reduce_buf[h] = alpha;
                 sm.reduce_buf[HPB + h] = nm;
             }
@@ -254,14 +251,18 @@ sparse_mla_decode_kernel(
             float alpha0 = sm.reduce_buf[gid], alpha1 = sm.reduce_buf[gid + 8];
             float nm0 = sm.reduce_buf[HPB + gid], nm1 = sm.reduce_buf[HPB + gid + 8];
 
-            #pragma unroll
-            for (int t = 0; t < CT::ACC_TILES; t++) {
-                acc_o[t][0] *= alpha0; acc_o[t][1] *= alpha0;
-                acc_o[t][2] *= alpha1; acc_o[t][3] *= alpha1;
-            }
-            if constexpr (KV::V_HAS_ROPE) {
-                acc_rope[0] *= alpha0; acc_rope[1] *= alpha0;
-                acc_rope[2] *= alpha1; acc_rope[3] *= alpha1;
+            if (alpha0 < 1.0f || alpha1 < 1.0f) {
+                #pragma unroll
+                for (int t = 0; t < CT::ACC_TILES; t++) {
+                    acc_o[t][0] *= alpha0; acc_o[t][1] *= alpha0;
+                    acc_o[t][2] *= alpha1; acc_o[t][3] *= alpha1;
+                }
+                if constexpr (KV::V_HAS_ROPE) {
+                    acc_rope[0] *= alpha0; acc_rope[1] *= alpha0;
+                    acc_rope[2] *= alpha1; acc_rope[3] *= alpha1;
+                }
+                warp_l[0] *= alpha0;
+                warp_l[1] *= alpha1;
             }
 
             float w0 = exp2f(s[0] - nm0), w1 = exp2f(s[1] - nm0);
@@ -269,15 +270,10 @@ sparse_mla_decode_kernel(
 
             float ls0, ls1;
             softmax_warp_sum(w0, w1, w2, w3, ls0, ls1);
-            // O1 barrier: reduce_buf is dead, safe to write sum_reduce_buf (shared memory)
-            bar_sync_t<2, MATH_THREADS>();
-            if (tid == 0) {
-                sm.sum_reduce_buf[mwarp * HPB + gid] = ls0;
-                sm.sum_reduce_buf[mwarp * HPB + gid + 8] = ls1;
-            }
+            warp_l[0] += ls0;
+            warp_l[1] += ls1;
 
             // ── V scale cache + atomicMax ───────────────────────────
-            // Pre-load V scales into registers — reused in W quantize below.
             float vsc_cache[CT::N_V_CHUNKS][2];
             {
                 const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
@@ -302,14 +298,6 @@ sparse_mla_decode_kernel(
             }
             bar_sync_t<2, MATH_THREADS>();
 
-            if (threadIdx.x < HPB) {
-                int h = threadIdx.x;
-                float ts = 0.f;
-                #pragma unroll
-                for (int w = 0; w < N_MATH_WARPS; w++)
-                    ts += sm.sum_reduce_buf[w * HPB + h];
-                sm.l_smem[h] += ts;
-            }
             for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
             bar_sync_t<2, MATH_THREADS>();
@@ -382,14 +370,23 @@ sparse_mla_decode_kernel(
             }
         }
 
-        // ── Write partial_O (float32) and partial_LSE ────────────────
-        // partial_O layout: [num_tokens, NSPLITS, NUM_HEADS, D_V] float32
-        // partial_LSE layout: [num_tokens, NSPLITS, NUM_HEADS] float32
-        //
-        // Use smem staging (reuse kv_bufs[0]) to coalesce float32 writes.
-        // Staging layout: [HPB heads × D_V floats] = HPB * D_V * 4 bytes
-        // kv_bufs[0] = BI * KV_SMEM_STRIDE bytes, D_V*HPB*4 = 32768 ≤ 33792 ✓
+        // ── Finalize deferred row_sum ────────────────────────────────
+        if (tid == 0) {
+            sm.reduce_buf[mwarp * HPB + gid] = warp_l[0];
+            sm.reduce_buf[mwarp * HPB + gid + 8] = warp_l[1];
+        }
+        bar_sync_t<2, MATH_THREADS>();
+        if (threadIdx.x < HPB) {
+            int h = threadIdx.x;
+            float ts = 0.f;
+            #pragma unroll
+            for (int w = 0; w < N_MATH_WARPS; w++)
+                ts += sm.reduce_buf[w * HPB + h];
+            sm.l_smem[h] = ts;
+        }
+        bar_sync_t<2, MATH_THREADS>();
 
+        // ── Write partial_O (float32) and partial_LSE ────────────────
         float il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
         float il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
 
