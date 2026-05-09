@@ -38,10 +38,10 @@ struct SmemLayout {
     static constexpr size_t SMEM_M          = HPB * sizeof(float);
     static constexpr size_t SMEM_L          = HPB * sizeof(float);
 
-    // XV phase — w_fp8 always double-buffered (D2 eliminates v_trans)
+    // XV phase — w_fp8 for all V chunks (batch W quant, single barrier)
     static constexpr size_t SMEM_W_SC_ALL   = CT::N_V_CHUNKS * HPB * sizeof(float);
     static constexpr size_t SMEM_W_FP8_ONE  = (CM == ComputeMode::FP8) ? HPB * (BI + 16) : 0;
-    static constexpr size_t SMEM_W_FP8      = SMEM_W_FP8_ONE * 2;
+    static constexpr size_t SMEM_W_FP8      = SMEM_W_FP8_ONE * CT::N_V_CHUNKS;
 
     // Mbarrier (double-buffered)
     static constexpr size_t SMEM_MBAR_KV    = 2 * sizeof(uint64_t);
@@ -59,9 +59,8 @@ struct SmemLayout {
     static constexpr size_t OFF_M         = OFF_REDUCE    + SMEM_REDUCE;
     static constexpr size_t OFF_L         = OFF_M         + SMEM_M;
     static constexpr size_t OFF_W_SC_ALL  = OFF_L         + SMEM_L;
-    static constexpr size_t OFF_W_FP8_0   = OFF_W_SC_ALL  + SMEM_W_SC_ALL;
-    static constexpr size_t OFF_W_FP8_1   = OFF_W_FP8_0   + SMEM_W_FP8_ONE;
-    static constexpr size_t OFF_MBAR_KV   = (OFF_W_FP8_0 + SMEM_W_FP8 + 7) / 8 * 8;
+    static constexpr size_t OFF_W_FP8     = OFF_W_SC_ALL  + SMEM_W_SC_ALL;
+    static constexpr size_t OFF_MBAR_KV   = (OFF_W_FP8 + SMEM_W_FP8 + 7) / 8 * 8;
     static constexpr size_t TOTAL         = OFF_MBAR_KV   + SMEM_MBAR_KV;
 
     static_assert(TOTAL <= 101376, "SG smem exceeds 99KB per-block limit");
@@ -181,7 +180,7 @@ struct SmemPtrs {
     float*   m_smem;
     float*   l_smem;
     float*   w_head_sc_all;
-    uint8_t* w_fp8_bufs[2];
+    uint8_t* w_fp8;   // base, index by vc * SMEM_W_FP8_ONE
     uint64_t* mbar_kv;
 
     __device__ static SmemPtrs init(char* base) {
@@ -203,8 +202,7 @@ struct SmemPtrs {
         s.m_smem         = (float*)  (base + L::OFF_M);
         s.l_smem         = (float*)  (base + L::OFF_L);
         s.w_head_sc_all  = (float*)  (base + L::OFF_W_SC_ALL);
-        s.w_fp8_bufs[0]  = (uint8_t*)(base + L::OFF_W_FP8_0);
-        s.w_fp8_bufs[1]  = (uint8_t*)(base + L::OFF_W_FP8_1);
+        s.w_fp8          = (uint8_t*)(base + L::OFF_W_FP8);
         s.mbar_kv        = (uint64_t*)(base + L::OFF_MBAR_KV);
         return s;
     }
