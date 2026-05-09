@@ -12,7 +12,7 @@
 #include "../common/fp8_quant.cuh"
 #include "../common/online_softmax.cuh"
 #include "../common/q_rope.cuh"
-#include "../common/v_transpose.cuh"
+#include "../common/d2_load_b.cuh"
 #include "../common/xv_rope_mma.cuh"
 
 // ============================================================================
@@ -300,19 +300,14 @@ sparse_mla_prefill_kernel(
                 sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
             bar_sync_t<2, MATH_THREADS>();
 
-            // ── XV nope MMA ─────────────────────────────────────────
+            // ── XV nope MMA (D2: direct B from kv_smem) ───────────
             {
                 const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
 
-                transpose_v_chunk<MT, CM>(sm.v_trans_bufs[0], kv_smem, 0);
-
                 #pragma unroll
                 for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-                    const int v_off = vc * CT::V_CHUNK;
                     float* vc_sc = sm.w_head_sc_all + vc * HPB;
-                    const int buf_idx = L::DOUBLE_BUF_XV ? (vc & 1) : 0;
-                    uint8_t* cur_vt = sm.v_trans_bufs[buf_idx];
-                    uint8_t* cur_wfp8 = sm.w_fp8_bufs[buf_idx];
+                    uint8_t* cur_wfp8 = sm.w_fp8_bufs[vc & 1];
 
                     {
                         float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
@@ -334,7 +329,7 @@ sparse_mla_prefill_kernel(
                     #pragma unroll
                     for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
                         int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
-                        int nl = mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
+                        int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
                         float xv[4] = {0.f, 0.f, 0.f, 0.f};
                         #pragma unroll
                         for (int kstep = 0; kstep < CT::XV_KSTEPS; kstep++) {
@@ -342,9 +337,8 @@ sparse_mla_prefill_kernel(
                             uint32_t a0, a1, a2, a3, b0, b1;
                             ldmatrix_load_A_fp8(a0, a1, a2, a3,
                                 cur_wfp8 + ko, BI + 16, lane);
-                            ldmatrix_load_B_fp8(b0, b1,
-                                cur_vt + nl * CT::V_TRANS_STRIDE + ko,
-                                CT::V_TRANS_STRIDE, lane);
+                            d2_load_b_fp8<KV::KV_SMEM_STRIDE>(b0, b1,
+                                kv_smem, kstep * 32, dim, lane);
                             MmaFp8Result r = mma_fp8_m16n8k32(
                                 a0, a1, a2, a3, b0, b1,
                                 xv[0], xv[1], xv[2], xv[3]);
@@ -353,13 +347,6 @@ sparse_mla_prefill_kernel(
                         float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
                         acc_o[ti_acc][0] += xv[0] * sc0; acc_o[ti_acc][1] += xv[1] * sc0;
                         acc_o[ti_acc][2] += xv[2] * sc1; acc_o[ti_acc][3] += xv[3] * sc1;
-                    }
-
-                    if (vc < CT::N_V_CHUNKS - 1) {
-                        const int next_buf = L::DOUBLE_BUF_XV ? ((vc + 1) & 1) : 0;
-                        transpose_v_chunk<MT, CM>(sm.v_trans_bufs[next_buf], kv_smem, (vc + 1) * CT::V_CHUNK);
-                        if constexpr (!L::DOUBLE_BUF_XV)
-                            bar_sync_t<2, MATH_THREADS>();
                     }
                 }
             }
@@ -370,7 +357,7 @@ sparse_mla_prefill_kernel(
                 xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
                     ib, KV_cache, mwarp, lane,
                     stride_kv_block,
-                    reinterpret_cast<bf16*>(sm.v_trans_bufs[0]));
+                    reinterpret_cast<bf16*>(sm.w_fp8_bufs[0]));
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();
@@ -750,14 +737,10 @@ sparse_mla_prefill_mg_kernel(
                 sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
             bar_sync_t<2, MATH_THREADS>();
 
-            // ── XV nope MMA (V transpose shared) ────────────────────
+            // ── XV nope MMA (D2: direct B from kv_smem) ────────────
             {
-                // Prologue: transpose chunk 0 (once, shared)
-                transpose_v_chunk<MT, CM>(sm.v_trans, kv_smem, 0);
-
                 #pragma unroll
                 for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-                    // W quantize for both groups → separate w_fp8 buffers
                     #pragma unroll
                     for (int g = 0; g < MG_N_HG; g++) {
                         float* vc_sc = sm.w_head_sc_all + g * SMG::WSC_GRP_STRIDE + vc * HPB;
@@ -781,7 +764,6 @@ sparse_mla_prefill_mg_kernel(
 
                     bar_sync_t<2, MATH_THREADS>();
 
-                    // MMA for both groups (shared v_trans, per-group w_fp8)
                     #pragma unroll
                     for (int g = 0; g < MG_N_HG; g++) {
                         float* vc_sc = sm.w_head_sc_all + g * SMG::WSC_GRP_STRIDE + vc * HPB;
@@ -789,7 +771,7 @@ sparse_mla_prefill_mg_kernel(
                         #pragma unroll
                         for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
                             int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
-                            int nl = mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
+                            int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
                             float xv[4] = {0.f, 0.f, 0.f, 0.f};
                             #pragma unroll
                             for (int kstep = 0; kstep < CT::XV_KSTEPS; kstep++) {
@@ -797,9 +779,8 @@ sparse_mla_prefill_mg_kernel(
                                 uint32_t a0, a1, a2, a3, b0, b1;
                                 ldmatrix_load_A_fp8(a0, a1, a2, a3,
                                     cur_wfp8 + ko, BI + 16, lane);
-                                ldmatrix_load_B_fp8(b0, b1,
-                                    sm.v_trans + nl * CT::V_TRANS_STRIDE + ko,
-                                    CT::V_TRANS_STRIDE, lane);
+                                d2_load_b_fp8<KV::KV_SMEM_STRIDE>(b0, b1,
+                                    kv_smem, kstep * 32, dim, lane);
                                 MmaFp8Result r = mma_fp8_m16n8k32(
                                     a0, a1, a2, a3, b0, b1,
                                     xv[0], xv[1], xv[2], xv[3]);
@@ -809,11 +790,6 @@ sparse_mla_prefill_mg_kernel(
                             acc_o[g][ti_acc][0] += xv[0] * sc0; acc_o[g][ti_acc][1] += xv[1] * sc0;
                             acc_o[g][ti_acc][2] += xv[2] * sc1; acc_o[g][ti_acc][3] += xv[3] * sc1;
                         }
-                    }
-
-                    if (vc < CT::N_V_CHUNKS - 1) {
-                        transpose_v_chunk<MT, CM>(sm.v_trans, kv_smem, (vc + 1) * CT::V_CHUNK);
-                        bar_sync_t<2, MATH_THREADS>();
                     }
                 }
             }
@@ -826,7 +802,7 @@ sparse_mla_prefill_mg_kernel(
                     xv_rope_mma<MT, PAGE_BLOCK_SIZE>(
                         acc_rope[g], w_grp[g][0], w_grp[g][1], w_grp[g][2], w_grp[g][3],
                         ib, KV_cache, mwarp, lane, stride_kv_block,
-                        reinterpret_cast<bf16*>(sm.v_trans));
+                        reinterpret_cast<bf16*>(sm.w_fp8));
                 }
             }
 

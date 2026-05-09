@@ -38,16 +38,10 @@ struct SmemLayout {
     static constexpr size_t SMEM_M          = HPB * sizeof(float);
     static constexpr size_t SMEM_L          = HPB * sizeof(float);
 
-    // XV phase — MODEL1 gets double-buffered w_fp8+v_trans (saves 6 barriers/tile)
-    // V32 stays single-buffered (smem too tight for double)
-    static constexpr bool DOUBLE_BUF_XV = KV::V_HAS_ROPE;  // MODEL1 only
-    static constexpr int XV_BUF_COUNT = DOUBLE_BUF_XV ? 2 : 1;
-
+    // XV phase — w_fp8 always double-buffered (D2 eliminates v_trans)
     static constexpr size_t SMEM_W_SC_ALL   = CT::N_V_CHUNKS * HPB * sizeof(float);
     static constexpr size_t SMEM_W_FP8_ONE  = (CM == ComputeMode::FP8) ? HPB * (BI + 16) : 0;
-    static constexpr size_t SMEM_W_FP8      = SMEM_W_FP8_ONE * XV_BUF_COUNT;
-    static constexpr size_t SMEM_V_TRANS_ONE = CT::V_CHUNK * CT::V_TRANS_STRIDE;
-    static constexpr size_t SMEM_V_TRANS    = SMEM_V_TRANS_ONE * XV_BUF_COUNT;
+    static constexpr size_t SMEM_W_FP8      = SMEM_W_FP8_ONE * 2;
 
     // Mbarrier (double-buffered)
     static constexpr size_t SMEM_MBAR_KV    = 2 * sizeof(uint64_t);
@@ -67,9 +61,7 @@ struct SmemLayout {
     static constexpr size_t OFF_W_SC_ALL  = OFF_L         + SMEM_L;
     static constexpr size_t OFF_W_FP8_0   = OFF_W_SC_ALL  + SMEM_W_SC_ALL;
     static constexpr size_t OFF_W_FP8_1   = OFF_W_FP8_0   + SMEM_W_FP8_ONE;
-    static constexpr size_t OFF_V_TRANS0  = OFF_W_FP8_0   + SMEM_W_FP8;
-    static constexpr size_t OFF_V_TRANS1  = OFF_V_TRANS0   + SMEM_V_TRANS_ONE;
-    static constexpr size_t OFF_MBAR_KV   = (OFF_V_TRANS0 + SMEM_V_TRANS + 7) / 8 * 8;
+    static constexpr size_t OFF_MBAR_KV   = (OFF_W_FP8_0 + SMEM_W_FP8 + 7) / 8 * 8;
     static constexpr size_t TOTAL         = OFF_MBAR_KV   + SMEM_MBAR_KV;
 
     static_assert(TOTAL <= 101376, "SG smem exceeds 99KB per-block limit");
@@ -94,7 +86,10 @@ struct SmemLayoutMG {
     static constexpr size_t SMEM_L          = N_HG * HPB * sizeof(float);
     static constexpr size_t SMEM_W_SC_ALL   = N_HG * CT::N_V_CHUNKS * HPB * sizeof(float);
     static constexpr size_t SMEM_W_FP8_MG   = (CM == ComputeMode::FP8) ? N_HG * HPB * (BI + 16) : 0;
-    static constexpr size_t SMEM_V_TRANS    = CT::V_CHUNK * CT::V_TRANS_STRIDE;
+    // Scratch area: q_rope staging (O2 overlap) and xv_rope weight staging
+    // q_rope needs: N_HG * HPB * D_ROPE * sizeof(bf16) = 4096 bytes
+    // xv_rope needs: HPB * BI * sizeof(bf16) = 2048 bytes
+    static constexpr size_t SMEM_SCRATCH    = N_HG * HPB * D_ROPE * sizeof(bf16);
     static constexpr size_t SMEM_MBAR_KV    = 2 * sizeof(uint64_t);
 
     static constexpr size_t OFF_Q_NOPE0   = 0;
@@ -111,9 +106,9 @@ struct SmemLayoutMG {
     static constexpr size_t OFF_L         = OFF_M         + SMEM_M;
     static constexpr size_t OFF_W_SC_ALL  = OFF_L         + SMEM_L;
     static constexpr size_t OFF_W_FP8     = OFF_W_SC_ALL  + SMEM_W_SC_ALL;
-    // O2: v_trans also serves as q_rope staging
-    static constexpr size_t OFF_V_TRANS   = OFF_W_FP8     + SMEM_W_FP8_MG;
-    static constexpr size_t OFF_MBAR_KV   = (OFF_V_TRANS + SMEM_V_TRANS + 7) / 8 * 8;
+    // Scratch: q_rope staging (O2 overlap) + xv_rope weight staging
+    static constexpr size_t OFF_SCRATCH   = OFF_W_FP8     + SMEM_W_FP8_MG;
+    static constexpr size_t OFF_MBAR_KV   = (OFF_SCRATCH + SMEM_SCRATCH + 7) / 8 * 8;
     static constexpr size_t TOTAL         = OFF_MBAR_KV   + SMEM_MBAR_KV;
 
     static_assert(TOTAL <= 101376, "MG smem exceeds 99KB per-block limit");
@@ -141,7 +136,7 @@ struct SmemPtrsMG {
     float*   l_smem;           // [N_HG * HPB]
     float*   w_head_sc_all;    // [N_HG * N_V_CHUNKS * HPB]
     uint8_t* w_fp8;            // [N_HG * HPB * (BI+16)]
-    uint8_t* v_trans;          // shared
+    uint8_t* scratch;          // q_rope staging + xv_rope weight staging
     uint64_t* mbar_kv;
 
     __device__ static SmemPtrsMG init(char* base) {
@@ -150,7 +145,7 @@ struct SmemPtrsMG {
         s.q_nope_fp8[1]  = (uint8_t*)(base + LMG::OFF_Q_NOPE1);
         s.q_nope_sc[0]   = (float*)  (base + LMG::OFF_Q_SC0);
         s.q_nope_sc[1]   = (float*)  (base + LMG::OFF_Q_SC1);
-        s.q_rope         = (bf16*)   (base + LMG::OFF_V_TRANS);
+        s.q_rope         = (bf16*)   (base + LMG::OFF_SCRATCH);
         s.kv_bufs[0]     = (uint8_t*)(base + LMG::OFF_KV0);
         s.kv_bufs[1]     = (uint8_t*)(base + LMG::OFF_KV1);
         if constexpr (SmemLayout<MT,CM>::NEED_SCALE_BUF) {
@@ -165,7 +160,7 @@ struct SmemPtrsMG {
         s.l_smem         = (float*)  (base + LMG::OFF_L);
         s.w_head_sc_all  = (float*)  (base + LMG::OFF_W_SC_ALL);
         s.w_fp8          = (uint8_t*)(base + LMG::OFF_W_FP8);
-        s.v_trans        = (uint8_t*)(base + LMG::OFF_V_TRANS);
+        s.scratch        = (uint8_t*)(base + LMG::OFF_SCRATCH);
         s.mbar_kv        = (uint64_t*)(base + LMG::OFF_MBAR_KV);
         return s;
     }
@@ -187,7 +182,6 @@ struct SmemPtrs {
     float*   l_smem;
     float*   w_head_sc_all;
     uint8_t* w_fp8_bufs[2];
-    uint8_t* v_trans_bufs[2];
     uint64_t* mbar_kv;
 
     __device__ static SmemPtrs init(char* base) {
@@ -210,9 +204,7 @@ struct SmemPtrs {
         s.l_smem         = (float*)  (base + L::OFF_L);
         s.w_head_sc_all  = (float*)  (base + L::OFF_W_SC_ALL);
         s.w_fp8_bufs[0]  = (uint8_t*)(base + L::OFF_W_FP8_0);
-        s.w_fp8_bufs[1]  = (uint8_t*)(base + (L::DOUBLE_BUF_XV ? L::OFF_W_FP8_1 : L::OFF_W_FP8_0));
-        s.v_trans_bufs[0] = (uint8_t*)(base + L::OFF_V_TRANS0);
-        s.v_trans_bufs[1] = (uint8_t*)(base + (L::DOUBLE_BUF_XV ? L::OFF_V_TRANS1 : L::OFF_V_TRANS0));
+        s.w_fp8_bufs[1]  = (uint8_t*)(base + L::OFF_W_FP8_1);
         s.mbar_kv        = (uint64_t*)(base + L::OFF_MBAR_KV);
         return s;
     }
