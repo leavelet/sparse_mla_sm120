@@ -577,27 +577,23 @@ sparse_mla_prefill_mg_kernel(
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
             uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
-            // Entry base precomputation (shared across groups)
-            const uint8_t* entry_base[ENTRIES_PER_WARP];
-            if constexpr (KV::V_HAS_ROPE) {
-                #pragma unroll
-                for (int e = 0; e < ENTRIES_PER_WARP; e++) {
-                    int idx = ib[qk_nb + e];
-                    idx = (idx >= 0) ? idx : 0;
-                    int bi_e = idx / page_block_size;
-                    int li_e = idx % page_block_size;
-                    entry_base[e] = KV_cache + (size_t)bi_e * stride_kv_block
-                                             + (size_t)li_e * IO::IO_STRIDE;
-                }
-            } else {
+            // Entry base: only gid's entry needed (rope prefetch + QK rope)
+            const uint8_t* entry_base_gid;
+            {
                 int idx = ib[qk_nb + gid];
                 idx = (idx >= 0) ? idx : 0;
-                entry_base[gid] = KV_cache + (size_t)idx * IO::IO_STRIDE;
+                if constexpr (KV::V_HAS_ROPE) {
+                    int bi_e = idx / page_block_size;
+                    int li_e = idx % page_block_size;
+                    entry_base_gid = KV_cache + (size_t)bi_e * stride_kv_block
+                                              + (size_t)li_e * IO::IO_STRIDE;
+                } else {
+                    entry_base_gid = KV_cache + (size_t)idx * IO::IO_STRIDE;
+                }
             }
 
-            // Prefetch KV rope (shared across groups — same entry)
             KVRopePrefetch rope_pf = prefetch_kv_rope(
-                reinterpret_cast<const bf16*>(entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET), lane);
+                reinterpret_cast<const bf16*>(entry_base_gid + KV::KV_ROPE_GMEM_OFFSET), lane);
 
             // Init per-group w_head_sc_all
             for (int i = threadIdx.x; i < MG_N_HG * CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
