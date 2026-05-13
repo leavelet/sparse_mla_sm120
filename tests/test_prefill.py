@@ -221,5 +221,238 @@ class TestAttnSinkPrefill:
         print("\n  prefill attn_sink race check (3 seeds): PASS")
 
 
+# ── Dual-Cache (extra_k_cache) Prefill Tests ──────────────────────────
+
+def ref_dual_cache_attn(q, kv_main_dq, kv_extra_dq, main_idx, extra_idx,
+                         sm_scale, d_v, topk_length=None, attn_sink=None):
+    """FP32 reference for dual-cache sparse attention.
+
+    q:            (num_tokens, num_heads, d_qk) bf16
+    kv_main_dq:   (num_blocks, block_size, 1, d_qk) bf16 — main (SWA) cache
+    kv_extra_dq:  (num_blocks, block_size, 1, d_qk) bf16 — extra (compressed) cache
+    main_idx:     (num_tokens, topk) int32
+    extra_idx:    (num_tokens, extra_topk) int32
+    """
+    T, H, D = q.shape
+    topk = main_idx.shape[-1]
+    extra_topk = extra_idx.shape[-1]
+
+    kv_main_flat = kv_main_dq.view(-1, D).float()
+    kv_extra_flat = kv_extra_dq.view(-1, D).float()
+    q_f = q.float()
+
+    main_fix = main_idx.clamp(min=0)
+    main_inv = main_idx < 0
+    extra_fix = extra_idx.clamp(min=0)
+    extra_inv = extra_idx < 0
+
+    g_main = kv_main_flat.index_select(0, main_fix.view(-1)).view(T, topk, D)
+    g_extra = kv_extra_flat.index_select(0, extra_fix.view(-1)).view(T, extra_topk, D)
+    gathered = torch.cat([g_main, g_extra], dim=1)
+
+    P = torch.einsum("thd,tsd->ths", q_f, gathered) * sm_scale
+
+    invalid = torch.cat([main_inv, extra_inv], dim=-1)
+    P[invalid.unsqueeze(1).expand_as(P)] = float("-inf")
+
+    if topk_length is not None:
+        for t in range(T):
+            tl = topk_length[t].item()
+            if tl < topk:
+                P[t, :, tl:topk] = float("-inf")
+
+    lse = torch.logsumexp(P, dim=-1)
+    lse_safe = lse.clone()
+    lse_safe[lse_safe == float("-inf")] = float("+inf")
+    weights = torch.exp(P - lse_safe.unsqueeze(-1))
+
+    out = torch.einsum("ths,tsd->thd", weights, gathered[..., :d_v])
+
+    if attn_sink is not None:
+        sink_f = attn_sink.float().view(1, H)
+        scale = 1.0 / (1.0 + torch.exp(sink_f - lse))
+        out = out * scale.unsqueeze(-1)
+
+    return out.to(torch.bfloat16), lse
+
+
+def run_dual_cache_test(num_heads, topk, extra_topk, num_tokens,
+                         block_size=64, num_blocks=64, num_extra_blocks=64,
+                         attn_sink_val=None, topk_length_mode=None, seed=42):
+    """Run dual-cache prefill and compare to reference."""
+    torch.manual_seed(seed)
+    d_qk, d_v = 512, 512
+    sm_scale = d_qk ** -0.5
+    s_kv_main = num_blocks * block_size
+    s_kv_extra = num_extra_blocks * block_size
+
+    kv_main = (torch.randn(num_blocks, block_size, 1, d_qk,
+                             device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    kv_extra = (torch.randn(num_extra_blocks, block_size, 1, d_qk,
+                              device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    kv_main_p = quantize_kv_model1(kv_main)
+    kv_extra_p = quantize_kv_model1(kv_extra)
+    kv_main_dq = dequantize_kv_model1(kv_main_p)
+    kv_extra_dq = dequantize_kv_model1(kv_extra_p)
+
+    q = (torch.randn(num_tokens, num_heads, d_qk,
+                       device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    main_idx = torch.randint(0, s_kv_main, (num_tokens, topk),
+                              device="cuda", dtype=torch.int32)
+    extra_idx = torch.randint(0, s_kv_extra, (num_tokens, extra_topk),
+                               device="cuda", dtype=torch.int32)
+    main_idx[:, -5:] = -1
+
+    topk_length = None
+    if topk_length_mode == "short":
+        topk_length = torch.randint(topk // 2, topk, (num_tokens,),
+                                     device="cuda", dtype=torch.int32)
+    elif topk_length_mode == "variable":
+        topk_length = torch.randint(1, topk + 1, (num_tokens,),
+                                     device="cuda", dtype=torch.int32)
+
+    attn_sink = None
+    if attn_sink_val is not None:
+        attn_sink = torch.full((num_heads,), attn_sink_val,
+                                device="cuda", dtype=torch.float32)
+
+    ref_out, ref_lse = ref_dual_cache_attn(
+        q, kv_main_dq, kv_extra_dq, main_idx, extra_idx,
+        sm_scale, d_v, topk_length, attn_sink)
+
+    out, ml, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
+        q, kv_main_p, main_idx, sm_scale, d_v,
+        attn_sink=attn_sink, topk_length=topk_length,
+        extra_k_cache=kv_extra_p, extra_indices=extra_idx,
+        extra_topk=extra_topk)
+
+    err = (out.float() - ref_out.float()).abs()
+    max_err = err.max().item()
+    mean_err = err.mean().item()
+    return max_err, mean_err
+
+
+class TestDualCachePrefill:
+    """Dual-cache prefill: SWA (main) + compressed (extra) V4 config."""
+
+    @pytest.mark.parametrize("num_heads,topk,extra_topk,num_tokens", [
+        (64, 128, 512, 65),     # V4 Flash C4A: SWA=128, compressed=512
+        (64, 128, 512, 128),    # larger batch
+        (128, 128, 1024, 65),   # V4 Pro C4A: SWA=128, compressed=1024
+        (128, 128, 1024, 100),
+        (64, 128, 256, 65),     # smaller extra_topk
+        (64, 512, 512, 65),     # equal main and extra
+    ])
+    def test_correctness(self, num_heads, topk, extra_topk, num_tokens):
+        max_err, mean_err = run_dual_cache_test(
+            num_heads, topk, extra_topk, num_tokens)
+        print(f"\n  dual-cache h={num_heads} topk={topk}+{extra_topk} "
+              f"tok={num_tokens}: max_err={max_err:.6f} mean_err={mean_err:.6f}")
+        assert max_err < 0.0015, f"dual-cache failed: max_err={max_err}"
+
+    def test_swa_only(self):
+        """extra_k_cache=None — should match single-cache."""
+        torch.manual_seed(42)
+        d_qk, d_v, h, topk = 512, 512, 64, 128
+        nb, bs, num_tokens = 64, 64, 65
+        sm_scale = d_qk ** -0.5
+
+        kv = (torch.randn(nb, bs, 1, d_qk, device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+        kv_p = quantize_kv_model1(kv)
+        q = torch.randn(num_tokens, h, d_qk, device="cuda", dtype=torch.bfloat16) / 10
+        idx = torch.randint(0, nb * bs, (num_tokens, topk), device="cuda", dtype=torch.int32)
+
+        out_single, _, _ = flash_mla_sm120.sparse_mla_prefill_fwd(
+            q, kv_p, idx, sm_scale, d_v)
+        out_dual, _, _ = flash_mla_sm120.sparse_mla_prefill_fwd(
+            q, kv_p, idx, sm_scale, d_v,
+            extra_k_cache=None, extra_indices=None, extra_topk=0)
+
+        err = (out_single.float() - out_dual.float()).abs().max().item()
+        print(f"\n  swa-only: single vs dual(extra=None) max_diff={err:.6f}")
+        assert err == 0.0, f"swa-only mismatch: {err}"
+
+    @pytest.mark.parametrize("num_heads,topk,extra_topk", [
+        (64, 128, 512), (128, 128, 1024),
+    ])
+    def test_with_attn_sink(self, num_heads, topk, extra_topk):
+        max_err, _ = run_dual_cache_test(
+            num_heads, topk, extra_topk, 65, attn_sink_val=2.0)
+        print(f"\n  dual-cache+sink h={num_heads}: max_err={max_err:.6f}")
+        assert max_err < 0.002, f"dual-cache+sink failed: max_err={max_err}"
+
+    @pytest.mark.parametrize("num_heads,topk,extra_topk", [
+        (64, 128, 512), (128, 128, 1024),
+    ])
+    def test_with_topk_length(self, num_heads, topk, extra_topk):
+        """topk_length masks main cache entries; extra cache fully valid."""
+        max_err, _ = run_dual_cache_test(
+            num_heads, topk, extra_topk, 65, topk_length_mode="variable")
+        print(f"\n  dual-cache+topk_length h={num_heads}: max_err={max_err:.6f}")
+        assert max_err < 0.0015, f"dual-cache+topk_length failed: max_err={max_err}"
+
+    def test_all_extra_invalid(self):
+        """All extra indices = -1, only main cache contributes."""
+        torch.manual_seed(42)
+        d_qk, d_v, h, topk, extra_topk = 512, 512, 64, 128, 512
+        nb, bs, num_tokens = 64, 64, 65
+        sm_scale = d_qk ** -0.5
+
+        kv_main = (torch.randn(nb, bs, 1, d_qk, device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+        kv_extra = (torch.randn(nb, bs, 1, d_qk, device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+        kv_main_p = quantize_kv_model1(kv_main)
+        kv_extra_p = quantize_kv_model1(kv_extra)
+
+        q = torch.randn(num_tokens, h, d_qk, device="cuda", dtype=torch.bfloat16) / 10
+        main_idx = torch.randint(0, nb * bs, (num_tokens, topk), device="cuda", dtype=torch.int32)
+        extra_idx = torch.full((num_tokens, extra_topk), -1, device="cuda", dtype=torch.int32)
+
+        out_dual, _, _ = flash_mla_sm120.sparse_mla_prefill_fwd(
+            q, kv_main_p, main_idx, sm_scale, d_v,
+            extra_k_cache=kv_extra_p, extra_indices=extra_idx, extra_topk=extra_topk)
+
+        out_single, _, _ = flash_mla_sm120.sparse_mla_prefill_fwd(
+            q, kv_main_p, main_idx, sm_scale, d_v)
+
+        err = (out_dual.float() - out_single.float()).abs().max().item()
+        print(f"\n  all-extra-invalid: max_diff={err:.6f}")
+        assert err < 1e-4, f"all-extra-invalid mismatch: {err}"
+
+    def test_race_check(self):
+        """Run 3x with different seeds to catch non-determinism."""
+        for seed in [42, 123, 999]:
+            max_err, _ = run_dual_cache_test(128, 128, 1024, 65, seed=seed)
+            assert max_err < 0.0015, f"race check seed={seed}: max_err={max_err}"
+        print("\n  dual-cache race check (3 seeds): PASS")
+
+    def test_out_param(self):
+        """Verify out= pre-allocated buffer works with dual-cache."""
+        torch.manual_seed(42)
+        d_qk, d_v, h, topk, extra_topk = 512, 512, 64, 128, 512
+        nb, bs, num_tokens = 64, 64, 65
+        sm_scale = d_qk ** -0.5
+
+        kv_main_p = quantize_kv_model1(
+            (torch.randn(nb, bs, 1, d_qk, device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1))
+        kv_extra_p = quantize_kv_model1(
+            (torch.randn(nb, bs, 1, d_qk, device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1))
+        q = torch.randn(num_tokens, h, d_qk, device="cuda", dtype=torch.bfloat16) / 10
+        main_idx = torch.randint(0, nb * bs, (num_tokens, topk), device="cuda", dtype=torch.int32)
+        extra_idx = torch.randint(0, nb * bs, (num_tokens, extra_topk), device="cuda", dtype=torch.int32)
+
+        out_alloc, _, _ = flash_mla_sm120.sparse_mla_prefill_fwd(
+            q, kv_main_p, main_idx, sm_scale, d_v,
+            extra_k_cache=kv_extra_p, extra_indices=extra_idx, extra_topk=extra_topk)
+
+        out_buf = torch.empty_like(out_alloc)
+        out_pre, _, _ = flash_mla_sm120.sparse_mla_prefill_fwd(
+            q, kv_main_p, main_idx, sm_scale, d_v, out=out_buf,
+            extra_k_cache=kv_extra_p, extra_indices=extra_idx, extra_topk=extra_topk)
+
+        assert out_pre.data_ptr() == out_buf.data_ptr(), "out buffer not used"
+        assert (out_alloc == out_pre).all(), "out= results differ"
+        print("\n  dual-cache out= param: PASS")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
