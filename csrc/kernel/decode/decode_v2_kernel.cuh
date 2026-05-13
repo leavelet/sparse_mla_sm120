@@ -49,7 +49,11 @@ struct DecodeV2ColdParams {
     size_t stride_extra_kv_block;  // extra cache block stride
 };
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+// PAGE_BLOCK_SIZE_EXTRA defaults to PAGE_BLOCK_SIZE so existing v2 instantiations
+// remain a strict subset. When extra cache uses a different block size (DSv4
+// C128A: PAGE_BLOCK_SIZE=64 + PAGE_BLOCK_SIZE_EXTRA=2), set it explicitly.
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_decode_v2_kernel(
     const bf16* __restrict__ Q,
@@ -69,6 +73,7 @@ sparse_mla_decode_v2_kernel(
     const int num_batches = cold.num_batches;
     const int s_q = cold.s_q;
     constexpr int page_block_size = PAGE_BLOCK_SIZE;
+    constexpr int page_block_size_extra = PAGE_BLOCK_SIZE_EXTRA;
     const size_t stride_kv_block = cold.stride_kv_block;
     const int topk = cold.topk;
     using KV = KVCacheTraits<MT>;
@@ -141,24 +146,28 @@ sparse_mla_decode_v2_kernel(
         const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
         const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
-        // Per-tile IO gather — select main vs extra cache based on block index
+        // Per-tile IO gather — select main vs extra cache based on block index.
+        // When PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE (typical), both branches
+        // compile to the same instantiation; otherwise the extra-cache branch
+        // picks the smaller block-size kernel (e.g. DSv4 C128A: 2).
         auto io_gather_one = [&](int global_blk, int buf_idx) {
-            const int32_t* idx_ptr;
-            const uint8_t* kv_ptr;
-            size_t kv_str;
             if (global_blk < num_orig_blocks) {
-                idx_ptr = indices + (size_t)s_i * topk + (size_t)global_blk * BI;
-                kv_ptr = KV_cache; kv_str = stride_kv_block;
+                const int32_t* idx_ptr = indices + (size_t)s_i * topk + (size_t)global_blk * BI;
+                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+                    sm.kv_bufs[buf_idx], idx_ptr, KV_cache,
+                    sm.mbar_kv + buf_idx, io_tid, stride_kv_block, kv_l2_policy);
+                io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                    sm.kv_scale_bufs[buf_idx], idx_ptr, KV_cache, io_tid, stride_kv_block);
             } else {
                 int eb = global_blk - num_orig_blocks;
-                idx_ptr = extra_indices + (size_t)s_i * cold.extra_topk + (size_t)eb * BI;
-                kv_ptr = extra_KV_cache; kv_str = cold.stride_extra_kv_block;
+                const int32_t* idx_ptr = extra_indices + (size_t)s_i * cold.extra_topk + (size_t)eb * BI;
+                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
+                    sm.kv_bufs[buf_idx], idx_ptr, extra_KV_cache,
+                    sm.mbar_kv + buf_idx, io_tid, cold.stride_extra_kv_block, kv_l2_policy);
+                io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
+                    sm.kv_scale_bufs[buf_idx], idx_ptr, extra_KV_cache,
+                    io_tid, cold.stride_extra_kv_block);
             }
-            io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
-                sm.kv_bufs[buf_idx], idx_ptr, kv_ptr,
-                sm.mbar_kv + buf_idx, io_tid, kv_str, kv_l2_policy);
-            io_gather_scales<MT, PAGE_BLOCK_SIZE>(
-                sm.kv_scale_bufs[buf_idx], idx_ptr, kv_ptr, io_tid, kv_str);
         };
 
         // Prologue: gather tile 0
@@ -228,14 +237,21 @@ sparse_mla_decode_v2_kernel(
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
             uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
+            // Pick block-size for index decomposition based on which cache this
+            // tile reads from. When PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE the
+            // compiler folds this away.
+            const int tile_page_block_size =
+                (PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE || !is_extra_tile)
+                ? page_block_size : page_block_size_extra;
+
             const uint8_t* entry_base[ENTRIES_PER_WARP];
             if constexpr (KV::V_HAS_ROPE) {
                 #pragma unroll
                 for (int e = 0; e < ENTRIES_PER_WARP; e++) {
                     int idx = ib[qk_nb + e];
                     idx = (idx >= 0) ? idx : 0;
-                    int bi_e = idx / page_block_size;
-                    int li_e = idx % page_block_size;
+                    int bi_e = idx / tile_page_block_size;
+                    int li_e = idx % tile_page_block_size;
                     entry_base[e] = tile_kv_cache + (size_t)bi_e * tile_stride
                                                   + (size_t)li_e * IO::IO_STRIDE;
                 }
@@ -431,13 +447,27 @@ sparse_mla_decode_v2_kernel(
                     bar_sync_t<2, MATH_THREADS>();
             }
 
-            // XV rope
+            // XV rope — pick the matching block-size template instantiation.
             if constexpr (KV::V_HAS_ROPE) {
                 bar_sync_t<2, MATH_THREADS>();
-                xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
-                    ib, tile_kv_cache, mwarp, lane,
-                    tile_stride,
-                    reinterpret_cast<bf16*>(sm.w_fp8));
+                if constexpr (PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE) {
+                    xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
+                        ib, tile_kv_cache, mwarp, lane,
+                        tile_stride,
+                        reinterpret_cast<bf16*>(sm.w_fp8));
+                } else {
+                    if (!is_extra_tile) {
+                        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
+                            ib, tile_kv_cache, mwarp, lane,
+                            tile_stride,
+                            reinterpret_cast<bf16*>(sm.w_fp8));
+                    } else {
+                        xv_rope_mma<MT, PAGE_BLOCK_SIZE_EXTRA>(acc_rope, w0, w1, w2, w3,
+                            ib, tile_kv_cache, mwarp, lane,
+                            tile_stride,
+                            reinterpret_cast<bf16*>(sm.w_fp8));
+                    }
+                }
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();

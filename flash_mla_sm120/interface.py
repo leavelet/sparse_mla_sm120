@@ -58,7 +58,8 @@ def flash_mla_with_kvcache(
     extra_topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from .ops import _DECODE_THRESHOLD, sparse_mla_decode_fwd, sparse_mla_prefill_fwd
+    from .ops import (_DECODE_THRESHOLD, sparse_mla_decode_fwd,
+                        sparse_mla_decode_v2_fwd, sparse_mla_prefill_fwd)
 
     sched_meta = tile_scheduler_metadata
     assert isinstance(sched_meta, FlashMLASchedMeta)
@@ -80,35 +81,35 @@ def flash_mla_with_kvcache(
     if out is not None:
         out_view = out.view(q_input.shape[0], q_input.shape[1], head_dim_v)
 
-    # Dispatch by num_tokens: the decode kernel is split-KV and capped at
-    # _DECODE_THRESHOLD queries; larger batches go to the prefill kernel.
-    # Dual-cache extras (API-skin; currently no-op in kernel — see
-    # sparse_mla_sm120/csrc/binding.cpp for the TORCH_WARN_ONCE that fires
-    # when these are provided). Plumb them through so the C++ layer sees them.
     extra_idx_input = None
     if extra_indices_in_kvcache is not None:
         extra_idx_input = extra_indices_in_kvcache.reshape(q_input.shape[0], -1)
 
-    extra_kwargs = dict(
-        extra_kv_cache=extra_k_cache,
-        extra_indices=extra_idx_input,
-        topk_length=topk_length,
-        extra_topk_length=extra_topk_length,
-        attn_sink=attn_sink,
-    )
-
-    # Do NOT reshape k_cache — preserve (num_blocks, page_block_size, 1, bpt)
-    # for correct page_block_size derivation in ops.py (MODEL1 footer layout)
+    # Dispatch:
+    # - num_tokens <= _DECODE_THRESHOLD: scheduler-driven v2 decode + v2 combine
+    #   (is_no_split fast path writes bf16 directly; combine_v2 is CUDA-graph
+    #   friendly and per-batch early-exits for unsplit rows).
+    # - num_tokens > _DECODE_THRESHOLD: prefill kernel (single-pass, direct bf16).
     num_tokens = q_input.shape[0]
     if num_tokens <= _DECODE_THRESHOLD:
-        output, real_lse = sparse_mla_decode_fwd(
+        output, real_lse = sparse_mla_decode_v2_fwd(
             q_input, k_cache, idx_input, softmax_scale, head_dim_v,
-            out=out_view, **extra_kwargs,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            out=out_view,
+            extra_kv_cache=extra_k_cache,
+            extra_indices=extra_idx_input,
+            extra_topk_length=extra_topk_length,
         )
     else:
         output, real_lse = sparse_mla_prefill_fwd(
             q_input, k_cache, idx_input, softmax_scale, head_dim_v,
-            out=out_view, **extra_kwargs,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            out=out_view,
+            extra_kv_cache=extra_k_cache,
+            extra_indices=extra_idx_input,
+            extra_topk_length=extra_topk_length,
         )
 
     batch = q.shape[0]

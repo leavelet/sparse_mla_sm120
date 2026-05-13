@@ -119,20 +119,32 @@ def sparse_mla_decode_fwd(
     return output, lse
 
 
+_HPB = 16
+_FIXED_OVERHEAD = 64
+
+
+def _compute_num_sm_parts(num_tokens: int, num_heads: int, s_q: int,
+                           device: torch.device) -> int:
+    """FlashMLA partitioning heuristic: num_SMs // (s_q * replicate_h)."""
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    replicate_h = (num_heads + _HPB - 1) // _HPB
+    return max(num_sms // (s_q * replicate_h), 1)
+
+
 def sparse_mla_decode_v2_fwd(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     extra_kv_cache: Optional[torch.Tensor] = None,
     extra_indices: Optional[torch.Tensor] = None,
-    topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
-    attn_sink: Optional[torch.Tensor] = None,
-    num_sm_parts: int = 64,
-    fixed_overhead: int = 64,
+    num_sm_parts: Optional[int] = None,
+    fixed_overhead: int = _FIXED_OVERHEAD,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sparse MLA decode v2 (scheduler-driven).
 
@@ -156,8 +168,13 @@ def sparse_mla_decode_v2_fwd(
     stride_kv_row = kv_cache.stride(-2) * kv_cache.element_size()
     page_block_size = kv_cache.shape[-3] if kv_cache.dim() >= 3 else 1
 
-    # Scheduler metadata
-    sched_meta = torch.empty((num_sm_parts, 8), dtype=torch.int32, device=q.device)
+    s_q = 1
+    if num_sm_parts is None:
+        num_sm_parts = _compute_num_sm_parts(num_tokens, num_heads, s_q, q.device)
+
+    # Scheduler metadata. Flat int32 buffer reinterpreted as DecodingSchedMeta
+    # (8 int32 fields per entry) by the kernel.
+    sched_meta = torch.empty((num_sm_parts * 8,), dtype=torch.int32, device=q.device)
     num_splits = torch.empty((num_tokens + 1,), dtype=torch.int32, device=q.device)
     _C.get_decode_metadata(
         num_tokens, topk, extra_topk,
@@ -166,20 +183,19 @@ def sparse_mla_decode_v2_fwd(
         sched_meta, num_splits,
     )
 
-    # Workspace for split accumulators: upper bound on total splits per batch
-    # is num_sm_parts; allocate accordingly.
-    max_splits = num_sm_parts
+    # FlashMLA upper bound on total per-batch splits across all batches.
+    total_splits_bound = num_tokens + num_sm_parts
     o_accum = torch.empty(
-        (max_splits, 1, num_heads, d_v),
+        (total_splits_bound, s_q, num_heads, d_v),
         dtype=torch.float32, device=q.device,
     )
     lse_accum = torch.empty(
-        (max_splits, 1, num_heads),
+        (total_splits_bound, s_q, num_heads),
         dtype=torch.float32, device=q.device,
     )
 
     if out is None:
-        output = torch.empty(
+        output = torch.zeros(
             (num_tokens, num_heads, d_v),
             dtype=torch.bfloat16, device=q.device,
         )
@@ -187,7 +203,7 @@ def sparse_mla_decode_v2_fwd(
         assert out.shape == (num_tokens, num_heads, d_v)
         assert out.dtype == torch.bfloat16 and out.is_contiguous()
         output = out
-    out_lse = torch.empty(
+    out_lse = torch.zeros(
         (num_tokens, num_heads),
         dtype=torch.float32, device=q.device,
     )
@@ -209,10 +225,14 @@ def sparse_mla_decode_v2_fwd(
     )
 
     # combine_v2 — always launched (CUDA-graph friendly). Per-batch early-exits
-    # for is_no_split batches (those wrote bf16 directly).
+    # for is_no_split batches (those wrote bf16 directly in decode_v2).
+    ns_cpu = num_splits.cpu()
+    max_nsplits = max(
+        (ns_cpu[i + 1] - ns_cpu[i]).item() for i in range(num_tokens)
+    ) if num_tokens > 0 else 1
     _C.sparse_mla_combine_v2_fwd(
         o_accum, lse_accum, output, out_lse, num_splits,
-        num_tokens, max_splits,
+        num_tokens, max_nsplits,
         attn_sink=attn_sink,
     )
 
