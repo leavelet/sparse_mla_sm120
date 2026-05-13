@@ -257,6 +257,21 @@ class TestMODEL1Decode:
         assert max_err < threshold, (
             f"MODEL1 decode [{tag}] failed: max_err={max_err} > {threshold}")
 
+    @pytest.mark.parametrize("num_heads,topk,batch_size", [
+        (64, 128, 1),  (64, 128, 4),    # V4 SWA window=128
+        (128, 128, 1), (128, 128, 4),
+        (64, 256, 1),                     # arbitrary topk
+    ])
+    def test_v4_swa_topk(self, num_heads, topk, batch_size):
+        """V4 SWA decode: topk=window_size=128 (runtime, no template)."""
+        max_err, mean_err = run_decode_test(
+            "MODEL1", d_qk=512, d_v=512, topk=topk,
+            num_heads=num_heads, batch_size=batch_size, bf16_qk=True)
+        print(f"\n  MODEL1 SWA h={num_heads} topk={topk} bs={batch_size}: "
+              f"max_err={max_err:.6f} mean_err={mean_err:.6f}")
+        assert max_err < 0.0015, (
+            f"MODEL1 SWA decode failed: max_err={max_err}")
+
 
 # ── attn_sink Tests (MODEL1 only) ───────────────────────────────────
 
