@@ -180,13 +180,17 @@ def flash_mla_sparse_fwd(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-    **kwargs,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from .ops import sparse_mla_prefill_fwd
 
+    if extra_k_cache is not None:
+        raise NotImplementedError(
+            "flash_mla_sparse_fwd does not yet support extra_k_cache "
+            "(prefill dual-cache). This requires kernel-level changes.")
+
     idx = indices.squeeze(1) if indices.dim() == 3 else indices
-    result = sparse_mla_prefill_fwd(
+    return sparse_mla_prefill_fwd(
         q, kv, idx, sm_scale, d_v,
         attn_sink=attn_sink, topk_length=topk_length, out=out)
-
-    return result
