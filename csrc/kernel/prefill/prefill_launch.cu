@@ -41,7 +41,7 @@ void launch_prefill_sg(
 // / indices_extra pointers may be nullptr and stride_kv_block_extra is unused;
 // the kernel template instantiation produces single-cache code via
 // if-constexpr dead-code-elim, matching the prior behavior.
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0, int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
 void launch_prefill_mg(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     const uint8_t* KV_cache_extra, const int32_t* indices_extra,
@@ -55,7 +55,7 @@ void launch_prefill_mg(
     dim3 grid(num_tokens * REPLICATE_H);
     dim3 block(BLOCK_THREADS);
 
-    auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, TOPK_EXTRA>;
+    auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, TOPK_EXTRA, PAGE_BLOCK_SIZE_EXTRA>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -196,26 +196,45 @@ void sparse_mla_prefill_launch_model1_dual(
 
     TORCH_CHECK(page_block_size == 64,
         "MODEL1 dual prefill: main page_block_size must be 64, got ", page_block_size);
-    TORCH_CHECK(page_block_size_extra == 64,
-        "MODEL1 dual prefill: extra page_block_size must be 64, got ", page_block_size_extra);
+    // DSv4 compressed cache: page_block_size_extra = main_block_size / compress_ratio.
+    TORCH_CHECK(page_block_size_extra == 64 || page_block_size_extra == 2,
+        "MODEL1 dual prefill: extra page_block_size must be 64 or 2, got ",
+        page_block_size_extra);
 
-    #define DISPATCH_DUAL_MG(NH, TK, TK_EX) \
-        launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, TK_EX>( \
+    #define DISPATCH_DUAL_MG(NH, TK, TK_EX, PBSX) \
+        launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, TK_EX, PBSX>( \
             Q_ptr, KV_ptr, idx_ptr, KV_extra_ptr, idx_extra_ptr, \
             O_ptr, LSE_ptr, sm_scale, num_tokens, \
             stride_kv_block, stride_kv_block_extra, stream)
 
-    if (topk == 128 && topk_extra == 128) {
+    if (topk == 128 && topk_extra == 128 && page_block_size_extra == 64) {
         switch (num_heads) {
-        case 64:  DISPATCH_DUAL_MG(64, 128, 128); break;
-        case 128: DISPATCH_DUAL_MG(128, 128, 128); break;
+        case 64:  DISPATCH_DUAL_MG(64, 128, 128, 64); break;
+        case 128: DISPATCH_DUAL_MG(128, 128, 128, 64); break;
+        default:
+            TORCH_CHECK(false, "MODEL1 dual prefill: unsupported num_heads=", num_heads);
+        }
+    } else if (topk == 128 && topk_extra == 512 && page_block_size_extra == 64) {
+        // DSv4-Flash C4A: SWA window=128, indexer top_k=512, compress_ratio=4.
+        switch (num_heads) {
+        case 64:  DISPATCH_DUAL_MG(64, 128, 512, 64); break;
+        case 128: DISPATCH_DUAL_MG(128, 128, 512, 64); break;
+        default:
+            TORCH_CHECK(false, "MODEL1 dual prefill: unsupported num_heads=", num_heads);
+        }
+    } else if (topk == 128 && topk_extra == 512 && page_block_size_extra == 2) {
+        // DSv4-Flash C128A: SWA window=128, indexer top_k=512, compress_ratio=128.
+        switch (num_heads) {
+        case 64:  DISPATCH_DUAL_MG(64, 128, 512, 2); break;
+        case 128: DISPATCH_DUAL_MG(128, 128, 512, 2); break;
         default:
             TORCH_CHECK(false, "MODEL1 dual prefill: unsupported num_heads=", num_heads);
         }
     } else {
-        TORCH_CHECK(false, "MODEL1 dual prefill: unsupported (topk, topk_extra)=(",
-                    topk, ", ", topk_extra,
-                    "); supported: (128,128)");
+        TORCH_CHECK(false, "MODEL1 dual prefill: unsupported "
+                    "(topk, topk_extra, page_block_size_extra)=(",
+                    topk, ", ", topk_extra, ", ", page_block_size_extra,
+                    "); supported: (128,128,64), (128,512,64), (128,512,2)");
     }
     #undef DISPATCH_DUAL_MG
 }

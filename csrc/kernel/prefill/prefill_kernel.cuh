@@ -457,7 +457,7 @@ static constexpr int MG_HEADS_PER_CTA = MG_N_HG * HPB;  // 32
 // KV_cache followed by NI_EXTRA = TOPK_EXTRA/BI tiles from KV_cache_extra,
 // sharing one set of online-softmax accumulators so the softmax denominator
 // is computed over the union of indices.
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0, int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_mg_kernel(
     const bf16* __restrict__ Q,
@@ -472,6 +472,7 @@ sparse_mla_prefill_mg_kernel(
     const float sm_scale = cold.sm_scale;
     const int num_tokens = cold.num_tokens;
     constexpr int page_block_size = PAGE_BLOCK_SIZE;
+    constexpr int page_block_size_extra = PAGE_BLOCK_SIZE_EXTRA;
     const size_t stride_kv_block = cold.stride_kv_block;
     const size_t stride_kv_block_extra = cold.stride_kv_block_extra;
     using KV = KVCacheTraits<MT>;
@@ -541,15 +542,39 @@ sparse_mla_prefill_mg_kernel(
                 const uint8_t* next_kv = tile_kv_ptr(ti + 1);
                 const size_t   next_stride = tile_stride(ti + 1);
                 const int32_t* next_idx = tile_idx_ptr(ti + 1);
-                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
-                    sm.kv_bufs[(ti + 1) & 1],
-                    next_idx, next_kv,
-                    sm.mbar_kv + ((ti + 1) & 1), io_tid,
-                    next_stride, kv_l2_policy);
-                io_gather_scales<MT, PAGE_BLOCK_SIZE>(
-                    sm.kv_scale_bufs[(ti + 1) & 1],
-                    next_idx, next_kv, io_tid,
-                    next_stride);
+                if constexpr (TOPK_EXTRA == 0) {
+                    io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+                        sm.kv_bufs[(ti + 1) & 1],
+                        next_idx, next_kv,
+                        sm.mbar_kv + ((ti + 1) & 1), io_tid,
+                        next_stride, kv_l2_policy);
+                    io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                        sm.kv_scale_bufs[(ti + 1) & 1],
+                        next_idx, next_kv, io_tid,
+                        next_stride);
+                } else {
+                    if (ti + 1 < NI) {
+                        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+                            sm.kv_bufs[(ti + 1) & 1],
+                            next_idx, next_kv,
+                            sm.mbar_kv + ((ti + 1) & 1), io_tid,
+                            next_stride, kv_l2_policy);
+                        io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                            sm.kv_scale_bufs[(ti + 1) & 1],
+                            next_idx, next_kv, io_tid,
+                            next_stride);
+                    } else {
+                        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
+                            sm.kv_bufs[(ti + 1) & 1],
+                            next_idx, next_kv,
+                            sm.mbar_kv + ((ti + 1) & 1), io_tid,
+                            next_stride, kv_l2_policy);
+                        io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
+                            sm.kv_scale_bufs[(ti + 1) & 1],
+                            next_idx, next_kv, io_tid,
+                            next_stride);
+                    }
+                }
                 __threadfence_block();
             }
             bar_sync_t<1, BLOCK_THREADS>();
@@ -629,6 +654,9 @@ sparse_mla_prefill_mg_kernel(
             // collapse to the original constants.
             const uint8_t* kv_global = tile_kv_ptr(ti);
             const size_t stride_kv_block_now = tile_stride(ti);
+            const int page_block_size_now =
+                (TOPK_EXTRA == 0 || ti < NI)
+                ? page_block_size : page_block_size_extra;
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
             uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
@@ -638,8 +666,8 @@ sparse_mla_prefill_mg_kernel(
                 int idx = ib[qk_nb + gid];
                 idx = (idx >= 0) ? idx : 0;
                 if constexpr (KV::V_HAS_ROPE) {
-                    int bi_e = idx / page_block_size;
-                    int li_e = idx % page_block_size;
+                    int bi_e = idx / page_block_size_now;
+                    int li_e = idx % page_block_size_now;
                     entry_base_gid = kv_global + (size_t)bi_e * stride_kv_block_now
                                                + (size_t)li_e * IO::IO_STRIDE;
                 } else {
@@ -852,12 +880,32 @@ sparse_mla_prefill_mg_kernel(
             // ── XV rope BF16 MMA (MODEL1, both groups) ──────────────
             if constexpr (KV::V_HAS_ROPE) {
                 bar_sync_t<2, MATH_THREADS>();
-                #pragma unroll
-                for (int g = 0; g < MG_N_HG; g++) {
-                    xv_rope_mma<MT, PAGE_BLOCK_SIZE>(
-                        acc_rope[g], w_grp[g][0], w_grp[g][1], w_grp[g][2], w_grp[g][3],
-                        ib, kv_global, mwarp, lane, stride_kv_block_now,
-                        reinterpret_cast<bf16*>(sm.w_fp8));
+                if constexpr (TOPK_EXTRA == 0) {
+                    #pragma unroll
+                    for (int g = 0; g < MG_N_HG; g++) {
+                        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(
+                            acc_rope[g], w_grp[g][0], w_grp[g][1], w_grp[g][2], w_grp[g][3],
+                            ib, kv_global, mwarp, lane, stride_kv_block_now,
+                            reinterpret_cast<bf16*>(sm.w_fp8));
+                    }
+                } else {
+                    if (ti < NI) {
+                        #pragma unroll
+                        for (int g = 0; g < MG_N_HG; g++) {
+                            xv_rope_mma<MT, PAGE_BLOCK_SIZE>(
+                                acc_rope[g], w_grp[g][0], w_grp[g][1], w_grp[g][2], w_grp[g][3],
+                                ib, kv_global, mwarp, lane, stride_kv_block_now,
+                                reinterpret_cast<bf16*>(sm.w_fp8));
+                        }
+                    } else {
+                        #pragma unroll
+                        for (int g = 0; g < MG_N_HG; g++) {
+                            xv_rope_mma<MT, PAGE_BLOCK_SIZE_EXTRA>(
+                                acc_rope[g], w_grp[g][0], w_grp[g][1], w_grp[g][2], w_grp[g][3],
+                                ib, kv_global, mwarp, lane, stride_kv_block_now,
+                                reinterpret_cast<bf16*>(sm.w_fp8));
+                        }
+                    }
                 }
             }
 

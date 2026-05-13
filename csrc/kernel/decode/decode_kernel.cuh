@@ -43,7 +43,12 @@ struct DecodeColdParams {
 // computed over the union of indices. The dispatcher must choose
 // TILES_PER_SPLIT = TOPK/BI + TOPK_EXTRA/BI to keep NSPLITS == 1 in dual-cache
 // mode (split-KV across both caches is not supported in this slice).
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int TILES_PER_SPLIT, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0>
+//
+// PAGE_BLOCK_SIZE_EXTRA selects the page block size for the extra cache; this
+// differs from PAGE_BLOCK_SIZE for DSv4 compressed-cache layers
+// (block_size = main_block_size / compress_ratio). Defaults to PAGE_BLOCK_SIZE
+// so swa-only / matched-block_size dual-cache instantiations are unchanged.
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int TILES_PER_SPLIT, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0, int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_decode_kernel(
     const bf16* __restrict__ Q,
@@ -58,6 +63,7 @@ sparse_mla_decode_kernel(
     const float sm_scale = cold.sm_scale;
     const int num_tokens = cold.num_tokens;
     constexpr int page_block_size = PAGE_BLOCK_SIZE;
+    constexpr int page_block_size_extra = PAGE_BLOCK_SIZE_EXTRA;
     const size_t stride_kv_block = cold.stride_kv_block;
     const size_t stride_kv_block_extra = cold.stride_kv_block_extra;
     using KV = KVCacheTraits<MT>;
@@ -149,15 +155,43 @@ sparse_mla_decode_kernel(
                 const uint8_t* next_kv = tile_kv_ptr(ti + 1);
                 const size_t   next_stride = tile_stride(ti + 1);
                 const int32_t* next_idx = tile_idx_ptr(ti + 1);
-                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
-                    sm.kv_bufs[(ti + 1) & 1],
-                    next_idx, next_kv,
-                    sm.mbar_kv + ((ti + 1) & 1), io_tid,
-                    next_stride, kv_l2_policy);
-                io_gather_scales<MT, PAGE_BLOCK_SIZE>(
-                    sm.kv_scale_bufs[(ti + 1) & 1],
-                    next_idx, next_kv, io_tid,
-                    next_stride);
+                // Pick the io helper instantiation by phase. The compile-time
+                // PAGE_BLOCK_SIZE template arg differs between main and extra
+                // caches for DSv4 compressed-cache layers (where extra
+                // block_size = main_block_size / compress_ratio).
+                if constexpr (TOPK_EXTRA == 0) {
+                    io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+                        sm.kv_bufs[(ti + 1) & 1],
+                        next_idx, next_kv,
+                        sm.mbar_kv + ((ti + 1) & 1), io_tid,
+                        next_stride, kv_l2_policy);
+                    io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                        sm.kv_scale_bufs[(ti + 1) & 1],
+                        next_idx, next_kv, io_tid,
+                        next_stride);
+                } else {
+                    if (ti + 1 < NI) {
+                        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+                            sm.kv_bufs[(ti + 1) & 1],
+                            next_idx, next_kv,
+                            sm.mbar_kv + ((ti + 1) & 1), io_tid,
+                            next_stride, kv_l2_policy);
+                        io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                            sm.kv_scale_bufs[(ti + 1) & 1],
+                            next_idx, next_kv, io_tid,
+                            next_stride);
+                    } else {
+                        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
+                            sm.kv_bufs[(ti + 1) & 1],
+                            next_idx, next_kv,
+                            sm.mbar_kv + ((ti + 1) & 1), io_tid,
+                            next_stride, kv_l2_policy);
+                        io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
+                            sm.kv_scale_bufs[(ti + 1) & 1],
+                            next_idx, next_kv, io_tid,
+                            next_stride);
+                    }
+                }
                 // [F3] threadfence for scale visibility in main loop
                 __threadfence_block();
             }
@@ -216,10 +250,16 @@ sparse_mla_decode_kernel(
             uint8_t* kv_smem = sm.kv_bufs[ti & 1];
             const int32_t* ib = tile_idx_ptr(ti);
             // Per-tile global KV cache pointer + stride for the entry_base /
-            // XV-rope-MMA paths below. With TOPK_EXTRA == 0, both collapse to
+            // XV-rope-MMA paths below. With TOPK_EXTRA == 0, all collapse to
             // the original constants.
             const uint8_t* kv_global = tile_kv_ptr(ti);
             const size_t stride_kv_block_now = tile_stride(ti);
+            // Page block size used for the bi_e / li_e split of `idx`. Differs
+            // from `page_block_size` for DSv4 compressed-cache layers, where
+            // extra block_size = main_block_size / compress_ratio.
+            const int page_block_size_now =
+                (TOPK_EXTRA == 0 || ti < NI)
+                ? page_block_size : page_block_size_extra;
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
             uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
@@ -233,8 +273,8 @@ sparse_mla_decode_kernel(
                 for (int e = 0; e < ENTRIES_PER_WARP; e++) {
                     int idx = ib[qk_nb + e];
                     idx = (idx >= 0) ? idx : 0;
-                    int bi_e = idx / page_block_size;
-                    int li_e = idx % page_block_size;
+                    int bi_e = idx / page_block_size_now;
+                    int li_e = idx % page_block_size_now;
                     entry_base[e] = kv_global + (size_t)bi_e * stride_kv_block_now
                                               + (size_t)li_e * IO::IO_STRIDE;
                 }
@@ -438,10 +478,24 @@ sparse_mla_decode_kernel(
             // Scratch overlays on w_fp8_bufs (dead after XV nope phase)
             if constexpr (KV::V_HAS_ROPE) {
                 bar_sync_t<2, MATH_THREADS>();
-                xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
-                    ib, kv_global, mwarp, lane,
-                    stride_kv_block_now,
-                    reinterpret_cast<bf16*>(sm.w_fp8));
+                if constexpr (TOPK_EXTRA == 0) {
+                    xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
+                        ib, kv_global, mwarp, lane,
+                        stride_kv_block_now,
+                        reinterpret_cast<bf16*>(sm.w_fp8));
+                } else {
+                    if (ti < NI) {
+                        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
+                            ib, kv_global, mwarp, lane,
+                            stride_kv_block_now,
+                            reinterpret_cast<bf16*>(sm.w_fp8));
+                    } else {
+                        xv_rope_mma<MT, PAGE_BLOCK_SIZE_EXTRA>(acc_rope, w0, w1, w2, w3,
+                            ib, kv_global, mwarp, lane,
+                            stride_kv_block_now,
+                            reinterpret_cast<bf16*>(sm.w_fp8));
+                    }
+                }
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();
