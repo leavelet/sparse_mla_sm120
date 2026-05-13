@@ -264,6 +264,34 @@ sparse_mla_decode_v2_kernel(
             for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = 0.f;
 
+            // Zero kv_smem rows for invalid (-1) entries so XV NoPE MMA picks
+            // up exact-zero V instead of whatever garbage was in the clamp-
+            // target slot. The QK manual mask sets qk=-1e30 for invalid (so
+            // softmax weight is 0), but 0 * fp8_NaN in the MMA accumulator
+            // still produces NaN. Zeroing the FP8 bytes makes B exactly 0
+            // and the contribution exactly 0. The IO warp already gathered
+            // slot-0 data here; we just stomp on it.
+            // Each warp owns ENTRIES_PER_WARP entries (qk_nb..qk_nb+EPW).
+            // 32 lanes cooperatively zero each invalid entry's NoPE region.
+            // NOTE: XV MMA reads 32-entry tiles that span MULTIPLE warps'
+            // owned entries, so we need a *block-level* sync (not just
+            // __syncwarp) before any subsequent reader sees the zeroed data.
+            {
+                constexpr int BYTES_PER_LANE = (KV::KV_SMEM_COPY_BYTES + 31) / 32;
+                #pragma unroll
+                for (int e = 0; e < ENTRIES_PER_WARP; e++) {
+                    if (ib[qk_nb + e] < 0) {
+                        uint8_t* row = kv_smem + (qk_nb + e) * KV::KV_SMEM_STRIDE;
+                        #pragma unroll
+                        for (int b = 0; b < BYTES_PER_LANE; b++) {
+                            int off = lane * BYTES_PER_LANE + b;
+                            if (off < KV::KV_SMEM_COPY_BYTES) row[off] = 0;
+                        }
+                    }
+                }
+                bar_sync_t<2, MATH_THREADS>();
+            }
+
             KVRopePrefetch rope_pf = prefetch_kv_rope(
                 reinterpret_cast<const bf16*>(entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET), lane);
 

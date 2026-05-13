@@ -10,6 +10,38 @@ def _load_lib():
 _DECODE_THRESHOLD = 64
 
 
+def _effective_stride_kv_row(kv_cache: torch.Tensor) -> int:
+    """Return the per-token byte stride the kernel should use.
+
+    The kernel computes ``stride_kv_block = page_block_size * stride_kv_row``
+    to advance from one paged block to the next. Some callers (e.g. vLLM)
+    pad the *block* stride for alignment so the natural per-token stride
+    times block_size doesn't equal the actual block-to-block stride. The
+    only knob the binding exposes is ``stride_kv_row``, so override it so
+    ``page_block_size * stride_kv_row == actual_block_byte_stride`` — the
+    kernel uses ``IO::IO_STRIDE`` (not stride_kv_row) for per-token offsets
+    *within* a block, so this remains correct.
+
+    For a paged tensor shaped ``(num_blocks, block_size, head_kv, bytes)``
+    or ``(num_blocks, block_size, bytes)`` the block stride is ``stride[0]``
+    and the per-token stride is ``stride[1]``.
+    """
+    if kv_cache.dim() < 3:
+        return kv_cache.stride(-2) * kv_cache.element_size()
+    page_block_size = kv_cache.shape[-3]
+    natural_row_bytes = kv_cache.stride(-2) * kv_cache.element_size()
+    # Outermost dim is num_blocks; its stride is the block byte stride.
+    block_stride_bytes = kv_cache.stride(0) * kv_cache.element_size()
+    if block_stride_bytes == page_block_size * natural_row_bytes:
+        return natural_row_bytes
+    assert block_stride_bytes % page_block_size == 0, (
+        f"kv_cache block stride {block_stride_bytes} not divisible by "
+        f"page_block_size {page_block_size}; cannot encode padding via "
+        f"stride_kv_row override"
+    )
+    return block_stride_bytes // page_block_size
+
+
 def _compute_decode_splits(num_tokens, num_heads, topk):
     """v1 decode split-KV heuristic (used by the legacy v1 path).
     For v2 (scheduler-driven), splits are computed on-device by
@@ -71,7 +103,7 @@ def sparse_mla_decode_fwd(
     assert indices.dtype == torch.int32 and indices.is_contiguous()
     assert num_tokens <= _DECODE_THRESHOLD
 
-    stride_kv_row = kv_cache.stride(-2) * kv_cache.element_size()
+    stride_kv_row = _effective_stride_kv_row(kv_cache)
     page_block_size = kv_cache.shape[-3] if kv_cache.dim() >= 3 else 1
     nsplits, tiles_per_split = _compute_decode_splits(num_tokens, num_heads, topk)
 
@@ -165,7 +197,7 @@ def sparse_mla_decode_v2_fwd(
     assert kv_cache.stride(-1) == 1
     assert indices.dtype == torch.int32 and indices.is_contiguous()
 
-    stride_kv_row = kv_cache.stride(-2) * kv_cache.element_size()
+    stride_kv_row = _effective_stride_kv_row(kv_cache)
     page_block_size = kv_cache.shape[-3] if kv_cache.dim() >= 3 else 1
 
     s_q = 1
@@ -261,7 +293,7 @@ def sparse_mla_prefill_fwd(
     )
     assert indices.dtype == torch.int32 and indices.is_contiguous()
 
-    stride_kv_row = kv_cache.stride(-2) * kv_cache.element_size()
+    stride_kv_row = _effective_stride_kv_row(kv_cache)
     page_block_size = kv_cache.shape[-3] if kv_cache.dim() >= 3 else 1
 
     if out is None:
