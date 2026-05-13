@@ -202,14 +202,11 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     }
 
     // ── Write output (bf16, packed uint64_t) ────────────────────────
-    // attn_sink scaling: same factor as the single-split fast path,
-    // using global_lse from the multi-split reduction above.
-    float sink_factor = 1.0f;
-    if (attn_sink != nullptr) {
-        float sink_log2 = attn_sink[h] * LOG2E;
-        sink_factor = 1.0f / (1.0f + exp2f(sink_log2 - global_lse));
-    }
-
+    // attn_sink output-scaling is implicit here: the per-split scale factors
+    // (smem_buf[sp] = exp2(raw_lse_i - global_lse_merged)) already divide
+    // the accumulated sum by (sum_exp(raw_lse) + exp(sink)), which is the
+    // sigmoid(global_lse_raw - sink) factor we want. Do NOT apply a second
+    // explicit sink scaling — that would double-count.
     bf16* o_ptr = output
         + (size_t)token_idx * num_heads * D_V
         + (size_t)h * D_V;
@@ -217,10 +214,10 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     #pragma unroll
     for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i) {
         bf16 b[4];
-        b[0] = __float2bfloat16(result[i].x * sink_factor);
-        b[1] = __float2bfloat16(result[i].y * sink_factor);
-        b[2] = __float2bfloat16(result[i].z * sink_factor);
-        b[3] = __float2bfloat16(result[i].w * sink_factor);
+        b[0] = __float2bfloat16(result[i].x);
+        b[1] = __float2bfloat16(result[i].y);
+        b[2] = __float2bfloat16(result[i].z);
+        b[3] = __float2bfloat16(result[i].w);
         *(uint64_t*)(o_ptr + lane_idx * 4 + i * 128) = *(const uint64_t*)b;
     }
 }

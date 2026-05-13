@@ -396,6 +396,12 @@ sparse_mla_prefill_kernel(
         bar_sync_t<2, MATH_THREADS>();
 
         // ── Write BF16 output and LSE ────────────────────────────────
+        // attn_sink convention (FlashMLA V4): output[h] *= sigmoid(lse_h - sink_h)
+        // is folded directly into the normalizer:
+        //   il = exp(lse) / (exp(lse) + exp(sink)) / exp(lse)
+        //      = 1 / (l + exp(sink - m))   in log2 space
+        // (working in log2 space: sum_l is in exp-domain of m, multiply sink by LOG2E).
+        // Padded heads carry sink=-inf → exp2(-inf)=0 → no-op (collapses to 1/l).
         float il0, il1;
         if (cold.attn_sink != nullptr) {
             float s0 = __ldg(cold.attn_sink + h_start + gid) * LOG2E;
@@ -407,21 +413,6 @@ sparse_mla_prefill_kernel(
         } else {
             il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
             il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
-        }
-
-        // attn_sink scaling (same convention as MG kernel above).
-        if (attn_sink != nullptr) {
-            float m0 = sm.m_smem[gid];
-            float l0 = sm.l_smem[gid];
-            float lse0 = (l0 > 0.f) ? (m0 + log2f(l0)) : -1e30f;
-            float sink0 = attn_sink[h_start + gid] * LOG2E;
-            il0 *= 1.0f / (1.0f + exp2f(sink0 - lse0));
-
-            float m1 = sm.m_smem[gid + 8];
-            float l1 = sm.l_smem[gid + 8];
-            float lse1 = (l1 > 0.f) ? (m1 + log2f(l1)) : -1e30f;
-            float sink1 = attn_sink[h_start + gid + 8] * LOG2E;
-            il1 *= 1.0f / (1.0f + exp2f(sink1 - lse1));
         }
 
         bf16* staging_bf16 = reinterpret_cast<bf16*>(sm.kv_bufs[0]);
@@ -1032,6 +1023,8 @@ sparse_mla_prefill_mg_kernel(
 
         #pragma unroll
         for (int g = 0; g < MG_N_HG; g++) {
+            // attn_sink folded into the normalizer (FlashMLA V4 convention).
+            // See SG epilogue for full derivation.
             float il0, il1;
             if (cold.attn_sink != nullptr) {
                 int h0 = h_start + g * HPB + gid, h1 = h0 + 8;
@@ -1048,26 +1041,6 @@ sparse_mla_prefill_mg_kernel(
                     ? (1.f / sm.l_smem[g * SMG::ML_GRP_STRIDE + gid]) : 0.f;
                 il1 = (sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8] > 0.f)
                     ? (1.f / sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8]) : 0.f;
-            }
-
-            // attn_sink scaling: output[h] *= sigmoid(lse_h - sink_h). lse is
-            // in log2 space (m_smem and log2(l_smem) both log2), sink in raw-log;
-            // multiply sink by LOG2E to compare. Fold the factor into il0/il1
-            // since both are scalar per-head multipliers. Padded heads carry
-            // -inf and produce factor==1 (no-op).
-            if (attn_sink != nullptr) {
-                int g_h_start = h_start + g * HPB;
-                float m0 = sm.m_smem[g * SMG::ML_GRP_STRIDE + gid];
-                float l0 = sm.l_smem[g * SMG::ML_GRP_STRIDE + gid];
-                float lse0 = (l0 > 0.f) ? (m0 + log2f(l0)) : -1e30f;
-                float sink0 = attn_sink[g_h_start + gid] * LOG2E;
-                il0 *= 1.0f / (1.0f + exp2f(sink0 - lse0));
-
-                float m1 = sm.m_smem[g * SMG::ML_GRP_STRIDE + gid + 8];
-                float l1 = sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8];
-                float lse1 = (l1 > 0.f) ? (m1 + log2f(l1)) : -1e30f;
-                float sink1 = attn_sink[g_h_start + gid + 8] * LOG2E;
-                il1 *= 1.0f / (1.0f + exp2f(sink1 - lse1));
             }
 
             #pragma unroll
