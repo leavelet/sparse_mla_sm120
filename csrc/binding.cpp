@@ -47,7 +47,8 @@ void sparse_mla_splitkv_launch_model1_dual(
 void sparse_mla_combine_launch(
     torch::Tensor partial_O, torch::Tensor partial_LSE,
     torch::Tensor output, torch::Tensor out_lse,
-    int nsplits, cudaStream_t stream);
+    int nsplits, cudaStream_t stream,
+    const float* attn_sink /* nullable, [num_heads] */);
 
 // Forward declarations — prefill
 void sparse_mla_prefill_launch_v32(
@@ -55,14 +56,16 @@ void sparse_mla_prefill_launch_v32(
     torch::Tensor output, torch::Tensor out_lse,
     float sm_scale, int num_heads, int num_tokens, int topk,
     int page_block_size, int stride_kv_row,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const float* attn_sink /* nullable, [num_heads] */);
 
 void sparse_mla_prefill_launch_model1(
     torch::Tensor Q, torch::Tensor KV_cache, torch::Tensor indices,
     torch::Tensor output, torch::Tensor out_lse,
     float sm_scale, int num_heads, int num_tokens, int topk,
     int page_block_size, int stride_kv_row,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const float* attn_sink /* nullable, [num_heads] */);
 
 void sparse_mla_prefill_launch_model1_dual(
     torch::Tensor Q,
@@ -73,7 +76,8 @@ void sparse_mla_prefill_launch_model1_dual(
     int topk, int topk_extra,
     int page_block_size, int stride_kv_row,
     int page_block_size_extra, int stride_kv_row_extra,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const float* attn_sink /* nullable, [num_heads] */);
 
 // ── Python-facing functions ─────────────────────────────────────────
 
@@ -111,15 +115,14 @@ void sparse_mla_splitkv_fwd(
     TORCH_CHECK(num_heads % HPB == 0);
     TORCH_CHECK(page_block_size > 0, "page_block_size must be > 0");
 
-    // attn_sink + topk_length are not yet kernel-wired (entries past
-    // topk_length must be -1-padded by the caller). Warn if provided.
-    if (topk_length.has_value() || topk_length_extra.has_value()
-        || attn_sink.has_value()) {
+    // topk_length / topk_length_extra are not yet kernel-wired (entries past
+    // topk_length must be -1-padded by the caller). attn_sink is consumed by
+    // the combine kernel via sparse_mla_combine_fwd, not here.
+    if (topk_length.has_value() || topk_length_extra.has_value()) {
         TORCH_WARN_ONCE(
-            "sparse_mla_splitkv_fwd: topk_length / topk_length_extra / "
-            "attn_sink are accepted but not yet plumbed to the kernel. "
-            "Pad indices with -1 beyond the valid range; attn_sink is "
-            "currently dropped.");
+            "sparse_mla_splitkv_fwd: topk_length / topk_length_extra are "
+            "accepted but not yet plumbed to the kernel. Pad indices with "
+            "-1 beyond the valid range.");
     }
 
     ModelType mt = infer_model_type(d_qk);
@@ -174,11 +177,24 @@ void sparse_mla_combine_fwd(
     torch::Tensor partial_LSE,
     torch::Tensor output,
     torch::Tensor out_lse,
-    int nsplits)
+    int nsplits,
+    c10::optional<torch::Tensor> attn_sink = c10::nullopt)
 {
     TORCH_CHECK(partial_O.is_cuda() && output.is_cuda());
     const cudaStream_t stream = get_current_stream(partial_O);
-    sparse_mla_combine_launch(partial_O, partial_LSE, output, out_lse, nsplits, stream);
+
+    const float* attn_sink_ptr = nullptr;
+    if (attn_sink.has_value()) {
+        const torch::Tensor& s = attn_sink.value();
+        TORCH_CHECK(s.is_cuda(), "attn_sink must be a CUDA tensor");
+        TORCH_CHECK(s.dtype() == torch::kFloat32, "attn_sink must be float32");
+        TORCH_CHECK(s.dim() == 1, "attn_sink must be 1-D (per-head)");
+        TORCH_CHECK(s.is_contiguous(), "attn_sink must be contiguous");
+        attn_sink_ptr = s.data_ptr<float>();
+    }
+
+    sparse_mla_combine_launch(partial_O, partial_LSE, output, out_lse, nsplits,
+                              stream, attn_sink_ptr);
 }
 
 void sparse_mla_prefill_fwd(
@@ -209,13 +225,23 @@ void sparse_mla_prefill_fwd(
     TORCH_CHECK(num_heads % HPB == 0);
     TORCH_CHECK(page_block_size > 0, "page_block_size must be > 0");
 
-    if (topk_length.has_value() || topk_length_extra.has_value()
-        || attn_sink.has_value()) {
+    if (topk_length.has_value() || topk_length_extra.has_value()) {
         TORCH_WARN_ONCE(
-            "sparse_mla_prefill_fwd: topk_length / topk_length_extra / "
-            "attn_sink are accepted but not yet plumbed to the kernel. "
-            "Pad indices with -1 beyond the valid range; attn_sink is "
-            "currently dropped.");
+            "sparse_mla_prefill_fwd: topk_length / topk_length_extra are "
+            "accepted but not yet plumbed to the kernel. Pad indices with "
+            "-1 beyond the valid range.");
+    }
+
+    // Validate + extract attn_sink (per-head, [num_heads], float32).
+    const float* attn_sink_ptr = nullptr;
+    if (attn_sink.has_value()) {
+        const torch::Tensor& s = attn_sink.value();
+        TORCH_CHECK(s.is_cuda(), "attn_sink must be a CUDA tensor");
+        TORCH_CHECK(s.dtype() == torch::kFloat32, "attn_sink must be float32");
+        TORCH_CHECK(s.dim() == 1 && (int)s.size(0) == num_heads,
+            "attn_sink must be shape [num_heads]");
+        TORCH_CHECK(s.is_contiguous(), "attn_sink must be contiguous");
+        attn_sink_ptr = s.data_ptr<float>();
     }
 
     ModelType mt = infer_model_type(d_qk);
@@ -242,7 +268,7 @@ void sparse_mla_prefill_fwd(
             topk, topk_extra,
             page_block_size, stride_kv_row,
             page_block_size_extra, stride_kv_row_extra,
-            stream);
+            stream, attn_sink_ptr);
         return;
     }
 
@@ -251,13 +277,13 @@ void sparse_mla_prefill_fwd(
         sparse_mla_prefill_launch_v32(
             Q, KV_cache, indices, output, out_lse,
             sm_scale, num_heads, num_tokens, topk,
-            page_block_size, stride_kv_row, stream);
+            page_block_size, stride_kv_row, stream, attn_sink_ptr);
         break;
     case ModelType::MODEL1:
         sparse_mla_prefill_launch_model1(
             Q, KV_cache, indices, output, out_lse,
             sm_scale, num_heads, num_tokens, topk,
-            page_block_size, stride_kv_row, stream);
+            page_block_size, stride_kv_row, stream, attn_sink_ptr);
         break;
     }
 }
@@ -282,7 +308,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("topk_length_extra") = py::none(),
           py::arg("attn_sink") = py::none());
     m.def("sparse_mla_combine_fwd", &sparse_mla_combine_fwd,
-          "Combine partial outputs from split-KV decode");
+          "Combine partial outputs from split-KV decode",
+          py::arg("partial_O"),
+          py::arg("partial_LSE"),
+          py::arg("output"),
+          py::arg("out_lse"),
+          py::arg("nsplits"),
+          py::arg("attn_sink") = py::none());
     m.def("sparse_mla_prefill_fwd", &sparse_mla_prefill_fwd,
           "Sparse MLA prefill forward (SM120, V32+MODEL1)",
           py::arg("Q"),

@@ -46,6 +46,7 @@ sparse_mla_prefill_kernel(
     const bf16* __restrict__ Q,
     const uint8_t* __restrict__ KV_cache,
     const int32_t* __restrict__ indices,
+    const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
     bf16* __restrict__ output,
     float* __restrict__ out_lse,
     __grid_constant__ const PrefillColdParams cold)
@@ -384,6 +385,21 @@ sparse_mla_prefill_kernel(
         float il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
         float il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
 
+        // attn_sink scaling (same convention as MG kernel above).
+        if (attn_sink != nullptr) {
+            float m0 = sm.m_smem[gid];
+            float l0 = sm.l_smem[gid];
+            float lse0 = (l0 > 0.f) ? (m0 + log2f(l0)) : -1e30f;
+            float sink0 = attn_sink[h_start + gid] * LOG2E;
+            il0 *= 1.0f / (1.0f + exp2f(sink0 - lse0));
+
+            float m1 = sm.m_smem[gid + 8];
+            float l1 = sm.l_smem[gid + 8];
+            float lse1 = (l1 > 0.f) ? (m1 + log2f(l1)) : -1e30f;
+            float sink1 = attn_sink[h_start + gid + 8] * LOG2E;
+            il1 *= 1.0f / (1.0f + exp2f(sink1 - lse1));
+        }
+
         bf16* staging_bf16 = reinterpret_cast<bf16*>(sm.kv_bufs[0]);
         constexpr int BF16_STAGING_STRIDE = D_V;
 
@@ -467,6 +483,7 @@ sparse_mla_prefill_mg_kernel(
     const int32_t* __restrict__ indices_extra,     // nullptr when TOPK_EXTRA==0
     bf16* __restrict__ output,
     float* __restrict__ out_lse,
+    const float* __restrict__ attn_sink,           // [NUM_HEADS], nullable
     __grid_constant__ const PrefillColdParams cold)
 {
     const float sm_scale = cold.sm_scale;
@@ -950,6 +967,26 @@ sparse_mla_prefill_mg_kernel(
                 ? (1.f / sm.l_smem[g * SMG::ML_GRP_STRIDE + gid]) : 0.f;
             float il1 = (sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8] > 0.f)
                 ? (1.f / sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8]) : 0.f;
+
+            // attn_sink scaling: output[h] *= sigmoid(lse_h - sink_h). lse is
+            // in log2 space (m_smem and log2(l_smem) both log2), sink in raw-log;
+            // multiply sink by LOG2E to compare. Fold the factor into il0/il1
+            // since both are scalar per-head multipliers. Padded heads carry
+            // -inf and produce factor==1 (no-op).
+            if (attn_sink != nullptr) {
+                int g_h_start = h_start + g * HPB;
+                float m0 = sm.m_smem[g * SMG::ML_GRP_STRIDE + gid];
+                float l0 = sm.l_smem[g * SMG::ML_GRP_STRIDE + gid];
+                float lse0 = (l0 > 0.f) ? (m0 + log2f(l0)) : -1e30f;
+                float sink0 = attn_sink[g_h_start + gid] * LOG2E;
+                il0 *= 1.0f / (1.0f + exp2f(sink0 - lse0));
+
+                float m1 = sm.m_smem[g * SMG::ML_GRP_STRIDE + gid + 8];
+                float l1 = sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8];
+                float lse1 = (l1 > 0.f) ? (m1 + log2f(l1)) : -1e30f;
+                float sink1 = attn_sink[g_h_start + gid + 8] * LOG2E;
+                il1 *= 1.0f / (1.0f + exp2f(sink1 - lse1));
+            }
 
             #pragma unroll
             for (int t = 0; t < CT::ACC_TILES; t++) {

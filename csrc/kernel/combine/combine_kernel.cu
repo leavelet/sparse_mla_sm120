@@ -29,6 +29,14 @@ struct CombineParams {
     const float* partial_LSE;
     bf16* output;
     float* out_lse;
+    // Per-head attention-sink logit, shape [num_heads], float32. nullptr =
+    // no sink (output unchanged). Convention from upstream FlashMLA:
+    // output *= exp(lse) / (exp(lse) + exp(attn_sink))
+    //        = sigmoid(lse - attn_sink) per head.
+    // `lse` in this kernel is in log2 space (sum_lse computed via exp2).
+    // sink is in natural-log space, so we multiply by LOG2E to compare.
+    // Padded heads carry -inf which yields factor == 1.
+    const float* attn_sink;
     int num_heads;
     int nsplits;
 };
@@ -43,6 +51,7 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     const float* __restrict__ partial_LSE = params.partial_LSE;
     bf16* __restrict__ output = params.output;
     float* __restrict__ out_lse = params.out_lse;
+    const float* __restrict__ attn_sink = params.attn_sink;  // [num_heads] or nullptr
     const int num_heads = params.num_heads;
     const int nsplits = params.nsplits;
 
@@ -55,7 +64,11 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     if (h >= num_heads) return;
 
     if (nsplits == 1) {
-        // Single split: just convert float32 → bf16, no combine needed
+        // Single split: just convert float32 → bf16, no combine needed.
+        // attn_sink scaling: output[h] *= sigmoid(lse_h - sink_h). lse is
+        // already in log2 space (the decode kernel writes `m + log2(l)`),
+        // and sink is in raw-log space, so compare via LOG2E. -inf sink
+        // (padded heads) yields factor == 1 — no-op.
         const float* src = partial_O
             + (size_t)token_idx * nsplits * num_heads * D_V
             + (size_t)h * D_V;
@@ -63,20 +76,28 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
             + (size_t)token_idx * num_heads * D_V
             + (size_t)h * D_V;
 
+        float sink_factor = 1.0f;
+        if (attn_sink != nullptr) {
+            float lse_h = partial_LSE[(size_t)token_idx * nsplits * num_heads + h];
+            float sink_log2 = attn_sink[h] * LOG2E;
+            sink_factor = 1.0f / (1.0f + exp2f(sink_log2 - lse_h));
+        }
+
         #pragma unroll
         for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i) {
             float4 v = *(const float4*)(src + lane_idx * 4 + i * 128);
             bf16 b[4];
-            b[0] = __float2bfloat16(v.x);
-            b[1] = __float2bfloat16(v.y);
-            b[2] = __float2bfloat16(v.z);
-            b[3] = __float2bfloat16(v.w);
+            b[0] = __float2bfloat16(v.x * sink_factor);
+            b[1] = __float2bfloat16(v.y * sink_factor);
+            b[2] = __float2bfloat16(v.z * sink_factor);
+            b[3] = __float2bfloat16(v.w * sink_factor);
             *(uint64_t*)(dst + lane_idx * 4 + i * 128) = *(const uint64_t*)b;
         }
 
         if (lane_idx == 0) {
             size_t lse_idx = (size_t)token_idx * nsplits * num_heads + h;
             size_t lse_out_idx = (size_t)token_idx * num_heads + h;
+            // Upstream FlashMLA: attn_sink does NOT affect the returned LSE.
             out_lse[lse_out_idx] = partial_LSE[lse_idx];
         }
         return;
@@ -167,6 +188,14 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     }
 
     // ── Write output (bf16, packed uint64_t) ────────────────────────
+    // attn_sink scaling: same factor as the single-split fast path,
+    // using global_lse from the multi-split reduction above.
+    float sink_factor = 1.0f;
+    if (attn_sink != nullptr) {
+        float sink_log2 = attn_sink[h] * LOG2E;
+        sink_factor = 1.0f / (1.0f + exp2f(sink_log2 - global_lse));
+    }
+
     bf16* o_ptr = output
         + (size_t)token_idx * num_heads * D_V
         + (size_t)h * D_V;
@@ -174,10 +203,10 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     #pragma unroll
     for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i) {
         bf16 b[4];
-        b[0] = __float2bfloat16(result[i].x);
-        b[1] = __float2bfloat16(result[i].y);
-        b[2] = __float2bfloat16(result[i].z);
-        b[3] = __float2bfloat16(result[i].w);
+        b[0] = __float2bfloat16(result[i].x * sink_factor);
+        b[1] = __float2bfloat16(result[i].y * sink_factor);
+        b[2] = __float2bfloat16(result[i].z * sink_factor);
+        b[3] = __float2bfloat16(result[i].w * sink_factor);
         *(uint64_t*)(o_ptr + lane_idx * 4 + i * 128) = *(const uint64_t*)b;
     }
 }
@@ -207,7 +236,8 @@ void sparse_mla_combine_launch(
     torch::Tensor output,
     torch::Tensor out_lse,
     int nsplits,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const float* attn_sink /* nullable, [num_heads] */)
 {
     int num_tokens = partial_O.size(0);
     int num_heads = partial_O.size(2);
@@ -228,6 +258,7 @@ void sparse_mla_combine_launch(
             partial_LSE.data_ptr<float>(),
             reinterpret_cast<bf16*>(output.data_ptr()),
             out_lse.data_ptr<float>(),
+            attn_sink,
             num_heads, nsplits
         };
 

@@ -10,6 +10,7 @@
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 void launch_prefill_sg(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+    const float* attn_sink,
     bf16* output, float* out_lse,
     float sm_scale, int num_tokens,
     size_t stride_kv_block,
@@ -32,6 +33,7 @@ void launch_prefill_sg(
     cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
     void* args[] = {
         (void*)&Q, (void*)&KV_cache, (void*)&indices,
+        (void*)&attn_sink,
         (void*)&output, (void*)&out_lse, (void*)&cold
     };
     CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
@@ -45,6 +47,7 @@ template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_
 void launch_prefill_mg(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     const uint8_t* KV_cache_extra, const int32_t* indices_extra,
+    const float* attn_sink,
     bf16* output, float* out_lse,
     float sm_scale, int num_tokens,
     size_t stride_kv_block, size_t stride_kv_block_extra,
@@ -67,7 +70,9 @@ void launch_prefill_mg(
     void* args[] = {
         (void*)&Q, (void*)&KV_cache, (void*)&indices,
         (void*)&KV_cache_extra, (void*)&indices_extra,
-        (void*)&output, (void*)&out_lse, (void*)&cold
+        (void*)&output, (void*)&out_lse,
+        (void*)&attn_sink,
+        (void*)&cold
     };
     CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
@@ -81,7 +86,8 @@ void sparse_mla_prefill_launch_v32(
     torch::Tensor output, torch::Tensor out_lse,
     float sm_scale, int num_heads, int num_tokens, int topk,
     int page_block_size, int stride_kv_row,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const float* attn_sink /* nullable, [num_heads] */)
 {
     auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
     auto KV_ptr = reinterpret_cast<const uint8_t*>(KV_cache.data_ptr());
@@ -95,7 +101,7 @@ void sparse_mla_prefill_launch_v32(
     if (num_heads <= HPB) {
         #define DISPATCH_SG(NH) \
             launch_prefill_sg<ModelType::V32, ComputeMode::FP8, NH, 2048, 1>( \
-                Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, \
+                Q_ptr, KV_ptr, idx_ptr, attn_sink, O_ptr, LSE_ptr, \
                 sm_scale, num_tokens, stride_kv_block, stream)
         switch (num_heads) {
         case 16:  DISPATCH_SG(16); break;
@@ -107,7 +113,7 @@ void sparse_mla_prefill_launch_v32(
             launch_prefill_mg<ModelType::V32, ComputeMode::FP8, NH, 2048, 1>( \
                 Q_ptr, KV_ptr, idx_ptr, \
                 /*KV_cache_extra=*/nullptr, /*indices_extra=*/nullptr, \
-                O_ptr, LSE_ptr, \
+                attn_sink, O_ptr, LSE_ptr, \
                 sm_scale, num_tokens, \
                 stride_kv_block, /*stride_kv_block_extra=*/(size_t)0, \
                 stream)
@@ -125,7 +131,8 @@ void sparse_mla_prefill_launch_model1(
     torch::Tensor output, torch::Tensor out_lse,
     float sm_scale, int num_heads, int num_tokens, int topk,
     int page_block_size, int stride_kv_row,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const float* attn_sink /* nullable, [num_heads] */)
 {
     auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
     auto KV_ptr = reinterpret_cast<const uint8_t*>(KV_cache.data_ptr());
@@ -141,7 +148,7 @@ void sparse_mla_prefill_launch_model1(
         launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64>( \
             Q_ptr, KV_ptr, idx_ptr, \
             /*KV_cache_extra=*/nullptr, /*indices_extra=*/nullptr, \
-            O_ptr, LSE_ptr, \
+            attn_sink, O_ptr, LSE_ptr, \
             sm_scale, num_tokens, \
             stride_kv_block, /*stride_kv_block_extra=*/(size_t)0, \
             stream)
@@ -182,7 +189,8 @@ void sparse_mla_prefill_launch_model1_dual(
     int topk, int topk_extra,
     int page_block_size, int stride_kv_row,
     int page_block_size_extra, int stride_kv_row_extra,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const float* attn_sink /* nullable, [num_heads] */)
 {
     auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
     auto KV_ptr = reinterpret_cast<const uint8_t*>(KV_cache.data_ptr());
@@ -204,7 +212,7 @@ void sparse_mla_prefill_launch_model1_dual(
     #define DISPATCH_DUAL_MG(NH, TK, TK_EX, PBSX) \
         launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, TK_EX, PBSX>( \
             Q_ptr, KV_ptr, idx_ptr, KV_extra_ptr, idx_extra_ptr, \
-            O_ptr, LSE_ptr, sm_scale, num_tokens, \
+            attn_sink, O_ptr, LSE_ptr, sm_scale, num_tokens, \
             stride_kv_block, stride_kv_block_extra, stream)
 
     if (topk == 128 && topk_extra == 128 && page_block_size_extra == 64) {

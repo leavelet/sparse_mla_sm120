@@ -112,7 +112,11 @@ def sparse_mla_decode_fwd(
         (num_tokens, num_heads),
         dtype=torch.float32, device=q.device,
     )
-    _C.sparse_mla_combine_fwd(partial_O, partial_LSE, output, lse, nsplits)
+    # attn_sink scaling lives in the combine kernel: output *= sigmoid(lse - sink)
+    # per head. Caller convention from upstream FlashMLA — attn_sink is a 1-D
+    # float32 tensor of length num_heads (padded heads carry -inf so factor==1).
+    _C.sparse_mla_combine_fwd(partial_O, partial_LSE, output, lse, nsplits,
+                              attn_sink=attn_sink)
 
     return output, lse
 
