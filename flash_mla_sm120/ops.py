@@ -309,6 +309,13 @@ def sparse_mla_fwd(
     )
     num_tokens = q.shape[0]
     if num_tokens <= _DECODE_THRESHOLD:
+        # Route through v2 when topk_length / extra_topk_length is set so the
+        # kernel-side QK mask is honored. v1 decode ignores topk_length (callers
+        # would have to pre-pad indices with -1, which vLLM does not do).
+        if topk_length is not None or extra_topk_length is not None:
+            return sparse_mla_decode_v2_fwd(
+                q, kv_cache, indices, sm_scale, d_v, out=out, **kwargs
+            )
         return sparse_mla_decode_fwd(
             q, kv_cache, indices, sm_scale, d_v, out=out, **kwargs
         )
