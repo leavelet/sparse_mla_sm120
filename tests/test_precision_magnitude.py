@@ -189,7 +189,7 @@ def run_prefill_test(model_type, num_heads, topk, magnitude, num_tokens=4,
     indices = torch.randint(0, num_blocks * block_size, (num_tokens, topk),
                             device="cuda", dtype=torch.int32)
 
-    output, lse = sparse_mla_prefill_fwd(
+    output, _, lse = sparse_mla_prefill_fwd(
         q, kv_packed.view(-1, block_size, 1, kv_packed.shape[-1]),
         indices, sm_scale, d_v)
     ref_output = vectorized_reference(q, kv_deq, indices, sm_scale, d_qk, d_v)

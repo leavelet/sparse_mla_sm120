@@ -1,12 +1,7 @@
 """FlashMLA-compatible Python interface for flash_mla_sm120.
 
-API signatures match flash_mla_interface.py exactly so that sglang/vllm
+API signatures match flash_mla_interface.py so that sglang/vllm
 can use this as a drop-in SM120 backend.
-
-Precision behavior (matching FlashMLA):
-  - prefill (flash_mla_sparse_fwd): BF16 compute by default
-  - decode  (flash_mla_with_kvcache): configurable (FP8 for perf, BF16 for precision)
-FlashMLA on SM90 uses BF16 MMA for all paths (dequant FP8→BF16 first).
 """
 
 from typing import Optional, Tuple
@@ -56,6 +51,7 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    bf16_qk: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from .ops import sparse_mla_decode_fwd
 
@@ -69,20 +65,60 @@ def flash_mla_with_kvcache(
     assert indices is not None, "flash_mla_sm120 only supports sparse attention"
     assert is_fp8_kvcache, "flash_mla_sm120 requires FP8 KV cache"
 
-    q_input = q.reshape(-1, q.shape[-2], q.shape[-1])  # [b*s_q, h_q, d_qk]
-    idx_input = indices.reshape(q_input.shape[0], -1)   # [b*s_q, topk]
+    topk = indices.shape[-1]
+    extra_topk = 0
+    extra_k_page_block_size = None
+    if extra_indices_in_kvcache is not None:
+        extra_topk = extra_indices_in_kvcache.shape[-1]
+    if extra_k_cache is not None:
+        extra_k_page_block_size = extra_k_cache.shape[1]
 
-    # Do NOT reshape k_cache — preserve (num_blocks, page_block_size, 1, bpt)
-    # for correct page_block_size derivation in ops.py (MODEL1 footer layout)
+    if not sched_meta.have_initialized:
+        sched_meta.have_initialized = True
+        sched_meta.config = FlashMLASchedMeta.Config(
+            b=q.shape[0],
+            s_q=q.shape[1] if q.dim() == 4 else 1,
+            h_q=q.shape[-2],
+            page_block_size=k_cache.shape[1],
+            h_k=k_cache.shape[2],
+            causal=causal,
+            is_fp8_kvcache=is_fp8_kvcache,
+            topk=topk,
+            extra_page_block_size=extra_k_page_block_size,
+            extra_topk=extra_topk if extra_topk > 0 else None,
+        )
+    else:
+        c = sched_meta.config
+        assert c.b == q.shape[0]
+        assert c.s_q == (q.shape[1] if q.dim() == 4 else 1)
+        assert c.h_q == q.shape[-2]
+        assert c.page_block_size == k_cache.shape[1]
+        assert c.h_k == k_cache.shape[2]
+        assert c.causal == causal
+        assert c.is_fp8_kvcache == is_fp8_kvcache
+        assert c.topk == topk
+        assert c.extra_page_block_size == extra_k_page_block_size
+        assert c.extra_topk == (extra_topk if extra_topk > 0 else None)
+
+    q_input = q.reshape(-1, q.shape[-2], q.shape[-1])
+    idx_input = indices.reshape(q_input.shape[0], -1)
+
+    extra_idx_input = None
+    if extra_indices_in_kvcache is not None:
+        extra_idx_input = extra_indices_in_kvcache.reshape(q_input.shape[0], -1)
+
     output, real_lse = sparse_mla_decode_fwd(
-        q_input, k_cache, idx_input, softmax_scale, head_dim_v
+        q_input, k_cache, idx_input, softmax_scale, head_dim_v,
+        attn_sink=attn_sink, bf16_qk=bf16_qk,
+        extra_k_cache=extra_k_cache, extra_indices=extra_idx_input,
+        topk_length=topk_length, extra_topk_length=extra_topk_length,
+        extra_topk=extra_topk,
     )
 
     batch = q.shape[0]
     s_q = q.shape[1] if q.dim() == 4 else 1
     h_q = q.shape[-2]
     output = output.reshape(batch, s_q, h_q, head_dim_v)
-    # real_lse is (b*s_q, h_q) → reshape to (b, s_q, h_q) then permute to (b, h_q, s_q)
     lse = real_lse.reshape(batch, s_q, h_q).permute(0, 2, 1).contiguous()
 
     return output, lse
@@ -97,19 +133,11 @@ def flash_mla_sparse_fwd(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from .ops import sparse_mla_fwd
+    from .ops import sparse_mla_prefill_fwd
 
-    result = sparse_mla_fwd(
-        q, kv, indices.squeeze(1) if indices.dim() == 3 else indices,
-        sm_scale, d_v)
-
-    if isinstance(result, tuple):
-        out, lse = result
-    else:
-        out, lse = result, None
-
-    if lse is None:
-        lse = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
-    max_logits = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
+    idx = indices.squeeze(1) if indices.dim() == 3 else indices
+    out, max_logits, lse = sparse_mla_prefill_fwd(
+        q, kv, idx, sm_scale, d_v,
+        attn_sink=attn_sink, topk_length=topk_length)
 
     return out, max_logits, lse

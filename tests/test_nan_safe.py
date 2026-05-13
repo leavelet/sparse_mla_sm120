@@ -76,7 +76,7 @@ class TestNaNSafeInvalidIndex:
         indices = torch.randint(1, 4096, (num_tokens, topk), device="cuda", dtype=torch.int32)
         indices[:, -topk//4:] = -1
 
-        output, lse = sparse_mla_prefill_fwd(q, kv_packed, indices, sm_scale, d_v)
+        output, _, lse = sparse_mla_prefill_fwd(q, kv_packed, indices, sm_scale, d_v)
 
         assert torch.isfinite(output).all(), (
             f"NaN/Inf in prefill output! "

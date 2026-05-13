@@ -48,6 +48,7 @@ sparse_mla_prefill_kernel(
     const int32_t* __restrict__ indices,
     bf16* __restrict__ output,
     float* __restrict__ out_lse,
+    float* __restrict__ out_max_logits,
     __grid_constant__ const PrefillColdParams cold)
 {
     const float sm_scale = cold.sm_scale;
@@ -499,10 +500,13 @@ sparse_mla_prefill_kernel(
             }
         }
 
-        // Write LSE (merged with attn_sink if present)
+        // Write LSE and max_logits
         if (threadIdx.x < HPB) {
             int h = threadIdx.x;
             float lse = softmax_lse(sm.m_smem[h], sm.l_smem[h]);
+            size_t lse_idx = (size_t)s_i * NUM_HEADS + h_start + h;
+            if (out_max_logits != nullptr)
+                out_max_logits[lse_idx] = sm.m_smem[h];
             if (cold.attn_sink != nullptr) {
                 float sink_log2 = __ldg(cold.attn_sink + h_start + h) * LOG2E;
                 if (lse != -1e30f)
@@ -510,7 +514,6 @@ sparse_mla_prefill_kernel(
                 else
                     lse = sink_log2;
             }
-            size_t lse_idx = (size_t)s_i * NUM_HEADS + h_start + h;
             out_lse[lse_idx] = lse;
         }
     }
@@ -540,6 +543,7 @@ sparse_mla_prefill_mg_kernel(
     const int32_t* __restrict__ indices,
     bf16* __restrict__ output,
     float* __restrict__ out_lse,
+    float* __restrict__ out_max_logits,
     __grid_constant__ const PrefillColdParams cold)
 {
     const float sm_scale = cold.sm_scale;
@@ -1044,11 +1048,14 @@ sparse_mla_prefill_mg_kernel(
                 }
             }
 
-            // Write LSE for this group (merged with attn_sink if present)
+            // Write LSE and max_logits for this group
             if (threadIdx.x < HPB) {
                 int h = threadIdx.x;
                 float lse = softmax_lse(sm.m_smem[g * SMG::ML_GRP_STRIDE + h],
                                          sm.l_smem[g * SMG::ML_GRP_STRIDE + h]);
+                size_t lse_idx = (size_t)s_i * NUM_HEADS + (h_start + g * HPB + h);
+                if (out_max_logits != nullptr)
+                    out_max_logits[lse_idx] = sm.m_smem[g * SMG::ML_GRP_STRIDE + h];
                 if (cold.attn_sink != nullptr) {
                     float sink_log2 = __ldg(cold.attn_sink + h_start + g * HPB + h) * LOG2E;
                     if (lse != -1e30f)
@@ -1056,7 +1063,6 @@ sparse_mla_prefill_mg_kernel(
                     else
                         lse = sink_log2;
                 }
-                size_t lse_idx = (size_t)s_i * NUM_HEADS + (h_start + g * HPB + h);
                 out_lse[lse_idx] = lse;
             }
 

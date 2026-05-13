@@ -340,11 +340,11 @@ class TestPrefillTopkLength:
         ref_flat = ref_indices.view(-1, topk)
 
         # Kernel with topk_length
-        out, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
+        out, _, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
             q_flat, kv_packed, idx_flat, sm_scale, d_v,
             topk_length=topk_length)
         # Reference: kernel with pre-masked indices (no topk_length)
-        ref_out, ref_lse = flash_mla_sm120.sparse_mla_prefill_fwd(
+        ref_out, _, ref_lse = flash_mla_sm120.sparse_mla_prefill_fwd(
             q_flat, kv_packed, ref_flat, sm_scale, d_v)
 
         # Compare vs FP32 reference (not bit-exact due to FP8 quantization)
@@ -402,7 +402,7 @@ class TestPrefillTopkLength:
         import flash_mla_sm120
         q_flat = q.view(-1, num_heads, d_qk)
         idx_flat = indices.view(-1, topk)
-        out, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
+        out, _, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
             q_flat, kv_packed, idx_flat, sm_scale, d_v,
             attn_sink, topk_length)
         out = out.view_as(ref_out)
@@ -438,7 +438,7 @@ class TestPrefillTopkLength:
                                      dtype=torch.int32, device="cuda")
 
         import flash_mla_sm120
-        out, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
+        out, _, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
             q, kv_packed, indices, sm_scale, d_v, topk_length=topk_length)
         assert torch.isfinite(out).all() or (out == 0).all(), "output has NaN/Inf"
         print(f"\n  extreme short topk (0-10): no crash, output finite")

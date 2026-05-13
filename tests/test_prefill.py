@@ -43,7 +43,7 @@ def run_prefill_test(model_type, d_qk, d_v, topk, num_heads, num_tokens,
     q_flat = q.view(-1, num_heads, d_qk)
     idx_flat = indices.view(-1, topk)
 
-    out, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
+    out, max_logits, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
         q_flat, kv_packed, idx_flat, sm_scale, d_v, bf16_qk=bf16_qk)
     out = out.view_as(ref_out)
 
@@ -135,7 +135,7 @@ def run_prefill_attn_sink_test(num_heads, topk, num_tokens, attn_sink_mode="rand
 
     q_flat = q.view(-1, num_heads, d_qk)
     idx_flat = indices.view(-1, topk)
-    out, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
+    out, max_logits, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
         q_flat, kv_packed, idx_flat, sm_scale, d_v, attn_sink)
     out = out.view_as(ref_out_sink)
 

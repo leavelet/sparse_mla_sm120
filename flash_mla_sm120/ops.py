@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 def _load_lib():
@@ -7,7 +7,17 @@ def _load_lib():
     return _C
 
 
-_DECODE_THRESHOLD = 64
+_HPB = 16
+_FIXED_OVERHEAD = 5
+_BI = 64
+
+_num_sms_cache: dict = {}
+
+def _get_num_sms() -> int:
+    dev = torch.cuda.current_device()
+    if dev not in _num_sms_cache:
+        _num_sms_cache[dev] = torch.cuda.get_device_properties(dev).multi_processor_count
+    return _num_sms_cache[dev]
 
 
 def _effective_stride_kv_row(kv_cache: torch.Tensor) -> int:
@@ -35,33 +45,19 @@ def _effective_stride_kv_row(kv_cache: torch.Tensor) -> int:
     return block_stride_bytes // page_block_size
 
 
-def _compute_decode_splits(num_tokens, num_heads, topk):
-    hpb = 16
-    bi = 64
-    ni = topk // bi
-
-    replicate_h = (num_heads + hpb - 1) // hpb
-    ctas_per_split = num_tokens * replicate_h
-
-    target_total_ctas = 128
-    nsplits = min(ni, max(1, (target_total_ctas + ctas_per_split - 1) // ctas_per_split))
-    min_tiles = 2
-    nsplits = min(nsplits, ni // min_tiles)
-    nsplits = max(nsplits, 1)
-    while nsplits > 1 and ni % nsplits != 0:
-        nsplits -= 1
-    tiles_per_split = ni // nsplits
-    return nsplits, tiles_per_split
-
-
 def sparse_mla_decode_fwd(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
-    attn_sink: torch.Tensor = None,
+    attn_sink: Optional[torch.Tensor] = None,
     bf16_qk: bool = True,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    extra_topk: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     _C = _load_lib()
     num_tokens, num_heads, d_qk = q.shape
@@ -70,38 +66,53 @@ def sparse_mla_decode_fwd(
     assert q.is_contiguous()
     assert kv_cache.is_contiguous()
     assert indices.dtype == torch.int32 and indices.is_contiguous()
-    assert num_tokens <= _DECODE_THRESHOLD
 
     stride_kv_row = _effective_stride_kv_row(kv_cache)
     page_block_size = kv_cache.shape[-3] if kv_cache.dim() >= 3 else 1
-    nsplits, tiles_per_split = _compute_decode_splits(num_tokens, num_heads, topk)
 
-    partial_O = torch.empty(
-        (num_tokens, nsplits, num_heads, d_v),
-        dtype=torch.float32, device=q.device,
-    )
-    partial_LSE = torch.empty(
-        (num_tokens, nsplits, num_heads),
-        dtype=torch.float32, device=q.device,
-    )
+    replicate_h = (num_heads + _HPB - 1) // _HPB
+    num_sm_parts = max(_get_num_sms() // (num_tokens * replicate_h), 1)
+    total_splits_bound = num_tokens + num_sm_parts
 
-    _C.sparse_mla_splitkv_fwd(
-        q, kv_cache, indices, partial_O, partial_LSE,
-        sm_scale, topk, tiles_per_split, stride_kv_row, page_block_size,
-        bf16_qk,
-    )
+    sched_meta = torch.empty(num_sm_parts * 8, dtype=torch.int32, device=q.device)
+    num_splits = torch.empty(num_tokens + 1, dtype=torch.int32, device=q.device)
+    _C.get_decode_metadata(
+        num_tokens, topk, extra_topk, num_sm_parts, _FIXED_OVERHEAD,
+        topk_length, extra_topk_length, sched_meta, num_splits)
 
+    s_q = 1
+    o_accum = torch.empty(
+        (total_splits_bound, s_q, num_heads, d_v),
+        dtype=torch.float32, device=q.device)
+    lse_accum = torch.empty(
+        (total_splits_bound, s_q, num_heads),
+        dtype=torch.float32, device=q.device)
     output = torch.empty(
         (num_tokens, num_heads, d_v),
-        dtype=torch.bfloat16, device=q.device,
-    )
-    lse = torch.empty(
+        dtype=torch.bfloat16, device=q.device)
+    out_lse = torch.empty(
         (num_tokens, num_heads),
-        dtype=torch.float32, device=q.device,
-    )
-    _C.sparse_mla_combine_fwd(partial_O, partial_LSE, output, lse, nsplits, attn_sink)
+        dtype=torch.float32, device=q.device)
 
-    return output, lse
+    _C.sparse_mla_splitkv_v2_fwd(
+        q, kv_cache, indices,
+        o_accum, lse_accum, output, out_lse,
+        sched_meta, num_splits,
+        sm_scale, topk, stride_kv_row, page_block_size,
+        num_sm_parts, attn_sink,
+        extra_k_cache, extra_indices, topk_length,
+        extra_topk, extra_topk_length, bf16_qk)
+
+    ni = topk // _BI
+    if extra_topk > 0:
+        ni += (extra_topk + _BI - 1) // _BI
+    max_nsplits = min(ni, num_sm_parts)
+
+    _C.sparse_mla_combine_v2_fwd(
+        o_accum, lse_accum, output, out_lse,
+        num_splits, num_tokens, max_nsplits, attn_sink)
+
+    return output, out_lse
 
 
 def sparse_mla_prefill_fwd(
@@ -110,10 +121,10 @@ def sparse_mla_prefill_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
-    attn_sink: torch.Tensor = None,
-    topk_length: torch.Tensor = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
     bf16_qk: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _C = _load_lib()
     num_tokens, num_heads, d_qk = q.shape
     topk = indices.shape[-1]
@@ -131,25 +142,14 @@ def sparse_mla_prefill_fwd(
     lse = torch.empty(
         (num_tokens, num_heads), dtype=torch.float32, device=q.device
     )
+    max_logits = torch.empty(
+        (num_tokens, num_heads), dtype=torch.float32, device=q.device
+    )
     _C.sparse_mla_prefill_fwd(
         q, kv_cache, indices, output, lse,
         sm_scale, topk, stride_kv_row, page_block_size,
-        attn_sink, topk_length, bf16_qk,
+        attn_sink, topk_length, bf16_qk, max_logits,
     )
-    return output, lse
+    return output, max_logits, lse
 
 
-def sparse_mla_fwd(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    indices: torch.Tensor,
-    sm_scale: float,
-    d_v: int = 512,
-    attn_sink: torch.Tensor = None,
-    topk_length: torch.Tensor = None,
-    bf16_qk: bool = True,
-):
-    num_tokens = q.shape[0]
-    if num_tokens <= _DECODE_THRESHOLD:
-        return sparse_mla_decode_fwd(q, kv_cache, indices, sm_scale, d_v, attn_sink, bf16_qk)
-    return sparse_mla_prefill_fwd(q, kv_cache, indices, sm_scale, d_v, attn_sink, topk_length, bf16_qk)

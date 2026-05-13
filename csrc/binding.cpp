@@ -17,29 +17,7 @@ ModelType infer_model_type(int d_qk) {
 
 }  // namespace
 
-// Forward declarations — split-KV decode
-void sparse_mla_splitkv_launch_v32(
-    torch::Tensor Q, torch::Tensor KV_cache, torch::Tensor indices,
-    torch::Tensor partial_O, torch::Tensor partial_LSE,
-    float sm_scale, int num_heads, int num_tokens, int topk,
-    int tiles_per_split, int page_block_size, int stride_kv_row,
-    cudaStream_t stream);
-
-void sparse_mla_splitkv_launch_model1(
-    torch::Tensor Q, torch::Tensor KV_cache, torch::Tensor indices,
-    torch::Tensor partial_O, torch::Tensor partial_LSE,
-    float sm_scale, int num_heads, int num_tokens, int topk,
-    int tiles_per_split, int page_block_size, int stride_kv_row,
-    bool bf16_qk,
-    cudaStream_t stream);
-
-// Forward declarations — combine
-void sparse_mla_combine_launch(
-    torch::Tensor partial_O, torch::Tensor partial_LSE,
-    torch::Tensor output, torch::Tensor out_lse,
-    int nsplits, c10::optional<torch::Tensor> attn_sink,
-    cudaStream_t stream);
-
+// Forward declarations — combine v2
 void sparse_mla_combine_v2_launch(
     torch::Tensor o_accum, torch::Tensor lse_accum,
     torch::Tensor output, torch::Tensor out_lse,
@@ -93,6 +71,7 @@ void sparse_mla_prefill_launch_v32(
     int page_block_size, int stride_kv_row,
     const float* attn_sink_ptr,
     const int* topk_length_ptr,
+    float* out_max_logits_ptr,
     cudaStream_t stream);
 
 void sparse_mla_prefill_launch_model1(
@@ -103,55 +82,12 @@ void sparse_mla_prefill_launch_model1(
     const float* attn_sink_ptr,
     const int* topk_length_ptr,
     bool bf16_qk,
+    float* out_max_logits_ptr,
     cudaStream_t stream);
 
 // ── Python-facing functions ─────────────────────────────────────────
 
 static constexpr int HPB = 16;
-
-void sparse_mla_splitkv_fwd(
-    torch::Tensor Q,
-    torch::Tensor KV_cache,
-    torch::Tensor indices,
-    torch::Tensor partial_O,
-    torch::Tensor partial_LSE,
-    float sm_scale,
-    int topk,
-    int tiles_per_split,
-    int stride_kv_row,
-    int page_block_size,
-    bool bf16_qk)
-{
-    TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Q must be bf16");
-    TORCH_CHECK(Q.is_cuda() && KV_cache.is_cuda() && indices.is_cuda());
-    TORCH_CHECK(partial_O.dtype() == torch::kFloat32, "partial_O must be float32");
-    TORCH_CHECK(partial_LSE.dtype() == torch::kFloat32, "partial_LSE must be float32");
-
-    int num_tokens = Q.size(0);
-    int num_heads = Q.size(1);
-    int d_qk = Q.size(2);
-    TORCH_CHECK(num_tokens <= 64, "decode path requires num_tokens <= 64");
-    TORCH_CHECK(num_heads > 0 && num_heads <= 128);
-    TORCH_CHECK(page_block_size > 0, "page_block_size must be > 0");
-
-    ModelType mt = infer_model_type(d_qk);
-    const cudaStream_t stream = get_current_stream(Q);
-
-    switch (mt) {
-    case ModelType::V32:
-        sparse_mla_splitkv_launch_v32(
-            Q, KV_cache, indices, partial_O, partial_LSE,
-            sm_scale, num_heads, num_tokens, topk,
-            tiles_per_split, page_block_size, stride_kv_row, stream);
-        break;
-    case ModelType::MODEL1:
-        sparse_mla_splitkv_launch_model1(
-            Q, KV_cache, indices, partial_O, partial_LSE,
-            sm_scale, num_heads, num_tokens, topk,
-            tiles_per_split, page_block_size, stride_kv_row, bf16_qk, stream);
-        break;
-    }
-}
 
 void sparse_mla_splitkv_v2_fwd(
     torch::Tensor Q,
@@ -223,23 +159,6 @@ void sparse_mla_splitkv_v2_fwd(
     }
 }
 
-void sparse_mla_combine_fwd(
-    torch::Tensor partial_O,
-    torch::Tensor partial_LSE,
-    torch::Tensor output,
-    torch::Tensor out_lse,
-    int nsplits,
-    c10::optional<torch::Tensor> attn_sink)
-{
-    TORCH_CHECK(partial_O.is_cuda() && output.is_cuda());
-    if (attn_sink.has_value()) {
-        TORCH_CHECK(attn_sink->dtype() == torch::kFloat32, "attn_sink must be float32");
-        TORCH_CHECK(attn_sink->is_cuda(), "attn_sink must be on CUDA");
-    }
-    const cudaStream_t stream = get_current_stream(partial_O);
-    sparse_mla_combine_launch(partial_O, partial_LSE, output, out_lse, nsplits, attn_sink, stream);
-}
-
 void sparse_mla_combine_v2_fwd(
     torch::Tensor o_accum,
     torch::Tensor lse_accum,
@@ -271,7 +190,8 @@ void sparse_mla_prefill_fwd(
     int page_block_size,
     c10::optional<torch::Tensor> attn_sink,
     c10::optional<torch::Tensor> topk_length,
-    bool bf16_qk)
+    bool bf16_qk,
+    c10::optional<torch::Tensor> out_max_logits)
 {
     TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Q must be bf16");
     TORCH_CHECK(Q.is_cuda() && KV_cache.is_cuda() && indices.is_cuda());
@@ -292,31 +212,25 @@ void sparse_mla_prefill_fwd(
     const cudaStream_t stream = get_current_stream(Q);
     const float* sink_ptr = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
     const int* tl_ptr = topk_length.has_value() ? topk_length->data_ptr<int>() : nullptr;
+    float* ml_ptr = out_max_logits.has_value() ? out_max_logits->data_ptr<float>() : nullptr;
 
     switch (mt) {
     case ModelType::V32:
         sparse_mla_prefill_launch_v32(
             Q, KV_cache, indices, output, out_lse,
             sm_scale, num_heads, num_tokens, topk,
-            page_block_size, stride_kv_row, sink_ptr, tl_ptr, stream);
+            page_block_size, stride_kv_row, sink_ptr, tl_ptr, ml_ptr, stream);
         break;
     case ModelType::MODEL1:
         sparse_mla_prefill_launch_model1(
             Q, KV_cache, indices, output, out_lse,
             sm_scale, num_heads, num_tokens, topk,
-            page_block_size, stride_kv_row, sink_ptr, tl_ptr, bf16_qk, stream);
+            page_block_size, stride_kv_row, sink_ptr, tl_ptr, bf16_qk, ml_ptr, stream);
         break;
     }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("sparse_mla_splitkv_fwd", &sparse_mla_splitkv_fwd,
-          "Split-KV decode forward (SM120, V32+MODEL1)",
-          py::arg("Q"), py::arg("KV_cache"), py::arg("indices"),
-          py::arg("partial_O"), py::arg("partial_LSE"),
-          py::arg("sm_scale"), py::arg("topk"),
-          py::arg("tiles_per_split"), py::arg("stride_kv_row"),
-          py::arg("page_block_size"), py::arg("bf16_qk") = true);
     m.def("sparse_mla_splitkv_v2_fwd", &sparse_mla_splitkv_v2_fwd,
           "Split-KV decode v2 forward (scheduler-driven, V4-compatible)",
           py::arg("Q"), py::arg("KV_cache"), py::arg("indices"),
@@ -333,11 +247,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("extra_topk") = 0,
           py::arg("extra_topk_length") = py::none(),
           py::arg("bf16_qk") = true);
-    m.def("sparse_mla_combine_fwd", &sparse_mla_combine_fwd,
-          "Combine partial outputs from split-KV decode",
-          py::arg("partial_O"), py::arg("partial_LSE"),
-          py::arg("output"), py::arg("out_lse"),
-          py::arg("nsplits"), py::arg("attn_sink") = py::none());
     m.def("sparse_mla_combine_v2_fwd", &sparse_mla_combine_v2_fwd,
           "Combine v2: per-batch split indexing via num_splits_ptr",
           py::arg("o_accum"), py::arg("lse_accum"),
@@ -360,5 +269,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("stride_kv_row"), py::arg("page_block_size"),
           py::arg("attn_sink") = py::none(),
           py::arg("topk_length") = py::none(),
-          py::arg("bf16_qk") = true);
+          py::arg("bf16_qk") = true,
+          py::arg("out_max_logits") = py::none());
 }
