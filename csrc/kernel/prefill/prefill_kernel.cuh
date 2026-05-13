@@ -34,12 +34,13 @@
 struct PrefillColdParams {
     float sm_scale;
     int num_tokens;
+    int topk;
     size_t stride_kv_block;
-    const float* attn_sink;  // [NUM_HEADS] float32, natural log domain. nullptr = disabled.
-    const int* topk_length;  // [num_tokens] int32, nullptr = uniform TOPK.
+    const float* attn_sink;
+    const int* topk_length;
 };
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
           bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_kernel(
@@ -53,14 +54,13 @@ sparse_mla_prefill_kernel(
 {
     const float sm_scale = cold.sm_scale;
     const int num_tokens = cold.num_tokens;
+    const int topk = cold.topk;
     constexpr int page_block_size = PAGE_BLOCK_SIZE;
     const size_t stride_kv_block = cold.stride_kv_block;
     using KV = KVCacheTraits<MT>;
     using CT = ComputeTraits<MT, CM>;
     using L = SmemLayout<MT, CM, BF16_QK>;
     using IO = KVIOTraits<MT>;
-
-    static constexpr int NI = TOPK / BI;
     static constexpr int REPLICATE_H = NUM_HEADS / HPB;
     static constexpr int QK_NOPE_KSTEPS = KV::QUANT_TILE / 32;
 
@@ -69,7 +69,7 @@ sparse_mla_prefill_kernel(
     const int h_start = h_tile * HPB;
     if (s_i >= num_tokens) return;
 
-    const int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK;
+    const int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : topk;
     const int actual_ni = (topk_len + BI - 1) / BI;
 
     const int warp_rank = threadIdx.x / 32;
@@ -89,7 +89,7 @@ sparse_mla_prefill_kernel(
         asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
 
         const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
-        const int32_t* idx_base = indices + (size_t)s_i * TOPK;
+        const int32_t* idx_base = indices + (size_t)s_i * topk;
         const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
         // Prologue: gather tile 0
@@ -127,7 +127,7 @@ sparse_mla_prefill_kernel(
         const int gid = lane >> 2, tid = lane & 3;
         const float sm_scale_log2e = sm_scale * LOG2E;
         const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
-        const int32_t* idx_base = indices + (size_t)s_i * TOPK;
+        const int32_t* idx_base = indices + (size_t)s_i * topk;
 
         if constexpr (BF16_QK) {
             load_q_bf16_to_smem<MT, MATH_THREADS>(
@@ -534,7 +534,7 @@ sparse_mla_prefill_kernel(
 static constexpr int MG_N_HG = 2;
 static constexpr int MG_HEADS_PER_CTA = MG_N_HG * HPB;  // 32
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
           bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_mg_kernel(
@@ -548,6 +548,7 @@ sparse_mla_prefill_mg_kernel(
 {
     const float sm_scale = cold.sm_scale;
     const int num_tokens = cold.num_tokens;
+    const int topk = cold.topk;
     constexpr int page_block_size = PAGE_BLOCK_SIZE;
     const size_t stride_kv_block = cold.stride_kv_block;
     using KV = KVCacheTraits<MT>;
@@ -555,8 +556,6 @@ sparse_mla_prefill_mg_kernel(
     using LMG = SmemLayoutMG<MT, CM, BF16_QK>;
     using IO = KVIOTraits<MT>;
     using SMG = SmemPtrsMG<MT, CM, BF16_QK>;
-
-    static constexpr int NI = TOPK / BI;
     static constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA;
     static constexpr int QK_NOPE_KSTEPS = KV::QUANT_TILE / 32;
 
@@ -565,7 +564,7 @@ sparse_mla_prefill_mg_kernel(
     const int h_start = h_tile * MG_HEADS_PER_CTA;
     if (s_i >= num_tokens) return;
 
-    const int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK;
+    const int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : topk;
     const int actual_ni = (topk_len + BI - 1) / BI;
 
     const int warp_rank = threadIdx.x / 32;
@@ -585,7 +584,7 @@ sparse_mla_prefill_mg_kernel(
         asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
 
         const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
-        const int32_t* idx_base = indices + (size_t)s_i * TOPK;
+        const int32_t* idx_base = indices + (size_t)s_i * topk;
         const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
         io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
@@ -620,7 +619,7 @@ sparse_mla_prefill_mg_kernel(
         const int mwarp = warp_rank;
         const int gid = lane >> 2, tid = lane & 3;
         const float sm_scale_log2e = sm_scale * LOG2E;
-        const int32_t* idx_base = indices + (size_t)s_i * TOPK;
+        const int32_t* idx_base = indices + (size_t)s_i * topk;
 
         // ── Quantize Q for both groups (serial, reuse reduce_buf) ───
         #pragma unroll

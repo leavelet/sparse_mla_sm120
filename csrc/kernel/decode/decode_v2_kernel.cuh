@@ -49,7 +49,7 @@ struct DecodeV2ColdParams {
     size_t stride_extra_kv_block;  // extra cache block stride
 };
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
           bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_decode_v2_kernel(

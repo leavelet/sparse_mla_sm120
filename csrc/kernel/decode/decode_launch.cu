@@ -3,9 +3,10 @@
 
 // ============================================================================
 // Scheduler-driven split-KV decode (V2) — launch helpers and dispatch.
+// TOPK is runtime (passed via DecodeV2ColdParams), not a template parameter.
 // ============================================================================
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
           bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 void launch_decode_v2(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
@@ -25,7 +26,7 @@ void launch_decode_v2(
     constexpr size_t smem_bytes = SmemLayout<MT, CM, BF16_QK>::TOTAL;
     constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
 
-    auto kernel = sparse_mla_decode_v2_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, BF16_QK>;
+    auto kernel = sparse_mla_decode_v2_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE, BF16_QK>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -87,10 +88,8 @@ void sparse_mla_splitkv_v2_launch_v32(
     size_t stride_la_split = (size_t)s_q * num_heads;
     size_t stride_la_sq = (size_t)num_heads;
 
-    TORCH_CHECK(topk == 2048, "V32 decode v2 requires topk=2048");
-
     #define DISPATCH_V2(NH) \
-        launch_decode_v2<ModelType::V32, ComputeMode::FP8, NH, 2048, 1>( \
+        launch_decode_v2<ModelType::V32, ComputeMode::FP8, NH, 1>( \
             Q_ptr, KV_ptr, idx_ptr, extra_kv, extra_idx, \
             OA_ptr, LA_ptr, O_ptr, LSE_ptr, \
             meta_ptr, ns_ptr, sm_scale, num_batches, s_q, topk, \
@@ -143,9 +142,9 @@ void sparse_mla_splitkv_v2_launch_model1(
 
     TORCH_CHECK(page_block_size == 64, "MODEL1 decode v2: page_block_size must be 64");
 
-    #define DISPATCH_V2(NH, TK) \
+    #define DISPATCH_V2(NH) \
         if (bf16_qk) { \
-            launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, true>( \
+            launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, 64, true>( \
                 Q_ptr, KV_ptr, idx_ptr, extra_kv, extra_idx, \
                 OA_ptr, LA_ptr, O_ptr, LSE_ptr, \
                 meta_ptr, ns_ptr, sm_scale, num_batches, s_q, topk, \
@@ -154,7 +153,7 @@ void sparse_mla_splitkv_v2_launch_model1(
                 attn_sink, topk_length_ptr, extra_topk, extra_topk_length_ptr, \
                 stride_extra, stream); \
         } else { \
-            launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, false>( \
+            launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, 64, false>( \
                 Q_ptr, KV_ptr, idx_ptr, extra_kv, extra_idx, \
                 OA_ptr, LA_ptr, O_ptr, LSE_ptr, \
                 meta_ptr, ns_ptr, sm_scale, num_batches, s_q, topk, \
@@ -164,22 +163,12 @@ void sparse_mla_splitkv_v2_launch_model1(
                 stride_extra, stream); \
         }
 
-    if (topk == 512) {
-        switch (num_heads) {
-        case 8:   DISPATCH_V2(8, 512); break;
-        case 64:  DISPATCH_V2(64, 512); break;
-        case 128: DISPATCH_V2(128, 512); break;
-        default:  TORCH_CHECK(false, "MODEL1 decode v2: unsupported num_heads=", num_heads);
-        }
-    } else if (topk == 1024) {
-        switch (num_heads) {
-        case 16:  DISPATCH_V2(16, 1024); break;
-        case 64:  DISPATCH_V2(64, 1024); break;
-        case 128: DISPATCH_V2(128, 1024); break;
-        default:  TORCH_CHECK(false, "MODEL1 decode v2: unsupported num_heads=", num_heads);
-        }
-    } else {
-        TORCH_CHECK(false, "MODEL1 decode v2: unsupported topk=", topk);
+    switch (num_heads) {
+    case 8:   DISPATCH_V2(8); break;
+    case 16:  DISPATCH_V2(16); break;
+    case 64:  DISPATCH_V2(64); break;
+    case 128: DISPATCH_V2(128); break;
+    default:  TORCH_CHECK(false, "MODEL1 decode v2: unsupported num_heads=", num_heads);
     }
     #undef DISPATCH_V2
 }
