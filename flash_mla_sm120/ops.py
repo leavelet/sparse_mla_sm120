@@ -15,7 +15,7 @@ def _compute_decode_splits(num_tokens, num_heads, topk):
     bi = 64
     ni = topk // bi
 
-    replicate_h = num_heads // hpb
+    replicate_h = (num_heads + hpb - 1) // hpb
     ctas_per_split = num_tokens * replicate_h
 
     target_total_ctas = 128
@@ -35,6 +35,7 @@ def sparse_mla_decode_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    attn_sink: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sparse MLA decode forward: splitkv + combine.
 
@@ -80,7 +81,7 @@ def sparse_mla_decode_fwd(
         (num_tokens, num_heads),
         dtype=torch.float32, device=q.device,
     )
-    _C.sparse_mla_combine_fwd(partial_O, partial_LSE, output, lse, nsplits)
+    _C.sparse_mla_combine_fwd(partial_O, partial_LSE, output, lse, nsplits, attn_sink)
 
     return output, lse
 
@@ -91,6 +92,8 @@ def sparse_mla_prefill_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    attn_sink: torch.Tensor = None,
+    topk_length: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     _C = _load_lib()
     num_tokens, num_heads, d_qk = q.shape
@@ -112,6 +115,7 @@ def sparse_mla_prefill_fwd(
     _C.sparse_mla_prefill_fwd(
         q, kv_cache, indices, output, lse,
         sm_scale, topk, stride_kv_row, page_block_size,
+        attn_sink, topk_length,
     )
     return output, lse
 
@@ -122,8 +126,10 @@ def sparse_mla_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    attn_sink: torch.Tensor = None,
+    topk_length: torch.Tensor = None,
 ):
     num_tokens = q.shape[0]
     if num_tokens <= _DECODE_THRESHOLD:
-        return sparse_mla_decode_fwd(q, kv_cache, indices, sm_scale, d_v)
-    return sparse_mla_prefill_fwd(q, kv_cache, indices, sm_scale, d_v)
+        return sparse_mla_decode_fwd(q, kv_cache, indices, sm_scale, d_v, attn_sink)
+    return sparse_mla_prefill_fwd(q, kv_cache, indices, sm_scale, d_v, attn_sink, topk_length)

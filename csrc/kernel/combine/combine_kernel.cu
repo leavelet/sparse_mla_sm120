@@ -31,6 +31,7 @@ struct CombineParams {
     float* out_lse;
     int num_heads;
     int nsplits;
+    const float* attn_sink;  // [num_heads] float32, natural log domain. nullptr = disabled.
 };
 
 template <int MAX_SPLITS>
@@ -124,6 +125,15 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     // Global LSE and per-split scale factors
     float global_lse = (sum_lse > 0.f) ? (log2f(sum_lse) + max_lse) : -1e30f;
 
+    // Merge attn_sink LSE (MODEL1 V4): logsumexp(global_lse, attn_sink)
+    if (params.attn_sink != nullptr) {
+        float sink_log2 = __ldg(params.attn_sink + h) * LOG2E;
+        if (global_lse != -1e30f)
+            global_lse += log2f(1.f + exp2f(sink_log2 - global_lse));
+        else
+            global_lse = sink_log2;
+    }
+
     if (lane_idx == 0) {
         size_t lse_out_idx = (size_t)token_idx * num_heads + h;
         out_lse[lse_out_idx] = global_lse;
@@ -207,6 +217,7 @@ void sparse_mla_combine_launch(
     torch::Tensor output,
     torch::Tensor out_lse,
     int nsplits,
+    c10::optional<torch::Tensor> attn_sink,
     cudaStream_t stream)
 {
     int num_tokens = partial_O.size(0);
@@ -228,7 +239,8 @@ void sparse_mla_combine_launch(
             partial_LSE.data_ptr<float>(),
             reinterpret_cast<bf16*>(output.data_ptr()),
             out_lse.data_ptr<float>(),
-            num_heads, nsplits
+            num_heads, nsplits,
+            attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr
         };
 
         cudaLaunchAttribute attrs[1];

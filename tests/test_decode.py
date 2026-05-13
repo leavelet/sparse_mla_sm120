@@ -224,6 +224,7 @@ class TestV32Decode:
         (128, 1), (128, 4),   # V3.2 TP1
         (16, 1), (16, 4),     # V3.2 TP8
         (64, 1), (64, 4),     # GLM 5.1 TP1
+        (8, 1),  (8, 4),      # GLM 5.1 TP8
     ])
     def test_correctness(self, num_heads, batch_size):
         max_err, mean_err = run_decode_test(
@@ -239,7 +240,9 @@ class TestMODEL1Decode:
     """DeepSeek V4 Flash/Pro (d_qk=512, 584B/token)"""
 
     @pytest.mark.parametrize("num_heads,topk,batch_size", [
+        (8, 512, 1),   (8, 512, 4),     # V4 Flash TP8
         (64, 512, 1),  (64, 512, 4),    # V4 Flash TP1
+        (16, 1024, 1), (16, 1024, 4),   # V4 Pro TP8
         (128, 1024, 1), (128, 1024, 4),  # V4 Pro TP1
     ])
     def test_correctness(self, num_heads, topk, batch_size):
@@ -249,6 +252,129 @@ class TestMODEL1Decode:
         print(f"\n  MODEL1 h={num_heads} topk={topk} bs={batch_size}: "
               f"max_err={max_err:.6f} mean_err={mean_err:.6f}")
         assert max_err < 0.001, f"MODEL1 decode failed: max_err={max_err}"
+
+
+# ── attn_sink Tests (MODEL1 only) ───────────────────────────────────
+
+def run_decode_attn_sink_test(num_heads, topk, batch_size, attn_sink_mode="random",
+                               block_size=64, num_blocks=64, seed=42):
+    """Run decode with attn_sink and compare to reference.
+
+    attn_sink_mode: "random", "neg_inf" (no effect), "large_pos" (dominates),
+                    "zero", "mixed" (half heads large, half small)
+    """
+    torch.manual_seed(seed)
+    d_qk, d_v = 512, 512
+    sm_scale = d_qk ** -0.5
+    s_kv = num_blocks * block_size
+
+    kv_bf16 = (torch.randn(num_blocks, block_size, 1, d_qk,
+                            device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    kv_packed = quantize_kv_model1(kv_bf16)
+    kv_dequant = dequantize_kv_model1(kv_packed)
+
+    q = (torch.randn(batch_size, 1, num_heads, d_qk,
+                      device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    indices = torch.randint(0, s_kv, (batch_size, 1, topk),
+                             device="cuda", dtype=torch.int32)
+    indices[:, :, -10:] = -1
+
+    if attn_sink_mode == "random":
+        attn_sink = torch.randn(num_heads, device="cuda", dtype=torch.float32) * 2.0
+    elif attn_sink_mode == "neg_inf":
+        attn_sink = torch.full((num_heads,), float("-inf"), device="cuda", dtype=torch.float32)
+    elif attn_sink_mode == "large_pos":
+        attn_sink = torch.full((num_heads,), 20.0, device="cuda", dtype=torch.float32)
+    elif attn_sink_mode == "zero":
+        attn_sink = torch.zeros(num_heads, device="cuda", dtype=torch.float32)
+    elif attn_sink_mode == "mixed":
+        attn_sink = torch.zeros(num_heads, device="cuda", dtype=torch.float32)
+        attn_sink[:num_heads // 2] = 15.0
+        attn_sink[num_heads // 2:] = -15.0
+    else:
+        raise ValueError(f"Unknown mode: {attn_sink_mode}")
+
+    ref_out, ref_lse = ref_sparse_attn_decode(q, kv_dequant, indices, sm_scale, d_v)
+    ref_lse_f = ref_lse.float()
+    sink_f = attn_sink.view(1, 1, num_heads)
+    scale = 1.0 / (1.0 + torch.exp(sink_f - ref_lse_f))
+    ref_out_sink = (ref_out.float() * scale.unsqueeze(-1)).to(torch.bfloat16)
+
+    q_flat = q.view(-1, num_heads, d_qk)
+    idx_flat = indices.view(-1, topk)
+    out, lse = flash_mla_sm120.sparse_mla_decode_fwd(
+        q_flat, kv_packed, idx_flat, sm_scale, d_v, attn_sink)
+    out = out.view_as(ref_out_sink)
+
+    err = (out.float() - ref_out_sink.float()).abs()
+    max_err = err.max().item()
+    mean_err = err.mean().item()
+    return max_err, mean_err
+
+
+class TestAttnSinkDecode:
+    """Test attn_sink LSE merge in combine kernel — comprehensive coverage."""
+
+    @pytest.mark.parametrize("num_heads,topk,batch_size", [
+        (64, 512, 1),    (64, 512, 4),    (64, 512, 8),
+        (128, 1024, 1),  (128, 1024, 4),  (128, 1024, 8),
+        (16, 1024, 1),   (16, 1024, 4),    # TP8 Pro config
+    ])
+    def test_random_sink(self, num_heads, topk, batch_size):
+        max_err, mean_err = run_decode_attn_sink_test(
+            num_heads, topk, batch_size, "random")
+        print(f"\n  attn_sink random h={num_heads} topk={topk} bs={batch_size}: "
+              f"max_err={max_err:.6f} mean_err={mean_err:.6f}")
+        assert max_err < 0.002, f"max_err={max_err}"
+
+    @pytest.mark.parametrize("num_heads,topk", [
+        (64, 512), (128, 1024),
+    ])
+    def test_neg_inf_sink(self, num_heads, topk):
+        """attn_sink = -inf should have no effect (same as no sink)."""
+        max_err_nosink, _ = run_decode_test(
+            "MODEL1", d_qk=512, d_v=512, topk=topk,
+            num_heads=num_heads, batch_size=1)
+        max_err_sink, _ = run_decode_attn_sink_test(
+            num_heads, topk, 1, "neg_inf")
+        print(f"\n  attn_sink -inf h={num_heads}: nosink_err={max_err_nosink:.6f} "
+              f"sink_err={max_err_sink:.6f}")
+        assert max_err_sink < 0.001, f"max_err={max_err_sink}"
+
+    @pytest.mark.parametrize("num_heads,topk", [
+        (64, 512), (128, 1024),
+    ])
+    def test_large_pos_sink(self, num_heads, topk):
+        """Large positive attn_sink should suppress sparse attention output toward 0."""
+        max_err, _ = run_decode_attn_sink_test(
+            num_heads, topk, 1, "large_pos")
+        print(f"\n  attn_sink large_pos h={num_heads}: max_err={max_err:.6f}")
+        assert max_err < 0.002, f"max_err={max_err}"
+
+    @pytest.mark.parametrize("num_heads,topk", [
+        (64, 512), (128, 1024),
+    ])
+    def test_zero_sink(self, num_heads, topk):
+        max_err, _ = run_decode_attn_sink_test(num_heads, topk, 1, "zero")
+        print(f"\n  attn_sink zero h={num_heads}: max_err={max_err:.6f}")
+        assert max_err < 0.002, f"max_err={max_err}"
+
+    @pytest.mark.parametrize("num_heads,topk", [
+        (64, 512), (128, 1024),
+    ])
+    def test_mixed_sink(self, num_heads, topk):
+        """Half heads large sink, half small — tests per-head independence."""
+        max_err, _ = run_decode_attn_sink_test(num_heads, topk, 4, "mixed")
+        print(f"\n  attn_sink mixed h={num_heads}: max_err={max_err:.6f}")
+        assert max_err < 0.002, f"max_err={max_err}"
+
+    def test_race_check(self):
+        """Run 3x with different seeds to catch non-deterministic races."""
+        for seed in [42, 123, 999]:
+            max_err, _ = run_decode_attn_sink_test(
+                128, 1024, 4, "random", seed=seed)
+            assert max_err < 0.002, f"race check seed={seed}: max_err={max_err}"
+        print("\n  attn_sink race check (3 seeds): PASS")
 
 
 if __name__ == "__main__":

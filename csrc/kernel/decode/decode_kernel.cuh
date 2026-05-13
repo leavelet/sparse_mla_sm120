@@ -53,8 +53,11 @@ sparse_mla_decode_kernel(
 
     static constexpr int NI = TOPK / BI;
     static constexpr int NSPLITS = NI / TILES_PER_SPLIT;
-    static constexpr int REPLICATE_H = NUM_HEADS / HPB;
+    static constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
     static constexpr int QK_NOPE_KSTEPS = KV::QUANT_TILE / 32;
+
+    static constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
+    static_assert(NUM_HEADS % VALID_HPB == 0, "NUM_HEADS must be a multiple of VALID_HPB");
 
     const int s_i = blockIdx.x / REPLICATE_H;
     const int h_tile = blockIdx.x % REPLICATE_H;
@@ -123,7 +126,7 @@ sparse_mla_decode_kernel(
         const int32_t* idx_base = indices + (size_t)s_i * TOPK + split_idx * tile_start_stride;
 
         quantize_q_to_smem<MT, MATH_THREADS>(
-            sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, sm.reduce_buf);
+            sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, sm.reduce_buf, VALID_HPB);
         QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
         for (int h = threadIdx.x; h < HPB; h += MATH_THREADS)
@@ -435,7 +438,7 @@ sparse_mla_decode_kernel(
                                  + (size_t)h_start * h_stride;
             constexpr int FLOATS_PER_WIDE_STORE = 8;  // v8.b32 = 256-bit for L2::evict_last
             constexpr int WIDE_STORES_PER_HEAD = D_V / FLOATS_PER_WIDE_STORE;  // 64
-            for (int idx = threadIdx.x; idx < HPB * WIDE_STORES_PER_HEAD; idx += MATH_THREADS) {
+            for (int idx = threadIdx.x; idx < VALID_HPB * WIDE_STORES_PER_HEAD; idx += MATH_THREADS) {
                 int h = idx / WIDE_STORES_PER_HEAD;
                 int d8 = (idx - h * WIDE_STORES_PER_HEAD) * FLOATS_PER_WIDE_STORE;
                 float4 v0 = *reinterpret_cast<const float4*>(
@@ -447,7 +450,7 @@ sparse_mla_decode_kernel(
         }
 
         // Write partial_LSE
-        if (threadIdx.x < HPB) {
+        if (threadIdx.x < VALID_HPB) {
             int h = threadIdx.x;
             float lse = softmax_lse(sm.m_smem[h], sm.l_smem[h]);
             constexpr size_t lse_split_stride = (size_t)NUM_HEADS;
