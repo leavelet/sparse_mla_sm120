@@ -72,6 +72,8 @@ void sparse_mla_prefill_launch_v32(
     const float* attn_sink_ptr,
     const int* topk_length_ptr,
     float* out_max_logits_ptr,
+    const uint8_t* extra_kv, const int32_t* extra_idx,
+    int extra_topk, int extra_page_block_size, int extra_stride_kv_row,
     cudaStream_t stream);
 
 void sparse_mla_prefill_launch_model1(
@@ -83,6 +85,8 @@ void sparse_mla_prefill_launch_model1(
     const int* topk_length_ptr,
     bool bf16_qk,
     float* out_max_logits_ptr,
+    const uint8_t* extra_kv, const int32_t* extra_idx,
+    int extra_topk, int extra_page_block_size, int extra_stride_kv_row,
     cudaStream_t stream);
 
 // ── Python-facing functions ─────────────────────────────────────────
@@ -191,7 +195,10 @@ void sparse_mla_prefill_fwd(
     c10::optional<torch::Tensor> attn_sink,
     c10::optional<torch::Tensor> topk_length,
     bool bf16_qk,
-    c10::optional<torch::Tensor> out_max_logits)
+    c10::optional<torch::Tensor> out_max_logits,
+    c10::optional<torch::Tensor> extra_k_cache,
+    c10::optional<torch::Tensor> extra_indices_t,
+    int extra_topk)
 {
     TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Q must be bf16");
     TORCH_CHECK(Q.is_cuda() && KV_cache.is_cuda() && indices.is_cuda());
@@ -213,19 +220,28 @@ void sparse_mla_prefill_fwd(
     const float* sink_ptr = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
     const int* tl_ptr = topk_length.has_value() ? topk_length->data_ptr<int>() : nullptr;
     float* ml_ptr = out_max_logits.has_value() ? out_max_logits->data_ptr<float>() : nullptr;
+    const uint8_t* extra_kv = extra_k_cache.has_value()
+        ? reinterpret_cast<const uint8_t*>(extra_k_cache->data_ptr()) : nullptr;
+    const int32_t* extra_idx = extra_indices_t.has_value()
+        ? extra_indices_t->data_ptr<int32_t>() : nullptr;
+    int extra_pbs = extra_k_cache.has_value() ? (int)extra_k_cache->size(-3) : 1;
+    int extra_stride = extra_k_cache.has_value()
+        ? (int)(extra_k_cache->stride(-2) * extra_k_cache->element_size()) : 0;
 
     switch (mt) {
     case ModelType::V32:
         sparse_mla_prefill_launch_v32(
             Q, KV_cache, indices, output, out_lse,
             sm_scale, num_heads, num_tokens, topk,
-            page_block_size, stride_kv_row, sink_ptr, tl_ptr, ml_ptr, stream);
+            page_block_size, stride_kv_row, sink_ptr, tl_ptr, ml_ptr,
+            extra_kv, extra_idx, extra_topk, extra_pbs, extra_stride, stream);
         break;
     case ModelType::MODEL1:
         sparse_mla_prefill_launch_model1(
             Q, KV_cache, indices, output, out_lse,
             sm_scale, num_heads, num_tokens, topk,
-            page_block_size, stride_kv_row, sink_ptr, tl_ptr, bf16_qk, ml_ptr, stream);
+            page_block_size, stride_kv_row, sink_ptr, tl_ptr, bf16_qk, ml_ptr,
+            extra_kv, extra_idx, extra_topk, extra_pbs, extra_stride, stream);
         break;
     }
 }
@@ -270,5 +286,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("attn_sink") = py::none(),
           py::arg("topk_length") = py::none(),
           py::arg("bf16_qk") = true,
-          py::arg("out_max_logits") = py::none());
+          py::arg("out_max_logits") = py::none(),
+          py::arg("extra_k_cache") = py::none(),
+          py::arg("extra_indices") = py::none(),
+          py::arg("extra_topk") = 0);
 }

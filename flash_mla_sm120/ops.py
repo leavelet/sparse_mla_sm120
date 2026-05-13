@@ -129,6 +129,9 @@ def sparse_mla_prefill_fwd(
     topk_length: Optional[torch.Tensor] = None,
     bf16_qk: bool = True,
     out: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _C = _load_lib()
     num_tokens, num_heads, d_qk = q.shape
@@ -157,6 +160,7 @@ def sparse_mla_prefill_fwd(
         q, kv_cache, indices, output, lse,
         sm_scale, topk, stride_kv_row, page_block_size,
         attn_sink, topk_length, bf16_qk, max_logits,
+        extra_k_cache, extra_indices, extra_topk,
     )
     return output, max_logits, lse
 
