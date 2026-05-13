@@ -88,5 +88,119 @@ class TestMODEL1Prefill:
         assert max_err < 0.001, f"MODEL1 prefill failed: max_err={max_err}"
 
 
+# ── attn_sink Prefill Tests (MODEL1 only) ───────────────────────────
+
+def run_prefill_attn_sink_test(num_heads, topk, num_tokens, attn_sink_mode="random",
+                                block_size=64, num_blocks=64, seed=42):
+    torch.manual_seed(seed)
+    d_qk, d_v = 512, 512
+    sm_scale = d_qk ** -0.5
+    s_kv = num_blocks * block_size
+
+    kv_bf16 = (torch.randn(num_blocks, block_size, 1, d_qk,
+                            device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    kv_packed = quantize_kv_model1(kv_bf16)
+    kv_dequant = dequantize_kv_model1(kv_packed)
+
+    q = (torch.randn(num_tokens, 1, num_heads, d_qk,
+                      device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    indices = torch.randint(0, s_kv, (num_tokens, 1, topk),
+                             device="cuda", dtype=torch.int32)
+    indices[:, :, -10:] = -1
+
+    if attn_sink_mode == "random":
+        attn_sink = torch.randn(num_heads, device="cuda", dtype=torch.float32) * 2.0
+    elif attn_sink_mode == "neg_inf":
+        attn_sink = torch.full((num_heads,), float("-inf"), device="cuda", dtype=torch.float32)
+    elif attn_sink_mode == "large_pos":
+        attn_sink = torch.full((num_heads,), 20.0, device="cuda", dtype=torch.float32)
+    elif attn_sink_mode == "zero":
+        attn_sink = torch.zeros(num_heads, device="cuda", dtype=torch.float32)
+    elif attn_sink_mode == "mixed":
+        attn_sink = torch.zeros(num_heads, device="cuda", dtype=torch.float32)
+        attn_sink[:num_heads // 2] = 15.0
+        attn_sink[num_heads // 2:] = -15.0
+    else:
+        raise ValueError(f"Unknown mode: {attn_sink_mode}")
+
+    ref_out, ref_lse = ref_sparse_attn_decode(q, kv_dequant, indices, sm_scale, d_v)
+    ref_lse_f = ref_lse.float()
+    sink_f = attn_sink.view(1, 1, num_heads)
+    scale = 1.0 / (1.0 + torch.exp(sink_f - ref_lse_f))
+    ref_out_sink = (ref_out.float() * scale.unsqueeze(-1)).to(torch.bfloat16)
+
+    q_flat = q.view(-1, num_heads, d_qk)
+    idx_flat = indices.view(-1, topk)
+    out, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
+        q_flat, kv_packed, idx_flat, sm_scale, d_v, attn_sink)
+    out = out.view_as(ref_out_sink)
+
+    err = (out.float() - ref_out_sink.float()).abs()
+    max_err = err.max().item()
+    mean_err = err.mean().item()
+    return max_err, mean_err
+
+
+class TestAttnSinkPrefill:
+    """Test attn_sink in prefill kernel epilogue — comprehensive coverage."""
+
+    @pytest.mark.parametrize("num_heads,topk,num_tokens", [
+        (64, 512, 65),     (64, 512, 128),   (64, 512, 256),
+        (128, 1024, 65),   (128, 1024, 128),  (128, 1024, 256),
+    ])
+    def test_random_sink(self, num_heads, topk, num_tokens):
+        max_err, mean_err = run_prefill_attn_sink_test(
+            num_heads, topk, num_tokens, "random")
+        print(f"\n  prefill sink random h={num_heads} topk={topk} tok={num_tokens}: "
+              f"max_err={max_err:.6f} mean_err={mean_err:.6f}")
+        assert max_err < 0.002, f"max_err={max_err}"
+
+    @pytest.mark.parametrize("num_heads,topk", [
+        (64, 512), (128, 1024),
+    ])
+    def test_neg_inf_sink(self, num_heads, topk):
+        """attn_sink = -inf should have no effect."""
+        max_err_nosink, _ = run_prefill_test(
+            "MODEL1", d_qk=512, d_v=512, topk=topk,
+            num_heads=num_heads, num_tokens=65)
+        max_err_sink, _ = run_prefill_attn_sink_test(
+            num_heads, topk, 65, "neg_inf")
+        print(f"\n  prefill sink -inf h={num_heads}: nosink={max_err_nosink:.6f} "
+              f"sink={max_err_sink:.6f}")
+        assert max_err_sink < 0.001, f"max_err={max_err_sink}"
+
+    @pytest.mark.parametrize("num_heads,topk", [
+        (64, 512), (128, 1024),
+    ])
+    def test_large_pos_sink(self, num_heads, topk):
+        max_err, _ = run_prefill_attn_sink_test(num_heads, topk, 65, "large_pos")
+        print(f"\n  prefill sink large_pos h={num_heads}: max_err={max_err:.6f}")
+        assert max_err < 0.002, f"max_err={max_err}"
+
+    @pytest.mark.parametrize("num_heads,topk", [
+        (64, 512), (128, 1024),
+    ])
+    def test_zero_sink(self, num_heads, topk):
+        max_err, _ = run_prefill_attn_sink_test(num_heads, topk, 65, "zero")
+        print(f"\n  prefill sink zero h={num_heads}: max_err={max_err:.6f}")
+        assert max_err < 0.002, f"max_err={max_err}"
+
+    @pytest.mark.parametrize("num_heads,topk", [
+        (64, 512), (128, 1024),
+    ])
+    def test_mixed_sink(self, num_heads, topk):
+        max_err, _ = run_prefill_attn_sink_test(num_heads, topk, 100, "mixed")
+        print(f"\n  prefill sink mixed h={num_heads}: max_err={max_err:.6f}")
+        assert max_err < 0.002, f"max_err={max_err}"
+
+    def test_race_check(self):
+        """Run 3x with different seeds."""
+        for seed in [42, 123, 999]:
+            max_err, _ = run_prefill_attn_sink_test(
+                128, 1024, 100, "random", seed=seed)
+            assert max_err < 0.002, f"race check seed={seed}: max_err={max_err}"
+        print("\n  prefill attn_sink race check (3 seeds): PASS")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

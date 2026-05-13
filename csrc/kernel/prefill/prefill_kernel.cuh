@@ -38,6 +38,9 @@ struct PrefillColdParams {
     // Used only by the MG kernel when TOPK_EXTRA > 0 (dual-cache); the SG
     // kernel and single-cache MG path ignore it.
     size_t stride_kv_block_extra;
+    const float* attn_sink;  // [NUM_HEADS] float32, natural log domain. nullptr = disabled.
+    const int* topk_length;  // [num_tokens] int32, nullptr = uniform TOPK.
+    const int* topk_length_extra;  // [num_tokens] int32, dual-cache only. nullptr = uniform TOPK_EXTRA.
 };
 
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
@@ -69,6 +72,9 @@ sparse_mla_prefill_kernel(
     const int h_start = h_tile * HPB;
     if (s_i >= num_tokens) return;
 
+    const int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK;
+    const int actual_ni = (topk_len + BI - 1) / BI;
+
     const int warp_rank = threadIdx.x / 32;
     const int wy = warp_rank / 4;
 
@@ -99,8 +105,8 @@ sparse_mla_prefill_kernel(
         __threadfence_block();
 
         #pragma unroll 1
-        for (int ti = 0; ti < NI; ti++) {
-            if (ti + 1 < NI) {
+        for (int ti = 0; ti < actual_ni; ti++) {
+            if (ti + 1 < actual_ni) {
                 io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
                     sm.kv_bufs[(ti + 1) & 1],
                     idx_base + (ti + 1) * BI, KV_cache,
@@ -146,7 +152,7 @@ sparse_mla_prefill_kernel(
 
         // ── Main loop — QK + softmax + XV ───────────────────────────
         #pragma unroll 1
-        for (int ti = 0; ti < NI; ti++) {
+        for (int ti = 0; ti < actual_ni; ti++) {
             uint8_t* kv_smem = sm.kv_bufs[ti & 1];
             const int32_t* ib = idx_base + ti * BI;
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
@@ -208,11 +214,16 @@ sparse_mla_prefill_kernel(
             // ── QK rope (BF16 MMA, uses prefetched B operands) ──────
             compute_qk_rope(qk, q_rope_regs, rope_pf);
 
-            // ── Invalid index masking ──────────────────────────────
+            // ── Invalid index masking + topk_length overflow ─────
             {
                 int e0 = qk_nb + tid * 2, e1 = e0 + 1;
                 if (ib[e0] < 0) { qk[0] = -1e30f; qk[2] = -1e30f; }
                 if (ib[e1] < 0) { qk[1] = -1e30f; qk[3] = -1e30f; }
+                if (cold.topk_length != nullptr) {
+                    int a0 = ti * BI + e0, a1 = ti * BI + e1;
+                    if (a0 >= topk_len) { qk[0] = -1e30f; qk[2] = -1e30f; }
+                    if (a1 >= topk_len) { qk[1] = -1e30f; qk[3] = -1e30f; }
+                }
             }
 
             // ── Online softmax (deferred sum, conditional rescale) ──
@@ -349,6 +360,9 @@ sparse_mla_prefill_kernel(
                 }
             }
 
+            if constexpr (!KV::V_HAS_ROPE)
+                bar_sync_t<2, MATH_THREADS>();
+
             // ── XV rope BF16 MMA (MODEL1 only) ─────────────────────
             if constexpr (KV::V_HAS_ROPE) {
                 bar_sync_t<2, MATH_THREADS>();
@@ -359,7 +373,7 @@ sparse_mla_prefill_kernel(
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();
-            if (ti + 1 < NI) {
+            if (ti + 1 < actual_ni) {
                 const int next_phase = ((ti + 1) >> 1) & 1;
                 mbarrier_wait_parity(sm.mbar_kv + ((ti + 1) & 1), next_phase);
             }
@@ -382,8 +396,18 @@ sparse_mla_prefill_kernel(
         bar_sync_t<2, MATH_THREADS>();
 
         // ── Write BF16 output and LSE ────────────────────────────────
-        float il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
-        float il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
+        float il0, il1;
+        if (cold.attn_sink != nullptr) {
+            float s0 = __ldg(cold.attn_sink + h_start + gid) * LOG2E;
+            float s1 = __ldg(cold.attn_sink + h_start + gid + 8) * LOG2E;
+            float denom0 = sm.l_smem[gid] + exp2f(s0 - sm.m_smem[gid]);
+            float denom1 = sm.l_smem[gid + 8] + exp2f(s1 - sm.m_smem[gid + 8]);
+            il0 = (denom0 > 0.f) ? (1.f / denom0) : 0.f;
+            il1 = (denom1 > 0.f) ? (1.f / denom1) : 0.f;
+        } else {
+            il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
+            il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
+        }
 
         // attn_sink scaling (same convention as MG kernel above).
         if (attn_sink != nullptr) {
@@ -441,10 +465,17 @@ sparse_mla_prefill_kernel(
             }
         }
 
-        // Write LSE
+        // Write LSE (merged with attn_sink if present)
         if (threadIdx.x < HPB) {
             int h = threadIdx.x;
             float lse = softmax_lse(sm.m_smem[h], sm.l_smem[h]);
+            if (cold.attn_sink != nullptr) {
+                float sink_log2 = __ldg(cold.attn_sink + h_start + h) * LOG2E;
+                if (lse != -1e30f)
+                    lse += log2f(1.f + exp2f(sink_log2 - lse));
+                else
+                    lse = sink_log2;
+            }
             size_t lse_idx = (size_t)s_i * NUM_HEADS + h_start + h;
             out_lse[lse_idx] = lse;
         }
@@ -509,6 +540,11 @@ sparse_mla_prefill_mg_kernel(
     const int h_start = h_tile * MG_HEADS_PER_CTA;
     if (s_i >= num_tokens) return;
 
+    const int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK;
+    const int actual_ni = (topk_len + BI - 1) / BI;
+    const int topk_len_extra = (TOPK_EXTRA == 0) ? 0
+        : (cold.topk_length_extra ? __ldg(cold.topk_length_extra + s_i) : TOPK_EXTRA);
+
     const int warp_rank = threadIdx.x / 32;
     const int wy = warp_rank / 4;
 
@@ -553,9 +589,13 @@ sparse_mla_prefill_mg_kernel(
             sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid, stride_kv_block);
         __threadfence_block();
 
+        // For dual-cache (TOPK_EXTRA > 0) we always iterate NI_TOTAL — topk_length
+        // masking happens at the QK stage. For single-cache, short-circuit at
+        // actual_ni (saves IO bandwidth when topk_length < TOPK).
+        const int loop_bound = (TOPK_EXTRA == 0) ? actual_ni : NI_TOTAL;
         #pragma unroll 1
-        for (int ti = 0; ti < NI_TOTAL; ti++) {
-            if (ti + 1 < NI_TOTAL) {
+        for (int ti = 0; ti < loop_bound; ti++) {
+            if (ti + 1 < loop_bound) {
                 const uint8_t* next_kv = tile_kv_ptr(ti + 1);
                 const size_t   next_stride = tile_stride(ti + 1);
                 const int32_t* next_idx = tile_idx_ptr(ti + 1);
@@ -663,8 +703,11 @@ sparse_mla_prefill_mg_kernel(
         mbarrier_wait_parity(sm.mbar_kv + 0, 0);
 
         // ── Main loop ───────────────────────────────────────────────
+        // Same loop_bound rule as IO: dual-cache iterates NI_TOTAL (mask via QK),
+        // single-cache short-circuits at actual_ni.
+        const int math_loop_bound = (TOPK_EXTRA == 0) ? actual_ni : NI_TOTAL;
         #pragma unroll 1
-        for (int ti = 0; ti < NI_TOTAL; ti++) {
+        for (int ti = 0; ti < math_loop_bound; ti++) {
             uint8_t* kv_smem = sm.kv_bufs[ti & 1];
             const int32_t* ib = tile_idx_ptr(ti);
             // Per-tile global KV pointer / stride. When TOPK_EXTRA == 0 these
@@ -738,11 +781,36 @@ sparse_mla_prefill_mg_kernel(
                 // QK rope (reuses prefetched B operands)
                 compute_qk_rope(qk, q_rope_regs[g], rope_pf);
 
-                // Invalid index masking
+                // Invalid index masking + topk_length overflow. For dual-cache
+                // (TOPK_EXTRA > 0): main-phase tiles (ti < NI) use topk_len
+                // against absolute index (ti * BI + e); extra-phase tiles
+                // (ti >= NI) use topk_len_extra against the relative index
+                // ((ti - NI) * BI + e).
                 {
                     int e0 = qk_nb + tid * 2, e1 = e0 + 1;
                     if (ib[e0] < 0) { qk[0] = -1e30f; qk[2] = -1e30f; }
                     if (ib[e1] < 0) { qk[1] = -1e30f; qk[3] = -1e30f; }
+                    if constexpr (TOPK_EXTRA == 0) {
+                        if (cold.topk_length != nullptr) {
+                            int a0 = ti * BI + e0, a1 = ti * BI + e1;
+                            if (a0 >= topk_len) { qk[0] = -1e30f; qk[2] = -1e30f; }
+                            if (a1 >= topk_len) { qk[1] = -1e30f; qk[3] = -1e30f; }
+                        }
+                    } else {
+                        if (ti < NI) {
+                            if (cold.topk_length != nullptr) {
+                                int a0 = ti * BI + e0, a1 = ti * BI + e1;
+                                if (a0 >= topk_len) { qk[0] = -1e30f; qk[2] = -1e30f; }
+                                if (a1 >= topk_len) { qk[1] = -1e30f; qk[3] = -1e30f; }
+                            }
+                        } else {
+                            if (cold.topk_length_extra != nullptr) {
+                                int a0 = (ti - NI) * BI + e0, a1 = (ti - NI) * BI + e1;
+                                if (a0 >= topk_len_extra) { qk[0] = -1e30f; qk[2] = -1e30f; }
+                                if (a1 >= topk_len_extra) { qk[1] = -1e30f; qk[3] = -1e30f; }
+                            }
+                        }
+                    }
                 }
 
                 float s[4] = { qk[0] * sm_scale_log2e, qk[1] * sm_scale_log2e,
@@ -892,6 +960,7 @@ sparse_mla_prefill_mg_kernel(
                         }
                     }
                 }
+                bar_sync_t<2, MATH_THREADS>();
             }
 
             // ── XV rope BF16 MMA (MODEL1, both groups) ──────────────
@@ -927,7 +996,7 @@ sparse_mla_prefill_mg_kernel(
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();
-            if (ti + 1 < NI_TOTAL) {
+            if (ti + 1 < math_loop_bound) {
                 const int next_phase = ((ti + 1) >> 1) & 1;
                 mbarrier_wait_parity(sm.mbar_kv + ((ti + 1) & 1), next_phase);
             }
@@ -963,10 +1032,23 @@ sparse_mla_prefill_mg_kernel(
 
         #pragma unroll
         for (int g = 0; g < MG_N_HG; g++) {
-            float il0 = (sm.l_smem[g * SMG::ML_GRP_STRIDE + gid] > 0.f)
-                ? (1.f / sm.l_smem[g * SMG::ML_GRP_STRIDE + gid]) : 0.f;
-            float il1 = (sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8] > 0.f)
-                ? (1.f / sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8]) : 0.f;
+            float il0, il1;
+            if (cold.attn_sink != nullptr) {
+                int h0 = h_start + g * HPB + gid, h1 = h0 + 8;
+                float s0 = __ldg(cold.attn_sink + h0) * LOG2E;
+                float s1 = __ldg(cold.attn_sink + h1) * LOG2E;
+                float d0 = sm.l_smem[g * SMG::ML_GRP_STRIDE + gid]
+                          + exp2f(s0 - sm.m_smem[g * SMG::ML_GRP_STRIDE + gid]);
+                float d1 = sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8]
+                          + exp2f(s1 - sm.m_smem[g * SMG::ML_GRP_STRIDE + gid + 8]);
+                il0 = (d0 > 0.f) ? (1.f / d0) : 0.f;
+                il1 = (d1 > 0.f) ? (1.f / d1) : 0.f;
+            } else {
+                il0 = (sm.l_smem[g * SMG::ML_GRP_STRIDE + gid] > 0.f)
+                    ? (1.f / sm.l_smem[g * SMG::ML_GRP_STRIDE + gid]) : 0.f;
+                il1 = (sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8] > 0.f)
+                    ? (1.f / sm.l_smem[g * SMG::ML_GRP_STRIDE + gid + 8]) : 0.f;
+            }
 
             // attn_sink scaling: output[h] *= sigmoid(lse_h - sink_h). lse is
             // in log2 space (m_smem and log2(l_smem) both log2), sink in raw-log;
@@ -1024,11 +1106,18 @@ sparse_mla_prefill_mg_kernel(
                 }
             }
 
-            // Write LSE for this group
+            // Write LSE for this group (merged with attn_sink if present)
             if (threadIdx.x < HPB) {
                 int h = threadIdx.x;
                 float lse = softmax_lse(sm.m_smem[g * SMG::ML_GRP_STRIDE + h],
                                          sm.l_smem[g * SMG::ML_GRP_STRIDE + h]);
+                if (cold.attn_sink != nullptr) {
+                    float sink_log2 = __ldg(cold.attn_sink + h_start + g * HPB + h) * LOG2E;
+                    if (lse != -1e30f)
+                        lse += log2f(1.f + exp2f(sink_log2 - lse));
+                    else
+                        lse = sink_log2;
+                }
                 size_t lse_idx = (size_t)s_i * NUM_HEADS + (h_start + g * HPB + h);
                 out_lse[lse_idx] = lse;
             }

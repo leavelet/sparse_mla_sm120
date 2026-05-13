@@ -29,16 +29,13 @@ struct CombineParams {
     const float* partial_LSE;
     bf16* output;
     float* out_lse;
-    // Per-head attention-sink logit, shape [num_heads], float32. nullptr =
-    // no sink (output unchanged). Convention from upstream FlashMLA:
-    // output *= exp(lse) / (exp(lse) + exp(attn_sink))
-    //        = sigmoid(lse - attn_sink) per head.
-    // `lse` in this kernel is in log2 space (sum_lse computed via exp2).
-    // sink is in natural-log space, so we multiply by LOG2E to compare.
-    // Padded heads carry -inf which yields factor == 1.
-    const float* attn_sink;
     int num_heads;
     int nsplits;
+    // Per-head attention-sink logit, shape [num_heads], float32. nullptr =
+    // no sink (output unchanged). FlashMLA convention: out *= sigmoid(lse - sink)
+    // AND merge sink into returned LSE: lse' = log(exp(lse) + exp(sink)).
+    // Padded heads carry -inf which yields factor == 1.
+    const float* attn_sink;
 };
 
 template <int MAX_SPLITS>
@@ -97,8 +94,16 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
         if (lane_idx == 0) {
             size_t lse_idx = (size_t)token_idx * nsplits * num_heads + h;
             size_t lse_out_idx = (size_t)token_idx * num_heads + h;
-            // Upstream FlashMLA: attn_sink does NOT affect the returned LSE.
-            out_lse[lse_out_idx] = partial_LSE[lse_idx];
+            float lse_h = partial_LSE[lse_idx];
+            // FlashMLA V4 convention: merge sink into LSE.
+            if (attn_sink != nullptr) {
+                float sink_log2 = attn_sink[h] * LOG2E;
+                if (lse_h != -1e30f)
+                    lse_h += log2f(1.f + exp2f(sink_log2 - lse_h));
+                else
+                    lse_h = sink_log2;
+            }
+            out_lse[lse_out_idx] = lse_h;
         }
         return;
     }
@@ -144,6 +149,15 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
 
     // Global LSE and per-split scale factors
     float global_lse = (sum_lse > 0.f) ? (log2f(sum_lse) + max_lse) : -1e30f;
+
+    // Merge attn_sink LSE (MODEL1 V4): logsumexp(global_lse, attn_sink)
+    if (params.attn_sink != nullptr) {
+        float sink_log2 = __ldg(params.attn_sink + h) * LOG2E;
+        if (global_lse != -1e30f)
+            global_lse += log2f(1.f + exp2f(sink_log2 - global_lse));
+        else
+            global_lse = sink_log2;
+    }
 
     if (lane_idx == 0) {
         size_t lse_out_idx = (size_t)token_idx * num_heads + h;
@@ -211,6 +225,155 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     }
 }
 
+// ============================================================================
+// V2 Combine — per-batch split indexing via num_splits_ptr
+//
+// Input:
+//   o_accum:   [total_splits, s_q, num_heads, D_V] float32
+//   lse_accum: [total_splits, s_q, num_heads]      float32
+//
+// Output:
+//   output: [batch * s_q, num_heads, D_V] bfloat16
+//   lse:    [batch * s_q, num_heads]      float32
+//
+// Grid: (batch * s_q, 1, ceil(num_heads / BLOCK_H))
+// ============================================================================
+
+struct CombineV2Params {
+    const float* o_accum;
+    const float* lse_accum;
+    bf16* output;
+    float* out_lse;
+    const int* num_splits_ptr;   // [batch + 1] prefix sum
+    int num_heads;
+    int s_q;
+    size_t stride_oa_split;      // s_q * num_heads * D_V
+    size_t stride_la_split;      // s_q * num_heads
+    const float* attn_sink;
+};
+
+template <int MAX_SPLITS>
+__global__ void __launch_bounds__(COMBINE_THREADS)
+sparse_mla_combine_v2_kernel(__grid_constant__ const CombineV2Params params)
+{
+    cudaGridDependencySynchronize();
+
+    const int batch_sq_idx = blockIdx.x;
+    const int batch_idx = batch_sq_idx / params.s_q;
+    const int s_q_idx = batch_sq_idx % params.s_q;
+    const int h_block = blockIdx.z;
+    const int warp_idx = threadIdx.x / 32;
+    const int lane_idx = threadIdx.x % 32;
+    const int h = h_block * COMBINE_BLOCK_H + warp_idx;
+    if (h >= params.num_heads) return;
+
+    const int start_split = __ldg(params.num_splits_ptr + batch_idx);
+    const int end_split = __ldg(params.num_splits_ptr + batch_idx + 1);
+    const int my_nsplits = end_split - start_split;
+
+    if (my_nsplits <= 1) return;
+
+    const float* __restrict__ oaccum_ptr = params.o_accum
+        + (size_t)start_split * params.stride_oa_split
+        + (size_t)s_q_idx * params.num_heads * D_V
+        + (size_t)h * D_V;
+    const size_t oa_split_stride = params.stride_oa_split;
+
+    const float* __restrict__ lse_ptr = params.lse_accum
+        + (size_t)start_split * params.stride_la_split
+        + (size_t)s_q_idx * params.num_heads
+        + h;
+    const size_t la_split_stride = params.stride_la_split;
+
+    // LSE reduction (identical algorithm to v1)
+    __shared__ float smem_buf[COMBINE_BLOCK_H][MAX_SPLITS];
+
+    constexpr int NUM_LSE_PER_THREAD = (MAX_SPLITS + 31) / 32;
+    float local_lse[NUM_LSE_PER_THREAD];
+
+    #pragma unroll
+    for (int i = 0; i < NUM_LSE_PER_THREAD; ++i) {
+        int sp = i * 32 + lane_idx;
+        local_lse[i] = (sp < my_nsplits) ? lse_ptr[sp * la_split_stride] : -1e30f;
+    }
+
+    float max_lse = -1e30f;
+    #pragma unroll
+    for (int i = 0; i < NUM_LSE_PER_THREAD; ++i)
+        max_lse = fmaxf(max_lse, local_lse[i]);
+    max_lse = warp_reduce_max(max_lse);
+    if (max_lse == -1e30f) max_lse = 0.f;
+
+    float sum_lse = 0.f;
+    #pragma unroll
+    for (int i = 0; i < NUM_LSE_PER_THREAD; ++i)
+        sum_lse += exp2f(local_lse[i] - max_lse);
+    sum_lse = warp_reduce_sum(sum_lse);
+
+    float global_lse = (sum_lse > 0.f) ? (log2f(sum_lse) + max_lse) : -1e30f;
+
+    if (params.attn_sink != nullptr) {
+        float sink_log2 = __ldg(params.attn_sink + h) * LOG2E;
+        if (global_lse != -1e30f)
+            global_lse += log2f(1.f + exp2f(sink_log2 - global_lse));
+        else
+            global_lse = sink_log2;
+    }
+
+    if (lane_idx == 0) {
+        size_t lse_out_idx = (size_t)batch_sq_idx * params.num_heads + h;
+        params.out_lse[lse_out_idx] = global_lse;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < NUM_LSE_PER_THREAD; ++i) {
+        int sp = i * 32 + lane_idx;
+        if (sp < MAX_SPLITS)
+            smem_buf[warp_idx][sp] = exp2f(local_lse[i] - global_lse);
+    }
+    __syncwarp();
+
+    // Accumulation with prefetch (identical algorithm to v1)
+    float4 datas[COMBINE_ELEMS_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i)
+        datas[i] = *(const float4*)(oaccum_ptr + lane_idx * 4 + i * 128);
+
+    float4 result[COMBINE_ELEMS_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i)
+        result[i] = {0.f, 0.f, 0.f, 0.f};
+
+    #pragma unroll 1
+    for (int sp = 0; sp < my_nsplits; ++sp) {
+        float lse_scale = smem_buf[warp_idx][sp];
+        #pragma unroll
+        for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i) {
+            result[i].x += lse_scale * datas[i].x;
+            result[i].y += lse_scale * datas[i].y;
+            result[i].z += lse_scale * datas[i].z;
+            result[i].w += lse_scale * datas[i].w;
+            if (sp != my_nsplits - 1) {
+                datas[i] = *(const float4*)(oaccum_ptr + (size_t)(sp + 1) * oa_split_stride + lane_idx * 4 + i * 128);
+            }
+        }
+    }
+
+    bf16* o_ptr = params.output
+        + (size_t)batch_sq_idx * params.num_heads * D_V
+        + (size_t)h * D_V;
+
+    #pragma unroll
+    for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i) {
+        bf16 b[4];
+        b[0] = __float2bfloat16(result[i].x);
+        b[1] = __float2bfloat16(result[i].y);
+        b[2] = __float2bfloat16(result[i].z);
+        b[3] = __float2bfloat16(result[i].w);
+        *(uint64_t*)(o_ptr + lane_idx * 4 + i * 128) = *(const uint64_t*)b;
+    }
+}
+
 // ── MAX_SPLITS dispatch macro ───────────────────────────────────────
 #define COMBINE_SPLITS_SWITCH(NSPLITS, NAME, ...)       \
     [&] {                                               \
@@ -236,8 +399,8 @@ void sparse_mla_combine_launch(
     torch::Tensor output,
     torch::Tensor out_lse,
     int nsplits,
-    cudaStream_t stream,
-    const float* attn_sink /* nullable, [num_heads] */)
+    c10::optional<torch::Tensor> attn_sink,
+    cudaStream_t stream)
 {
     int num_tokens = partial_O.size(0);
     int num_heads = partial_O.size(2);
@@ -258,8 +421,54 @@ void sparse_mla_combine_launch(
             partial_LSE.data_ptr<float>(),
             reinterpret_cast<bf16*>(output.data_ptr()),
             out_lse.data_ptr<float>(),
-            attn_sink,
-            num_heads, nsplits
+            num_heads, nsplits,
+            attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr
+        };
+
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t config{grid, block, smem_bytes, stream, attrs, 1};
+        void* args[] = { (void*)&params };
+        CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
+    });
+}
+
+// ── V2 launch wrapper ───────────────────────────────────────────────
+void sparse_mla_combine_v2_launch(
+    torch::Tensor o_accum,
+    torch::Tensor lse_accum,
+    torch::Tensor output,
+    torch::Tensor out_lse,
+    torch::Tensor num_splits_ptr,
+    int batch, int s_q, int num_heads,
+    int max_nsplits,
+    c10::optional<torch::Tensor> attn_sink,
+    cudaStream_t stream)
+{
+    size_t stride_oa_split = (size_t)s_q * num_heads * D_V;
+    size_t stride_la_split = (size_t)s_q * num_heads;
+
+    COMBINE_SPLITS_SWITCH(max_nsplits, MAX_SPLITS, [&] {
+        dim3 grid(batch * s_q, 1, (num_heads + COMBINE_BLOCK_H - 1) / COMBINE_BLOCK_H);
+        dim3 block(COMBINE_THREADS);
+        size_t smem_bytes = COMBINE_BLOCK_H * MAX_SPLITS * sizeof(float);
+
+        auto kernel = sparse_mla_combine_v2_kernel<MAX_SPLITS>;
+        if (smem_bytes > 48 * 1024) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+        }
+
+        CombineV2Params params{
+            o_accum.data_ptr<float>(),
+            lse_accum.data_ptr<float>(),
+            reinterpret_cast<bf16*>(output.data_ptr()),
+            out_lse.data_ptr<float>(),
+            num_splits_ptr.data_ptr<int>(),
+            num_heads, s_q,
+            stride_oa_split, stride_la_split,
+            attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr
         };
 
         cudaLaunchAttribute attrs[1];

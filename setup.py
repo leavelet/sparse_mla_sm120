@@ -10,6 +10,7 @@ cuda_sources = [
     os.path.join(csrc_dir, "kernel", "decode", "decode_launch.cu"),
     os.path.join(csrc_dir, "kernel", "combine", "combine_kernel.cu"),
     os.path.join(csrc_dir, "kernel", "prefill", "prefill_launch.cu"),
+    os.path.join(csrc_dir, "kernel", "sched", "get_sched_meta.cu"),
 ]
 
 # Track all headers so setuptools recompiles when .cuh/.h files change

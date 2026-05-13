@@ -20,7 +20,8 @@ __device__ __forceinline__ void quantize_q_to_smem(
     float* q_nope_sc,
     bf16* q_rope,
     const bf16* q_base,
-    float* reduce_buf)
+    float* reduce_buf,
+    int valid_hpb = HPB)
 {
     using KV = KVCacheTraits<MT>;
     constexpr int D_NOPE = KV::D_NOPE;
@@ -31,35 +32,40 @@ __device__ __forceinline__ void quantize_q_to_smem(
 
     float* amax = reduce_buf;
 
-    // Step 1: copy Q rope to smem
+    // Step 1: copy Q rope to smem (only valid heads from gmem; zero-fill rest)
     for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
         int h = i / D_ROPE, d = i % D_ROPE;
-        q_rope[h * D_ROPE + d] = q_base[h * DIM + D_NOPE + d];
+        q_rope[h * D_ROPE + d] = (h < valid_hpb)
+            ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
     }
     // Step 2: init amax
     for (int i = threadIdx.x; i < HPB * NUM_SCALES; i += _MATH_THREADS)
         amax[i] = 0.f;
     bar_sync_t<2, _MATH_THREADS>();
 
-    // Compute absmax per tile
-    for (int idx = threadIdx.x; idx < HPB * D_NOPE; idx += _MATH_THREADS) {
+    // Compute absmax per tile (only valid heads)
+    for (int idx = threadIdx.x; idx < valid_hpb * D_NOPE; idx += _MATH_THREADS) {
         int h = idx / D_NOPE, blk = (idx % D_NOPE) / QUANT_TILE;
         atomicMax(reinterpret_cast<int*>(&amax[h * NUM_SCALES + blk]),
                   __float_as_int(fabsf(__bfloat162float(q_base[h * DIM + idx % D_NOPE]))));
     }
     bar_sync_t<2, _MATH_THREADS>();
 
-    // Step 3: compute scale
+    // Step 3: compute scale (all HPB — invalid heads have amax=0, scale=1e-4/FP8_MAX)
     for (int i = threadIdx.x; i < HPB * NUM_SCALES; i += _MATH_THREADS)
         q_nope_sc[i] = fmaxf(amax[i], 1e-4f) / FP8_MAX;
     bar_sync_t<2, _MATH_THREADS>();
 
-    // Step 4: quantize
+    // Step 4: quantize (valid heads from gmem; zero-fill rest)
     for (int idx = threadIdx.x; idx < HPB * D_NOPE; idx += _MATH_THREADS) {
         int h = idx / D_NOPE, d = idx % D_NOPE, blk = d / QUANT_TILE;
-        float si = 1.f / q_nope_sc[h * NUM_SCALES + blk];
-        float v = fmaxf(FP8_MIN, fminf(FP8_MAX, __bfloat162float(q_base[h * DIM + d]) * si));
-        __nv_fp8_e4m3 fp8v(v);
-        q_nope_fp8[h * Q_NOPE_STRIDE + d] = fp8v.__x;
+        if (h < valid_hpb) {
+            float si = 1.f / q_nope_sc[h * NUM_SCALES + blk];
+            float v = fmaxf(FP8_MIN, fminf(FP8_MAX, __bfloat162float(q_base[h * DIM + d]) * si));
+            __nv_fp8_e4m3 fp8v(v);
+            q_nope_fp8[h * Q_NOPE_STRIDE + d] = fp8v.__x;
+        } else {
+            q_nope_fp8[h * Q_NOPE_STRIDE + d] = 0;
+        }
     }
 }

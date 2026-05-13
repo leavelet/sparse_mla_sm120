@@ -14,6 +14,7 @@ void launch_prefill_sg(
     bf16* output, float* out_lse,
     float sm_scale, int num_tokens,
     size_t stride_kv_block,
+    const int* topk_length_ptr,
     cudaStream_t stream)
 {
     constexpr size_t smem_bytes = SmemLayout<MT, CM>::TOTAL;
@@ -28,8 +29,11 @@ void launch_prefill_sg(
         configured = true;
     }
 
-    // SG is single-cache only; stride_kv_block_extra is unused.
-    PrefillColdParams cold{sm_scale, num_tokens, stride_kv_block, /*stride_kv_block_extra=*/(size_t)0};
+    // SG is single-cache only; stride_kv_block_extra + topk_length_extra unused.
+    PrefillColdParams cold{sm_scale, num_tokens, stride_kv_block,
+                            /*stride_kv_block_extra=*/(size_t)0,
+                            attn_sink, topk_length_ptr,
+                            /*topk_length_extra=*/(const int*)nullptr};
     cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
     void* args[] = {
         (void*)&Q, (void*)&KV_cache, (void*)&indices,
@@ -51,6 +55,8 @@ void launch_prefill_mg(
     bf16* output, float* out_lse,
     float sm_scale, int num_tokens,
     size_t stride_kv_block, size_t stride_kv_block_extra,
+    const int* topk_length_ptr,
+    const int* topk_length_extra_ptr,
     cudaStream_t stream)
 {
     constexpr size_t smem_bytes = SmemLayoutMG<MT, CM>::TOTAL;
@@ -65,7 +71,8 @@ void launch_prefill_mg(
         configured = true;
     }
 
-    PrefillColdParams cold{sm_scale, num_tokens, stride_kv_block, stride_kv_block_extra};
+    PrefillColdParams cold{sm_scale, num_tokens, stride_kv_block, stride_kv_block_extra,
+                            attn_sink, topk_length_ptr, topk_length_extra_ptr};
     cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
     void* args[] = {
         (void*)&Q, (void*)&KV_cache, (void*)&indices,
@@ -86,8 +93,9 @@ void sparse_mla_prefill_launch_v32(
     torch::Tensor output, torch::Tensor out_lse,
     float sm_scale, int num_heads, int num_tokens, int topk,
     int page_block_size, int stride_kv_row,
-    cudaStream_t stream,
-    const float* attn_sink /* nullable, [num_heads] */)
+    const float* attn_sink_ptr,
+    const int* topk_length_ptr,
+    cudaStream_t stream)
 {
     auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
     auto KV_ptr = reinterpret_cast<const uint8_t*>(KV_cache.data_ptr());
@@ -101,8 +109,8 @@ void sparse_mla_prefill_launch_v32(
     if (num_heads <= HPB) {
         #define DISPATCH_SG(NH) \
             launch_prefill_sg<ModelType::V32, ComputeMode::FP8, NH, 2048, 1>( \
-                Q_ptr, KV_ptr, idx_ptr, attn_sink, O_ptr, LSE_ptr, \
-                sm_scale, num_tokens, stride_kv_block, stream)
+                Q_ptr, KV_ptr, idx_ptr, attn_sink_ptr, O_ptr, LSE_ptr, \
+                sm_scale, num_tokens, stride_kv_block, topk_length_ptr, stream)
         switch (num_heads) {
         case 16:  DISPATCH_SG(16); break;
         default:  TORCH_CHECK(false, "V32 prefill SG: unsupported num_heads=", num_heads);
@@ -113,10 +121,10 @@ void sparse_mla_prefill_launch_v32(
             launch_prefill_mg<ModelType::V32, ComputeMode::FP8, NH, 2048, 1>( \
                 Q_ptr, KV_ptr, idx_ptr, \
                 /*KV_cache_extra=*/nullptr, /*indices_extra=*/nullptr, \
-                attn_sink, O_ptr, LSE_ptr, \
+                attn_sink_ptr, O_ptr, LSE_ptr, \
                 sm_scale, num_tokens, \
                 stride_kv_block, /*stride_kv_block_extra=*/(size_t)0, \
-                stream)
+                topk_length_ptr, /*topk_length_extra=*/nullptr, stream)
         switch (num_heads) {
         case 64:  DISPATCH_MG(64); break;
         case 128: DISPATCH_MG(128); break;
@@ -131,8 +139,9 @@ void sparse_mla_prefill_launch_model1(
     torch::Tensor output, torch::Tensor out_lse,
     float sm_scale, int num_heads, int num_tokens, int topk,
     int page_block_size, int stride_kv_row,
-    cudaStream_t stream,
-    const float* attn_sink /* nullable, [num_heads] */)
+    const float* attn_sink_ptr,
+    const int* topk_length_ptr,
+    cudaStream_t stream)
 {
     auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
     auto KV_ptr = reinterpret_cast<const uint8_t*>(KV_cache.data_ptr());
@@ -148,10 +157,10 @@ void sparse_mla_prefill_launch_model1(
         launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64>( \
             Q_ptr, KV_ptr, idx_ptr, \
             /*KV_cache_extra=*/nullptr, /*indices_extra=*/nullptr, \
-            attn_sink, O_ptr, LSE_ptr, \
+            attn_sink_ptr, O_ptr, LSE_ptr, \
             sm_scale, num_tokens, \
             stride_kv_block, /*stride_kv_block_extra=*/(size_t)0, \
-            stream)
+            topk_length_ptr, /*topk_length_extra=*/nullptr, stream)
 
     if (topk == 128) {
         switch (num_heads) {
@@ -178,7 +187,7 @@ void sparse_mla_prefill_launch_model1(
 }
 
 // Dual-cache MODEL1 prefill entry point. Hardcoded to
-// (topk_main=128, topk_extra=128) for the DSv4-sm120 case; add more
+// (topk_main=128, topk_extra=128/512) for the DSv4-sm120 case; add more
 // (topk_main, topk_extra) combinations here as needed.
 void sparse_mla_prefill_launch_model1_dual(
     torch::Tensor Q,
@@ -189,8 +198,10 @@ void sparse_mla_prefill_launch_model1_dual(
     int topk, int topk_extra,
     int page_block_size, int stride_kv_row,
     int page_block_size_extra, int stride_kv_row_extra,
-    cudaStream_t stream,
-    const float* attn_sink /* nullable, [num_heads] */)
+    const float* attn_sink_ptr,
+    const int* topk_length_ptr,
+    const int* topk_length_extra_ptr,
+    cudaStream_t stream)
 {
     auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
     auto KV_ptr = reinterpret_cast<const uint8_t*>(KV_cache.data_ptr());
@@ -204,7 +215,6 @@ void sparse_mla_prefill_launch_model1_dual(
 
     TORCH_CHECK(page_block_size == 64,
         "MODEL1 dual prefill: main page_block_size must be 64, got ", page_block_size);
-    // DSv4 compressed cache: page_block_size_extra = main_block_size / compress_ratio.
     TORCH_CHECK(page_block_size_extra == 64 || page_block_size_extra == 2,
         "MODEL1 dual prefill: extra page_block_size must be 64 or 2, got ",
         page_block_size_extra);
@@ -212,8 +222,9 @@ void sparse_mla_prefill_launch_model1_dual(
     #define DISPATCH_DUAL_MG(NH, TK, TK_EX, PBSX) \
         launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, TK_EX, PBSX>( \
             Q_ptr, KV_ptr, idx_ptr, KV_extra_ptr, idx_extra_ptr, \
-            attn_sink, O_ptr, LSE_ptr, sm_scale, num_tokens, \
-            stride_kv_block, stride_kv_block_extra, stream)
+            attn_sink_ptr, O_ptr, LSE_ptr, sm_scale, num_tokens, \
+            stride_kv_block, stride_kv_block_extra, \
+            topk_length_ptr, topk_length_extra_ptr, stream)
 
     if (topk == 128 && topk_extra == 128 && page_block_size_extra == 64) {
         switch (num_heads) {
