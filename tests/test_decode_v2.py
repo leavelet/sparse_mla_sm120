@@ -98,13 +98,12 @@ def run_decode_v2_test(model_type, d_qk, d_v, topk, num_heads, batch_size,
         num_sm_parts, attn_sink)
     torch.cuda.synchronize()
 
-    # V2 combine: single launch for all batches
+    # V2 combine: always launch (CUDA graph friendly — kernel early-exits for is_no_split)
     ns_cpu = num_splits.cpu()
     max_nsplits = max((ns_cpu[i+1] - ns_cpu[i]).item() for i in range(batch_size))
-    if max_nsplits > 1:
-        sparse_mla_combine_v2_fwd(
-            o_accum, lse_accum, output, out_lse,
-            num_splits, batch_size, max_nsplits, attn_sink)
+    sparse_mla_combine_v2_fwd(
+        o_accum, lse_accum, output, out_lse,
+        num_splits, batch_size, max_nsplits, attn_sink)
 
     out_view = output.view_as(ref_out)
     err = (out_view.float() - ref_out.float()).abs()
@@ -177,6 +176,136 @@ class TestDecodeV2Race:
                 num_heads=128, batch_size=4)
             assert max_err < 0.001, f"v2 race check seed={seed}: max_err={max_err}"
         print("\n  v2 decode race check (3 seeds): PASS")
+
+
+# ── CUDA graph compatibility ────────────────────────────────────────
+
+class TestDecodeV2CudaGraph:
+    """Verify the v2 pipeline works under CUDA graph capture."""
+
+    def test_cuda_graph_capture(self):
+        """Capture scheduler→decode→combine as a CUDA graph and replay."""
+        torch.manual_seed(42)
+        d_qk, d_v, h, topk, b = 512, 512, 128, 1024, 4
+        sm_scale = d_qk ** -0.5
+        block_size, num_blocks = 64, 64
+        s_kv = num_blocks * block_size
+
+        kv_bf16 = (torch.randn(num_blocks, block_size, 1, d_qk,
+                                device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+        kv_packed = quantize_kv_model1(kv_bf16)
+        kv_dequant = dequantize_kv_model1(kv_packed)
+        q = (torch.randn(b, 1, h, d_qk,
+                          device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+        indices = torch.randint(0, s_kv, (b, 1, topk),
+                                 device="cuda", dtype=torch.int32)
+        indices[:, :, -10:] = -1
+
+        replicate_h = (h + HPB - 1) // HPB
+        num_sm_parts = max(NUM_SMS // replicate_h, 1)
+        total_splits = b + num_sm_parts
+
+        sched_meta = torch.empty(num_sm_parts * 8, dtype=torch.int32, device="cuda")
+        num_splits = torch.empty(b + 1, dtype=torch.int32, device="cuda")
+        o_accum = torch.empty(total_splits, 1, h, d_v, dtype=torch.float32, device="cuda")
+        lse_accum = torch.empty(total_splits, 1, h, dtype=torch.float32, device="cuda")
+        output = torch.empty(b, h, d_v, dtype=torch.bfloat16, device="cuda")
+        out_lse = torch.empty(b, h, dtype=torch.float32, device="cuda")
+
+        stride_kv = kv_packed.stride(-2) * kv_packed.element_size()
+        pbs = kv_packed.shape[-3]
+        qf = q.view(b, h, d_qk)
+        idf = indices.view(b, topk)
+
+        # Warmup (outside graph)
+        get_decode_metadata(b, topk, 0, num_sm_parts, FIXED_OVERHEAD,
+                            None, None, sched_meta, num_splits)
+        sparse_mla_splitkv_v2_fwd(qf, kv_packed, idf, o_accum, lse_accum,
+                                   output, out_lse, sched_meta, num_splits,
+                                   sm_scale, topk, stride_kv, pbs, num_sm_parts)
+        ns_cpu = num_splits.cpu()
+        max_nsplits = max((ns_cpu[i+1] - ns_cpu[i]).item() for i in range(b))
+        sparse_mla_combine_v2_fwd(o_accum, lse_accum, output, out_lse,
+                                   num_splits, b, max_nsplits)
+        torch.cuda.synchronize()
+
+        # Capture graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            get_decode_metadata(b, topk, 0, num_sm_parts, FIXED_OVERHEAD,
+                                None, None, sched_meta, num_splits)
+            sparse_mla_splitkv_v2_fwd(qf, kv_packed, idf, o_accum, lse_accum,
+                                       output, out_lse, sched_meta, num_splits,
+                                       sm_scale, topk, stride_kv, pbs, num_sm_parts)
+            sparse_mla_combine_v2_fwd(o_accum, lse_accum, output, out_lse,
+                                       num_splits, b, max_nsplits)
+
+        # Replay
+        graph.replay()
+        torch.cuda.synchronize()
+
+        # Verify correctness
+        ref_out, _ = ref_sparse_attn_decode(q, kv_dequant, indices, sm_scale, d_v)
+        err = (output.view_as(ref_out).float() - ref_out.float()).abs()
+        max_err = err.max().item()
+        print(f"\n  CUDA graph replay: max_err={max_err:.6f}")
+        assert max_err < 0.001, f"CUDA graph failed: max_err={max_err}"
+
+    def test_all_is_no_split(self):
+        """When all batches fit in one partition (is_no_split), combine is a no-op.
+        Verify combine kernel handles max_nsplits=1 gracefully."""
+        torch.manual_seed(42)
+        d_qk, d_v, h, topk, b = 512, 512, 64, 512, 1
+        sm_scale = d_qk ** -0.5
+        block_size, num_blocks = 64, 64
+        s_kv = num_blocks * block_size
+
+        kv_bf16 = (torch.randn(num_blocks, block_size, 1, d_qk,
+                                device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+        kv_packed = quantize_kv_model1(kv_bf16)
+        kv_dequant = dequantize_kv_model1(kv_packed)
+        q = (torch.randn(b, 1, h, d_qk,
+                          device="cuda", dtype=torch.bfloat16) / 10).clamp(-1, 1)
+        indices = torch.randint(0, s_kv, (b, 1, topk),
+                                 device="cuda", dtype=torch.int32)
+
+        replicate_h = (h + HPB - 1) // HPB
+        num_sm_parts = max(NUM_SMS // replicate_h, 1)
+        total_splits = b + num_sm_parts
+
+        sched_meta = torch.empty(num_sm_parts * 8, dtype=torch.int32, device="cuda")
+        num_splits = torch.empty(b + 1, dtype=torch.int32, device="cuda")
+        o_accum = torch.empty(total_splits, 1, h, d_v, dtype=torch.float32, device="cuda")
+        lse_accum = torch.empty(total_splits, 1, h, dtype=torch.float32, device="cuda")
+        output = torch.empty(b, h, d_v, dtype=torch.bfloat16, device="cuda")
+        out_lse = torch.empty(b, h, dtype=torch.float32, device="cuda")
+
+        stride_kv = kv_packed.stride(-2) * kv_packed.element_size()
+        pbs = kv_packed.shape[-3]
+        qf = q.view(b, h, d_qk)
+        idf = indices.view(b, topk)
+
+        get_decode_metadata(b, topk, 0, num_sm_parts, FIXED_OVERHEAD,
+                            None, None, sched_meta, num_splits)
+        sparse_mla_splitkv_v2_fwd(qf, kv_packed, idf, o_accum, lse_accum,
+                                   output, out_lse, sched_meta, num_splits,
+                                   sm_scale, topk, stride_kv, pbs, num_sm_parts)
+
+        # max_nsplits should be 1 (all is_no_split for b=1 with many partitions)
+        ns_cpu = num_splits.cpu()
+        max_nsplits = max((ns_cpu[i+1] - ns_cpu[i]).item() for i in range(b))
+        print(f"\n  all_is_no_split: max_nsplits={max_nsplits}")
+
+        # Always launch combine (CUDA graph friendly) — should be a no-op
+        sparse_mla_combine_v2_fwd(o_accum, lse_accum, output, out_lse,
+                                   num_splits, b, max_nsplits)
+        torch.cuda.synchronize()
+
+        ref_out, _ = ref_sparse_attn_decode(q, kv_dequant, indices, sm_scale, d_v)
+        err = (output.view_as(ref_out).float() - ref_out.float()).abs()
+        max_err = err.max().item()
+        print(f"  max_err={max_err:.6f}")
+        assert max_err < 0.001, f"all_is_no_split failed: max_err={max_err}"
 
 
 if __name__ == "__main__":

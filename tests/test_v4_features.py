@@ -199,13 +199,12 @@ def run_v4_decode_test(num_heads, topk, batch_size,
         extra_topk_length)
     torch.cuda.synchronize()
 
-    # V2 combine: single launch for all batches
+    # V2 combine: always launch (CUDA graph friendly — kernel early-exits for is_no_split)
     ns_cpu = num_splits.cpu()
     max_nsplits = max((ns_cpu[i+1] - ns_cpu[i]).item() for i in range(batch_size))
-    if max_nsplits > 1:
-        sparse_mla_combine_v2_fwd(
-            o_accum, lse_accum, output, out_lse,
-            num_splits, batch_size, max_nsplits, attn_sink)
+    sparse_mla_combine_v2_fwd(
+        o_accum, lse_accum, output, out_lse,
+        num_splits, batch_size, max_nsplits, attn_sink)
 
     out_view = output.view_as(ref_out)
     err = (out_view.float() - ref_out.float()).abs()
