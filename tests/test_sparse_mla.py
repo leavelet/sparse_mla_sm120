@@ -28,72 +28,33 @@ FP8_MAX = 448.0
 
 
 def pack_kv_cache_fp8(kv_bf16: torch.Tensor) -> torch.Tensor:
-    """Convert bf16 KV cache to packed FP8 format matching sglang layout.
+    """Convert bf16 KV cache (V32 layout) to packed FP8 format using UE8M0 scales.
+
+    UE8M0 (power-of-2-only) is required because the kernel reinterprets the
+    4-byte scale field as a float32 with the implicit exponent-only invariant
+    inherited from FlashMLA upstream — arbitrary float32 scales produce wrong
+    results.
 
     Input:  kv_bf16 [pool_size, 1, 576] bf16
-    Output: packed  [pool_size, 1, 656] uint8
+    Output: packed  [pool_size, 1, 1, 656] uint8 — adds the explicit
+                    page_block_size=1 axis the kernel infers from kv.shape[-3].
     """
-    pool_size = kv_bf16.shape[0]
-    kv_f = kv_bf16.squeeze(1).float()  # [pool_size, 576]
-
-    packed = torch.zeros(pool_size, 1, KV_PACKED_BYTES, dtype=torch.uint8, device=kv_bf16.device)
-
-    nope = kv_f[:, :D_NOPE]  # [pool_size, 512]
-    rope = kv_bf16.squeeze(1)[:, D_NOPE:]  # [pool_size, 64] bf16
-
-    for b in range(NUM_SCALES):
-        tile = nope[:, b * QUANT_TILE : (b + 1) * QUANT_TILE]  # [pool_size, 128]
-        amax = tile.abs().amax(dim=1).clamp(min=1e-4)  # [pool_size]
-        scale = amax / FP8_MAX  # [pool_size]
-        scale_inv = 1.0 / scale
-
-        # Quantize to fp8 e4m3
-        fp8_vals = (tile * scale_inv.unsqueeze(1)).clamp(-FP8_MAX, FP8_MAX)
-        fp8_tensor = fp8_vals.to(torch.float8_e4m3fn)
-
-        # Store fp8 bytes
-        byte_offset = b * QUANT_TILE
-        packed[:, 0, byte_offset : byte_offset + QUANT_TILE] = fp8_tensor.view(torch.uint8)
-
-        # Store fp32 scale
-        scale_bytes = scale.to(torch.float32).view(torch.uint8).reshape(pool_size, 4)
-        scale_offset = D_NOPE + b * 4
-        packed[:, 0, scale_offset : scale_offset + 4] = scale_bytes
-
-    # Store rope as bf16
-    rope_bytes = rope.contiguous().view(torch.uint8).reshape(pool_size, D_ROPE * 2)
-    packed[:, 0, D_NOPE + NUM_SCALES * 4 :] = rope_bytes
-
-    return packed
+    from tests.test_decode import quantize_kv_v32
+    # quantize_kv_v32 wants (num_blocks, block_size, 1, 576). Treat each
+    # pool slot as its own one-token block.
+    kv_4d = kv_bf16.unsqueeze(2) if kv_bf16.dim() == 3 else kv_bf16  # (pool, 1, 1, 576)
+    return quantize_kv_v32(kv_4d)
 
 
 def unpack_kv_cache_fp8(packed: torch.Tensor) -> torch.Tensor:
-    """Dequantize packed FP8 KV cache back to bf16 for reference comparison.
+    """Dequantize packed FP8 V32 KV cache back to bf16 for reference comparison.
 
-    Input:  packed [pool_size, 1, 656] uint8
+    Input:  packed [pool_size, 1, 1, 656] uint8
     Output: kv_bf16 [pool_size, 1, 576] bf16
     """
-    pool_size = packed.shape[0]
-    result = torch.zeros(pool_size, 1, DIM, dtype=torch.bfloat16, device=packed.device)
-
-    for b in range(NUM_SCALES):
-        byte_offset = b * QUANT_TILE
-        fp8_raw = packed[:, 0, byte_offset : byte_offset + QUANT_TILE]
-        fp8_tensor = fp8_raw.view(torch.float8_e4m3fn).float()  # [pool_size, 128]
-
-        scale_offset = D_NOPE + b * 4
-        scale_bytes = packed[:, 0, scale_offset : scale_offset + 4]
-        scale = scale_bytes.contiguous().view(torch.float32).squeeze(-1)  # [pool_size]
-
-        dequant = fp8_tensor * scale.unsqueeze(1)
-        result[:, 0, b * QUANT_TILE : (b + 1) * QUANT_TILE] = dequant.to(torch.bfloat16)
-
-    # Rope
-    rope_bytes = packed[:, 0, D_NOPE + NUM_SCALES * 4 :]
-    rope = rope_bytes.contiguous().view(torch.bfloat16).reshape(pool_size, D_ROPE)
-    result[:, 0, D_NOPE:] = rope
-
-    return result
+    from tests.test_decode import dequantize_kv_v32
+    out_4d = dequantize_kv_v32(packed)  # (pool, 1, 1, 576)
+    return out_4d.squeeze(2)
 
 
 # ── Reference implementation ──────────────────────────────────────────────
@@ -143,14 +104,15 @@ def sm120_sparse_mla(
     d_v: int,
 ) -> torch.Tensor:
     """Wrapper for our SM120 CUDA kernel."""
-    import sparse_mla_sm120
-    return sparse_mla_sm120.sparse_mla_fwd(
+    from flash_mla_sm120.ops import sparse_mla_fwd
+    out, _ = sparse_mla_fwd(
         q=q.contiguous(),
         kv_cache=kv_packed.contiguous(),
         indices=indices.contiguous(),
         sm_scale=sm_scale,
         d_v=d_v,
     )
+    return out
 
 
 def sm120_sparse_mla_decode(
@@ -160,14 +122,15 @@ def sm120_sparse_mla_decode(
     sm_scale: float,
     d_v: int,
 ) -> torch.Tensor:
-    import sparse_mla_sm120
-    return sparse_mla_sm120.sparse_mla_decode_fwd(
+    from flash_mla_sm120.ops import sparse_mla_decode_fwd
+    out, _ = sparse_mla_decode_fwd(
         q=q.contiguous(),
         kv_cache=kv_packed.contiguous(),
         indices=indices.contiguous(),
         sm_scale=sm_scale,
         d_v=d_v,
     )
+    return out
 
 
 def sm120_sparse_mla_prefill(
@@ -177,14 +140,15 @@ def sm120_sparse_mla_prefill(
     sm_scale: float,
     d_v: int,
 ) -> torch.Tensor:
-    import sparse_mla_sm120
-    return sparse_mla_sm120.sparse_mla_prefill_fwd(
+    from flash_mla_sm120.ops import sparse_mla_prefill_fwd
+    out, _ = sparse_mla_prefill_fwd(
         q=q.contiguous(),
         kv_cache=kv_packed.contiguous(),
         indices=indices.contiguous(),
         sm_scale=sm_scale,
         d_v=d_v,
     )
+    return out
 
 
 # ── Test configs ──────────────────────────────────────────────────────────
@@ -207,8 +171,12 @@ def test_correctness_all_valid(batch_size: int, num_heads: int) -> None:
     pool_size = 4096
     sm_scale = DIM ** -0.5
 
-    q = torch.randn(batch_size, num_heads, DIM, device=DEVICE, dtype=torch.bfloat16)
-    kv_bf16 = torch.randn(pool_size, 1, DIM, device=DEVICE, dtype=torch.bfloat16)
+    # Scale to FP8-friendly range; raw randn (stdev=1) magnitudes exceed
+    # UE8M0 power-of-2 scale granularity and produce out-of-tolerance noise.
+    q = (torch.randn(batch_size, num_heads, DIM, device=DEVICE,
+                      dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    kv_bf16 = (torch.randn(pool_size, 1, DIM, device=DEVICE,
+                            dtype=torch.bfloat16) / 10).clamp(-1, 1)
     indices = torch.randint(0, pool_size, (batch_size, TOPK), device=DEVICE, dtype=torch.int32)
 
     kv_packed = pack_kv_cache_fp8(kv_bf16)
@@ -235,8 +203,12 @@ def test_correctness_mixed_invalid(batch_size: int, num_heads: int) -> None:
     sm_scale = DIM ** -0.5
     n_valid = 128
 
-    q = torch.randn(batch_size, num_heads, DIM, device=DEVICE, dtype=torch.bfloat16)
-    kv_bf16 = torch.randn(pool_size, 1, DIM, device=DEVICE, dtype=torch.bfloat16)
+    # Scale to FP8-friendly range; raw randn (stdev=1) magnitudes exceed
+    # UE8M0 power-of-2 scale granularity and produce out-of-tolerance noise.
+    q = (torch.randn(batch_size, num_heads, DIM, device=DEVICE,
+                      dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    kv_bf16 = (torch.randn(pool_size, 1, DIM, device=DEVICE,
+                            dtype=torch.bfloat16) / 10).clamp(-1, 1)
 
     indices = torch.full((batch_size, TOPK), -1, device=DEVICE, dtype=torch.int32)
     indices[:, :n_valid] = torch.randint(0, pool_size, (batch_size, n_valid), device=DEVICE, dtype=torch.int32)
@@ -261,8 +233,12 @@ def test_no_nan_inf(num_heads: int) -> None:
     sm_scale = DIM ** -0.5
     batch_size = 4
 
-    q = torch.randn(batch_size, num_heads, DIM, device=DEVICE, dtype=torch.bfloat16)
-    kv_bf16 = torch.randn(pool_size, 1, DIM, device=DEVICE, dtype=torch.bfloat16)
+    # Scale to FP8-friendly range; raw randn (stdev=1) magnitudes exceed
+    # UE8M0 power-of-2 scale granularity and produce out-of-tolerance noise.
+    q = (torch.randn(batch_size, num_heads, DIM, device=DEVICE,
+                      dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    kv_bf16 = (torch.randn(pool_size, 1, DIM, device=DEVICE,
+                            dtype=torch.bfloat16) / 10).clamp(-1, 1)
 
     indices = torch.full((batch_size, TOPK), -1, device=DEVICE, dtype=torch.int32)
     indices[:, :32] = torch.randint(0, pool_size, (batch_size, 32), device=DEVICE, dtype=torch.int32)
@@ -287,8 +263,12 @@ def test_prefill_path(num_heads: int) -> None:
     sm_scale = DIM ** -0.5
     batch_size = 128  # triggers prefill path
 
-    q = torch.randn(batch_size, num_heads, DIM, device=DEVICE, dtype=torch.bfloat16)
-    kv_bf16 = torch.randn(pool_size, 1, DIM, device=DEVICE, dtype=torch.bfloat16)
+    # Scale to FP8-friendly range; raw randn (stdev=1) magnitudes exceed
+    # UE8M0 power-of-2 scale granularity and produce out-of-tolerance noise.
+    q = (torch.randn(batch_size, num_heads, DIM, device=DEVICE,
+                      dtype=torch.bfloat16) / 10).clamp(-1, 1)
+    kv_bf16 = (torch.randn(pool_size, 1, DIM, device=DEVICE,
+                            dtype=torch.bfloat16) / 10).clamp(-1, 1)
     indices = torch.randint(0, pool_size, (batch_size, TOPK), device=DEVICE, dtype=torch.int32)
 
     kv_packed = pack_kv_cache_fp8(kv_bf16)

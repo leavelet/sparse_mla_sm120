@@ -31,7 +31,11 @@ struct CombineParams {
     float* out_lse;
     int num_heads;
     int nsplits;
-    const float* attn_sink;  // [num_heads] float32, natural log domain. nullptr = disabled.
+    // Per-head attention-sink logit, shape [num_heads], float32. nullptr =
+    // no sink (output unchanged). FlashMLA convention: out *= sigmoid(lse - sink)
+    // AND merge sink into returned LSE: lse' = log(exp(lse) + exp(sink)).
+    // Padded heads carry -inf which yields factor == 1.
+    const float* attn_sink;
 };
 
 template <int MAX_SPLITS>
@@ -44,6 +48,7 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     const float* __restrict__ partial_LSE = params.partial_LSE;
     bf16* __restrict__ output = params.output;
     float* __restrict__ out_lse = params.out_lse;
+    const float* __restrict__ attn_sink = params.attn_sink;  // [num_heads] or nullptr
     const int num_heads = params.num_heads;
     const int nsplits = params.nsplits;
 
@@ -56,7 +61,11 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     if (h >= num_heads) return;
 
     if (nsplits == 1) {
-        // Single split: just convert float32 → bf16, no combine needed
+        // Single split: just convert float32 → bf16, no combine needed.
+        // attn_sink scaling: output[h] *= sigmoid(lse_h - sink_h). lse is
+        // already in log2 space (the decode kernel writes `m + log2(l)`),
+        // and sink is in raw-log space, so compare via LOG2E. -inf sink
+        // (padded heads) yields factor == 1 — no-op.
         const float* src = partial_O
             + (size_t)token_idx * nsplits * num_heads * D_V
             + (size_t)h * D_V;
@@ -64,21 +73,37 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
             + (size_t)token_idx * num_heads * D_V
             + (size_t)h * D_V;
 
+        float sink_factor = 1.0f;
+        if (attn_sink != nullptr) {
+            float lse_h = partial_LSE[(size_t)token_idx * nsplits * num_heads + h];
+            float sink_log2 = attn_sink[h] * LOG2E;
+            sink_factor = 1.0f / (1.0f + exp2f(sink_log2 - lse_h));
+        }
+
         #pragma unroll
         for (int i = 0; i < COMBINE_ELEMS_PER_THREAD; ++i) {
             float4 v = *(const float4*)(src + lane_idx * 4 + i * 128);
             bf16 b[4];
-            b[0] = __float2bfloat16(v.x);
-            b[1] = __float2bfloat16(v.y);
-            b[2] = __float2bfloat16(v.z);
-            b[3] = __float2bfloat16(v.w);
+            b[0] = __float2bfloat16(v.x * sink_factor);
+            b[1] = __float2bfloat16(v.y * sink_factor);
+            b[2] = __float2bfloat16(v.z * sink_factor);
+            b[3] = __float2bfloat16(v.w * sink_factor);
             *(uint64_t*)(dst + lane_idx * 4 + i * 128) = *(const uint64_t*)b;
         }
 
         if (lane_idx == 0) {
             size_t lse_idx = (size_t)token_idx * nsplits * num_heads + h;
             size_t lse_out_idx = (size_t)token_idx * num_heads + h;
-            out_lse[lse_out_idx] = partial_LSE[lse_idx];
+            float lse_h = partial_LSE[lse_idx];
+            // FlashMLA V4 convention: merge sink into LSE.
+            if (attn_sink != nullptr) {
+                float sink_log2 = attn_sink[h] * LOG2E;
+                if (lse_h != -1e30f)
+                    lse_h += log2f(1.f + exp2f(sink_log2 - lse_h));
+                else
+                    lse_h = sink_log2;
+            }
+            out_lse[lse_out_idx] = lse_h;
         }
         return;
     }
@@ -177,6 +202,11 @@ sparse_mla_combine_kernel(__grid_constant__ const CombineParams params)
     }
 
     // ── Write output (bf16, packed uint64_t) ────────────────────────
+    // attn_sink output-scaling is implicit here: the per-split scale factors
+    // (smem_buf[sp] = exp2(raw_lse_i - global_lse_merged)) already divide
+    // the accumulated sum by (sum_exp(raw_lse) + exp(sink)), which is the
+    // sigmoid(global_lse_raw - sink) factor we want. Do NOT apply a second
+    // explicit sink scaling — that would double-count.
     bf16* o_ptr = output
         + (size_t)token_idx * num_heads * D_V
         + (size_t)h * D_V;

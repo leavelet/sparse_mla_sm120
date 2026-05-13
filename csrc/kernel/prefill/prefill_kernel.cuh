@@ -35,8 +35,12 @@ struct PrefillColdParams {
     float sm_scale;
     int num_tokens;
     size_t stride_kv_block;
+    // Used only by the MG kernel when TOPK_EXTRA > 0 (dual-cache); the SG
+    // kernel and single-cache MG path ignore it.
+    size_t stride_kv_block_extra;
     const float* attn_sink;  // [NUM_HEADS] float32, natural log domain. nullptr = disabled.
     const int* topk_length;  // [num_tokens] int32, nullptr = uniform TOPK.
+    const int* topk_length_extra;  // [num_tokens] int32, dual-cache only. nullptr = uniform TOPK_EXTRA.
 };
 
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
@@ -45,6 +49,7 @@ sparse_mla_prefill_kernel(
     const bf16* __restrict__ Q,
     const uint8_t* __restrict__ KV_cache,
     const int32_t* __restrict__ indices,
+    const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
     bf16* __restrict__ output,
     float* __restrict__ out_lse,
     __grid_constant__ const PrefillColdParams cold)
@@ -391,6 +396,12 @@ sparse_mla_prefill_kernel(
         bar_sync_t<2, MATH_THREADS>();
 
         // ── Write BF16 output and LSE ────────────────────────────────
+        // attn_sink convention (FlashMLA V4): output[h] *= sigmoid(lse_h - sink_h)
+        // is folded directly into the normalizer:
+        //   il = exp(lse) / (exp(lse) + exp(sink)) / exp(lse)
+        //      = 1 / (l + exp(sink - m))   in log2 space
+        // (working in log2 space: sum_l is in exp-domain of m, multiply sink by LOG2E).
+        // Padded heads carry sink=-inf → exp2(-inf)=0 → no-op (collapses to 1/l).
         float il0, il1;
         if (cold.attn_sink != nullptr) {
             float s0 = __ldg(cold.attn_sink + h_start + gid) * LOG2E;
@@ -477,20 +488,32 @@ sparse_mla_prefill_kernel(
 static constexpr int MG_N_HG = 2;
 static constexpr int MG_HEADS_PER_CTA = MG_N_HG * HPB;  // 32
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+// Dual-cache MG prefill (Design A: phase-within-block, online softmax persists
+// across phases). When TOPK_EXTRA == 0 the extra-phase branches dead-code-
+// elide and behavior is bit-identical to the prior single-cache kernel.
+// When TOPK_EXTRA > 0 the outer loop iterates over NI = TOPK/BI tiles from
+// KV_cache followed by NI_EXTRA = TOPK_EXTRA/BI tiles from KV_cache_extra,
+// sharing one set of online-softmax accumulators so the softmax denominator
+// is computed over the union of indices.
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0, int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_mg_kernel(
     const bf16* __restrict__ Q,
     const uint8_t* __restrict__ KV_cache,
     const int32_t* __restrict__ indices,
+    const uint8_t* __restrict__ KV_cache_extra,   // nullptr when TOPK_EXTRA==0
+    const int32_t* __restrict__ indices_extra,     // nullptr when TOPK_EXTRA==0
     bf16* __restrict__ output,
     float* __restrict__ out_lse,
+    const float* __restrict__ attn_sink,           // [NUM_HEADS], nullable
     __grid_constant__ const PrefillColdParams cold)
 {
     const float sm_scale = cold.sm_scale;
     const int num_tokens = cold.num_tokens;
     constexpr int page_block_size = PAGE_BLOCK_SIZE;
+    constexpr int page_block_size_extra = PAGE_BLOCK_SIZE_EXTRA;
     const size_t stride_kv_block = cold.stride_kv_block;
+    const size_t stride_kv_block_extra = cold.stride_kv_block_extra;
     using KV = KVCacheTraits<MT>;
     using CT = ComputeTraits<MT, CM>;
     using LMG = SmemLayoutMG<MT, CM>;
@@ -498,6 +521,8 @@ sparse_mla_prefill_mg_kernel(
     using SMG = SmemPtrsMG<MT, CM>;
 
     static constexpr int NI = TOPK / BI;
+    static constexpr int NI_EXTRA = TOPK_EXTRA / BI;
+    static constexpr int NI_TOTAL = NI + NI_EXTRA;
     static constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA;
     static constexpr int QK_NOPE_KSTEPS = KV::QUANT_TILE / 32;
 
@@ -508,6 +533,8 @@ sparse_mla_prefill_mg_kernel(
 
     const int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK;
     const int actual_ni = (topk_len + BI - 1) / BI;
+    const int topk_len_extra = (TOPK_EXTRA == 0) ? 0
+        : (cold.topk_length_extra ? __ldg(cold.topk_length_extra + s_i) : TOPK_EXTRA);
 
     const int warp_rank = threadIdx.x / 32;
     const int wy = warp_rank / 4;
@@ -521,7 +548,7 @@ sparse_mla_prefill_mg_kernel(
     }
     bar_sync_t<3, BLOCK_THREADS>();
 
-    // ── IO warps (identical to SG) ──────────────────────────────────
+    // ── IO warps (identical to SG, plus dual-cache phase switch) ────
     if (wy == 2) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
 
@@ -529,6 +556,23 @@ sparse_mla_prefill_mg_kernel(
         const int32_t* idx_base = indices + (size_t)s_i * TOPK;
         const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
+        // Per-tile data-source selection. When TOPK_EXTRA == 0, helpers
+        // collapse via if-constexpr to the existing single-cache form.
+        auto tile_kv_ptr = [&] (int ti) -> const uint8_t* {
+            if constexpr (TOPK_EXTRA == 0) return KV_cache;
+            return (ti < NI) ? KV_cache : KV_cache_extra;
+        };
+        auto tile_stride = [&] (int ti) -> size_t {
+            if constexpr (TOPK_EXTRA == 0) return stride_kv_block;
+            return (ti < NI) ? stride_kv_block : stride_kv_block_extra;
+        };
+        auto tile_idx_ptr = [&] (int ti) -> const int32_t* {
+            if constexpr (TOPK_EXTRA == 0) return idx_base + ti * BI;
+            if (ti < NI) return idx_base + ti * BI;
+            return indices_extra + (size_t)s_i * TOPK_EXTRA + (ti - NI) * BI;
+        };
+
+        // Prologue: gather tile 0 (always main cache; idx_base + 0 == ptr).
         io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
             sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid,
             stride_kv_block, kv_l2_policy);
@@ -536,18 +580,49 @@ sparse_mla_prefill_mg_kernel(
             sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid, stride_kv_block);
         __threadfence_block();
 
+        // For dual-cache (TOPK_EXTRA > 0) we always iterate NI_TOTAL — topk_length
+        // masking happens at the QK stage. For single-cache, short-circuit at
+        // actual_ni (saves IO bandwidth when topk_length < TOPK).
+        const int loop_bound = (TOPK_EXTRA == 0) ? actual_ni : NI_TOTAL;
         #pragma unroll 1
-        for (int ti = 0; ti < actual_ni; ti++) {
-            if (ti + 1 < actual_ni) {
-                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
-                    sm.kv_bufs[(ti + 1) & 1],
-                    idx_base + (ti + 1) * BI, KV_cache,
-                    sm.mbar_kv + ((ti + 1) & 1), io_tid,
-                    stride_kv_block, kv_l2_policy);
-                io_gather_scales<MT, PAGE_BLOCK_SIZE>(
-                    sm.kv_scale_bufs[(ti + 1) & 1],
-                    idx_base + (ti + 1) * BI, KV_cache, io_tid,
-                    stride_kv_block);
+        for (int ti = 0; ti < loop_bound; ti++) {
+            if (ti + 1 < loop_bound) {
+                const uint8_t* next_kv = tile_kv_ptr(ti + 1);
+                const size_t   next_stride = tile_stride(ti + 1);
+                const int32_t* next_idx = tile_idx_ptr(ti + 1);
+                if constexpr (TOPK_EXTRA == 0) {
+                    io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+                        sm.kv_bufs[(ti + 1) & 1],
+                        next_idx, next_kv,
+                        sm.mbar_kv + ((ti + 1) & 1), io_tid,
+                        next_stride, kv_l2_policy);
+                    io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                        sm.kv_scale_bufs[(ti + 1) & 1],
+                        next_idx, next_kv, io_tid,
+                        next_stride);
+                } else {
+                    if (ti + 1 < NI) {
+                        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+                            sm.kv_bufs[(ti + 1) & 1],
+                            next_idx, next_kv,
+                            sm.mbar_kv + ((ti + 1) & 1), io_tid,
+                            next_stride, kv_l2_policy);
+                        io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                            sm.kv_scale_bufs[(ti + 1) & 1],
+                            next_idx, next_kv, io_tid,
+                            next_stride);
+                    } else {
+                        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
+                            sm.kv_bufs[(ti + 1) & 1],
+                            next_idx, next_kv,
+                            sm.mbar_kv + ((ti + 1) & 1), io_tid,
+                            next_stride, kv_l2_policy);
+                        io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
+                            sm.kv_scale_bufs[(ti + 1) & 1],
+                            next_idx, next_kv, io_tid,
+                            next_stride);
+                    }
+                }
                 __threadfence_block();
             }
             bar_sync_t<1, BLOCK_THREADS>();
@@ -562,6 +637,22 @@ sparse_mla_prefill_mg_kernel(
         const int gid = lane >> 2, tid = lane & 3;
         const float sm_scale_log2e = sm_scale * LOG2E;
         const int32_t* idx_base = indices + (size_t)s_i * TOPK;
+
+        // Per-tile data-source selection (mirror of the IO-warp helpers).
+        // Dead-code-elided to single-cache form when TOPK_EXTRA == 0.
+        auto tile_kv_ptr = [&] (int ti) -> const uint8_t* {
+            if constexpr (TOPK_EXTRA == 0) return KV_cache;
+            return (ti < NI) ? KV_cache : KV_cache_extra;
+        };
+        auto tile_stride = [&] (int ti) -> size_t {
+            if constexpr (TOPK_EXTRA == 0) return stride_kv_block;
+            return (ti < NI) ? stride_kv_block : stride_kv_block_extra;
+        };
+        auto tile_idx_ptr = [&] (int ti) -> const int32_t* {
+            if constexpr (TOPK_EXTRA == 0) return idx_base + ti * BI;
+            if (ti < NI) return idx_base + ti * BI;
+            return indices_extra + (size_t)s_i * TOPK_EXTRA + (ti - NI) * BI;
+        };
 
         // ── Quantize Q for both groups (serial, reuse reduce_buf) ───
         #pragma unroll
@@ -603,10 +694,20 @@ sparse_mla_prefill_mg_kernel(
         mbarrier_wait_parity(sm.mbar_kv + 0, 0);
 
         // ── Main loop ───────────────────────────────────────────────
+        // Same loop_bound rule as IO: dual-cache iterates NI_TOTAL (mask via QK),
+        // single-cache short-circuits at actual_ni.
+        const int math_loop_bound = (TOPK_EXTRA == 0) ? actual_ni : NI_TOTAL;
         #pragma unroll 1
-        for (int ti = 0; ti < actual_ni; ti++) {
+        for (int ti = 0; ti < math_loop_bound; ti++) {
             uint8_t* kv_smem = sm.kv_bufs[ti & 1];
-            const int32_t* ib = idx_base + ti * BI;
+            const int32_t* ib = tile_idx_ptr(ti);
+            // Per-tile global KV pointer / stride. When TOPK_EXTRA == 0 these
+            // collapse to the original constants.
+            const uint8_t* kv_global = tile_kv_ptr(ti);
+            const size_t stride_kv_block_now = tile_stride(ti);
+            const int page_block_size_now =
+                (TOPK_EXTRA == 0 || ti < NI)
+                ? page_block_size : page_block_size_extra;
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
             uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
@@ -616,12 +717,12 @@ sparse_mla_prefill_mg_kernel(
                 int idx = ib[qk_nb + gid];
                 idx = (idx >= 0) ? idx : 0;
                 if constexpr (KV::V_HAS_ROPE) {
-                    int bi_e = idx / page_block_size;
-                    int li_e = idx % page_block_size;
-                    entry_base_gid = KV_cache + (size_t)bi_e * stride_kv_block
-                                              + (size_t)li_e * IO::IO_STRIDE;
+                    int bi_e = idx / page_block_size_now;
+                    int li_e = idx % page_block_size_now;
+                    entry_base_gid = kv_global + (size_t)bi_e * stride_kv_block_now
+                                               + (size_t)li_e * IO::IO_STRIDE;
                 } else {
-                    entry_base_gid = KV_cache + (size_t)idx * IO::IO_STRIDE;
+                    entry_base_gid = kv_global + (size_t)idx * IO::IO_STRIDE;
                 }
             }
 
@@ -671,15 +772,35 @@ sparse_mla_prefill_mg_kernel(
                 // QK rope (reuses prefetched B operands)
                 compute_qk_rope(qk, q_rope_regs[g], rope_pf);
 
-                // Invalid index masking + topk_length overflow
+                // Invalid index masking + topk_length overflow. For dual-cache
+                // (TOPK_EXTRA > 0): main-phase tiles (ti < NI) use topk_len
+                // against absolute index (ti * BI + e); extra-phase tiles
+                // (ti >= NI) use topk_len_extra against the relative index
+                // ((ti - NI) * BI + e).
                 {
                     int e0 = qk_nb + tid * 2, e1 = e0 + 1;
                     if (ib[e0] < 0) { qk[0] = -1e30f; qk[2] = -1e30f; }
                     if (ib[e1] < 0) { qk[1] = -1e30f; qk[3] = -1e30f; }
-                    if (cold.topk_length != nullptr) {
-                        int a0 = ti * BI + e0, a1 = ti * BI + e1;
-                        if (a0 >= topk_len) { qk[0] = -1e30f; qk[2] = -1e30f; }
-                        if (a1 >= topk_len) { qk[1] = -1e30f; qk[3] = -1e30f; }
+                    if constexpr (TOPK_EXTRA == 0) {
+                        if (cold.topk_length != nullptr) {
+                            int a0 = ti * BI + e0, a1 = ti * BI + e1;
+                            if (a0 >= topk_len) { qk[0] = -1e30f; qk[2] = -1e30f; }
+                            if (a1 >= topk_len) { qk[1] = -1e30f; qk[3] = -1e30f; }
+                        }
+                    } else {
+                        if (ti < NI) {
+                            if (cold.topk_length != nullptr) {
+                                int a0 = ti * BI + e0, a1 = ti * BI + e1;
+                                if (a0 >= topk_len) { qk[0] = -1e30f; qk[2] = -1e30f; }
+                                if (a1 >= topk_len) { qk[1] = -1e30f; qk[3] = -1e30f; }
+                            }
+                        } else {
+                            if (cold.topk_length_extra != nullptr) {
+                                int a0 = (ti - NI) * BI + e0, a1 = (ti - NI) * BI + e1;
+                                if (a0 >= topk_len_extra) { qk[0] = -1e30f; qk[2] = -1e30f; }
+                                if (a1 >= topk_len_extra) { qk[1] = -1e30f; qk[3] = -1e30f; }
+                            }
+                        }
                     }
                 }
 
@@ -835,17 +956,38 @@ sparse_mla_prefill_mg_kernel(
 
             // ── XV rope BF16 MMA (MODEL1, both groups) ──────────────
             if constexpr (KV::V_HAS_ROPE) {
-                #pragma unroll
-                for (int g = 0; g < MG_N_HG; g++) {
-                    xv_rope_mma<MT, PAGE_BLOCK_SIZE>(
-                        acc_rope[g], w_grp[g][0], w_grp[g][1], w_grp[g][2], w_grp[g][3],
-                        ib, KV_cache, mwarp, lane, stride_kv_block,
-                        reinterpret_cast<bf16*>(sm.w_fp8));
+                bar_sync_t<2, MATH_THREADS>();
+                if constexpr (TOPK_EXTRA == 0) {
+                    #pragma unroll
+                    for (int g = 0; g < MG_N_HG; g++) {
+                        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(
+                            acc_rope[g], w_grp[g][0], w_grp[g][1], w_grp[g][2], w_grp[g][3],
+                            ib, kv_global, mwarp, lane, stride_kv_block_now,
+                            reinterpret_cast<bf16*>(sm.w_fp8));
+                    }
+                } else {
+                    if (ti < NI) {
+                        #pragma unroll
+                        for (int g = 0; g < MG_N_HG; g++) {
+                            xv_rope_mma<MT, PAGE_BLOCK_SIZE>(
+                                acc_rope[g], w_grp[g][0], w_grp[g][1], w_grp[g][2], w_grp[g][3],
+                                ib, kv_global, mwarp, lane, stride_kv_block_now,
+                                reinterpret_cast<bf16*>(sm.w_fp8));
+                        }
+                    } else {
+                        #pragma unroll
+                        for (int g = 0; g < MG_N_HG; g++) {
+                            xv_rope_mma<MT, PAGE_BLOCK_SIZE_EXTRA>(
+                                acc_rope[g], w_grp[g][0], w_grp[g][1], w_grp[g][2], w_grp[g][3],
+                                ib, kv_global, mwarp, lane, stride_kv_block_now,
+                                reinterpret_cast<bf16*>(sm.w_fp8));
+                        }
+                    }
                 }
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();
-            if (ti + 1 < actual_ni) {
+            if (ti + 1 < math_loop_bound) {
                 const int next_phase = ((ti + 1) >> 1) & 1;
                 mbarrier_wait_parity(sm.mbar_kv + ((ti + 1) & 1), next_phase);
             }
@@ -881,6 +1023,8 @@ sparse_mla_prefill_mg_kernel(
 
         #pragma unroll
         for (int g = 0; g < MG_N_HG; g++) {
+            // attn_sink folded into the normalizer (FlashMLA V4 convention).
+            // See SG epilogue for full derivation.
             float il0, il1;
             if (cold.attn_sink != nullptr) {
                 int h0 = h_start + g * HPB + gid, h1 = h0 + 8;

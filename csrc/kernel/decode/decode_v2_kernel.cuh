@@ -49,7 +49,11 @@ struct DecodeV2ColdParams {
     size_t stride_extra_kv_block;  // extra cache block stride
 };
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+// PAGE_BLOCK_SIZE_EXTRA defaults to PAGE_BLOCK_SIZE so existing v2 instantiations
+// remain a strict subset. When extra cache uses a different block size (DSv4
+// C128A: PAGE_BLOCK_SIZE=64 + PAGE_BLOCK_SIZE_EXTRA=2), set it explicitly.
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_decode_v2_kernel(
     const bf16* __restrict__ Q,
@@ -69,6 +73,7 @@ sparse_mla_decode_v2_kernel(
     const int num_batches = cold.num_batches;
     const int s_q = cold.s_q;
     constexpr int page_block_size = PAGE_BLOCK_SIZE;
+    constexpr int page_block_size_extra = PAGE_BLOCK_SIZE_EXTRA;
     const size_t stride_kv_block = cold.stride_kv_block;
     const int topk = cold.topk;
     using KV = KVCacheTraits<MT>;
@@ -141,24 +146,28 @@ sparse_mla_decode_v2_kernel(
         const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
         const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
-        // Per-tile IO gather — select main vs extra cache based on block index
+        // Per-tile IO gather — select main vs extra cache based on block index.
+        // When PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE (typical), both branches
+        // compile to the same instantiation; otherwise the extra-cache branch
+        // picks the smaller block-size kernel (e.g. DSv4 C128A: 2).
         auto io_gather_one = [&](int global_blk, int buf_idx) {
-            const int32_t* idx_ptr;
-            const uint8_t* kv_ptr;
-            size_t kv_str;
             if (global_blk < num_orig_blocks) {
-                idx_ptr = indices + (size_t)s_i * topk + (size_t)global_blk * BI;
-                kv_ptr = KV_cache; kv_str = stride_kv_block;
+                const int32_t* idx_ptr = indices + (size_t)s_i * topk + (size_t)global_blk * BI;
+                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+                    sm.kv_bufs[buf_idx], idx_ptr, KV_cache,
+                    sm.mbar_kv + buf_idx, io_tid, stride_kv_block, kv_l2_policy);
+                io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                    sm.kv_scale_bufs[buf_idx], idx_ptr, KV_cache, io_tid, stride_kv_block);
             } else {
                 int eb = global_blk - num_orig_blocks;
-                idx_ptr = extra_indices + (size_t)s_i * cold.extra_topk + (size_t)eb * BI;
-                kv_ptr = extra_KV_cache; kv_str = cold.stride_extra_kv_block;
+                const int32_t* idx_ptr = extra_indices + (size_t)s_i * cold.extra_topk + (size_t)eb * BI;
+                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
+                    sm.kv_bufs[buf_idx], idx_ptr, extra_KV_cache,
+                    sm.mbar_kv + buf_idx, io_tid, cold.stride_extra_kv_block, kv_l2_policy);
+                io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
+                    sm.kv_scale_bufs[buf_idx], idx_ptr, extra_KV_cache,
+                    io_tid, cold.stride_extra_kv_block);
             }
-            io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
-                sm.kv_bufs[buf_idx], idx_ptr, kv_ptr,
-                sm.mbar_kv + buf_idx, io_tid, kv_str, kv_l2_policy);
-            io_gather_scales<MT, PAGE_BLOCK_SIZE>(
-                sm.kv_scale_bufs[buf_idx], idx_ptr, kv_ptr, io_tid, kv_str);
         };
 
         // Prologue: gather tile 0
@@ -228,14 +237,21 @@ sparse_mla_decode_v2_kernel(
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
             uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
+            // Pick block-size for index decomposition based on which cache this
+            // tile reads from. When PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE the
+            // compiler folds this away.
+            const int tile_page_block_size =
+                (PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE || !is_extra_tile)
+                ? page_block_size : page_block_size_extra;
+
             const uint8_t* entry_base[ENTRIES_PER_WARP];
             if constexpr (KV::V_HAS_ROPE) {
                 #pragma unroll
                 for (int e = 0; e < ENTRIES_PER_WARP; e++) {
                     int idx = ib[qk_nb + e];
                     idx = (idx >= 0) ? idx : 0;
-                    int bi_e = idx / page_block_size;
-                    int li_e = idx % page_block_size;
+                    int bi_e = idx / tile_page_block_size;
+                    int li_e = idx % tile_page_block_size;
                     entry_base[e] = tile_kv_cache + (size_t)bi_e * tile_stride
                                                   + (size_t)li_e * IO::IO_STRIDE;
                 }
@@ -247,6 +263,34 @@ sparse_mla_decode_v2_kernel(
 
             for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = 0.f;
+
+            // Zero kv_smem rows for invalid (-1) entries so XV NoPE MMA picks
+            // up exact-zero V instead of whatever garbage was in the clamp-
+            // target slot. The QK manual mask sets qk=-1e30 for invalid (so
+            // softmax weight is 0), but 0 * fp8_NaN in the MMA accumulator
+            // still produces NaN. Zeroing the FP8 bytes makes B exactly 0
+            // and the contribution exactly 0. The IO warp already gathered
+            // slot-0 data here; we just stomp on it.
+            // Each warp owns ENTRIES_PER_WARP entries (qk_nb..qk_nb+EPW).
+            // 32 lanes cooperatively zero each invalid entry's NoPE region.
+            // NOTE: XV MMA reads 32-entry tiles that span MULTIPLE warps'
+            // owned entries, so we need a *block-level* sync (not just
+            // __syncwarp) before any subsequent reader sees the zeroed data.
+            {
+                constexpr int BYTES_PER_LANE = (KV::KV_SMEM_COPY_BYTES + 31) / 32;
+                #pragma unroll
+                for (int e = 0; e < ENTRIES_PER_WARP; e++) {
+                    if (ib[qk_nb + e] < 0) {
+                        uint8_t* row = kv_smem + (qk_nb + e) * KV::KV_SMEM_STRIDE;
+                        #pragma unroll
+                        for (int b = 0; b < BYTES_PER_LANE; b++) {
+                            int off = lane * BYTES_PER_LANE + b;
+                            if (off < KV::KV_SMEM_COPY_BYTES) row[off] = 0;
+                        }
+                    }
+                }
+                bar_sync_t<2, MATH_THREADS>();
+            }
 
             KVRopePrefetch rope_pf = prefetch_kv_rope(
                 reinterpret_cast<const bf16*>(entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET), lane);
@@ -431,13 +475,27 @@ sparse_mla_decode_v2_kernel(
                     bar_sync_t<2, MATH_THREADS>();
             }
 
-            // XV rope
+            // XV rope — pick the matching block-size template instantiation.
             if constexpr (KV::V_HAS_ROPE) {
                 bar_sync_t<2, MATH_THREADS>();
-                xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
-                    ib, tile_kv_cache, mwarp, lane,
-                    tile_stride,
-                    reinterpret_cast<bf16*>(sm.w_fp8));
+                if constexpr (PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE) {
+                    xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
+                        ib, tile_kv_cache, mwarp, lane,
+                        tile_stride,
+                        reinterpret_cast<bf16*>(sm.w_fp8));
+                } else {
+                    if (!is_extra_tile) {
+                        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
+                            ib, tile_kv_cache, mwarp, lane,
+                            tile_stride,
+                            reinterpret_cast<bf16*>(sm.w_fp8));
+                    } else {
+                        xv_rope_mma<MT, PAGE_BLOCK_SIZE_EXTRA>(acc_rope, w0, w1, w2, w3,
+                            ib, tile_kv_cache, mwarp, lane,
+                            tile_stride,
+                            reinterpret_cast<bf16*>(sm.w_fp8));
+                    }
+                }
             }
 
             bar_arrive_t<1, BLOCK_THREADS>();
