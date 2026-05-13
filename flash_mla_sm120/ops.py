@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 def _load_lib():
@@ -35,11 +35,24 @@ def sparse_mla_decode_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    out: Optional[torch.Tensor] = None,
+    # Dual-cache extras (API-skin; currently no-op in kernel).
+    # Plumbed to the C++ binding which emits TORCH_WARN_ONCE if any are set,
+    # making it visible that the second-cache contribution is being dropped.
+    extra_kv_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sparse MLA decode forward: splitkv + combine.
 
+    If `out` is provided, the combine kernel writes directly into it
+    (no extra allocation/copy). `out` must be a contiguous bfloat16 tensor
+    with shape (num_tokens, num_heads, d_v).
+
     Returns:
-        output: [num_tokens, num_heads, d_v] bfloat16
+        output: [num_tokens, num_heads, d_v] bfloat16 (same storage as `out` if provided)
         lse: [num_tokens, num_heads] float32
     """
     _C = _load_lib()
@@ -47,7 +60,12 @@ def sparse_mla_decode_fwd(
     topk = indices.shape[-1]
 
     assert q.is_contiguous()
-    assert kv_cache.is_contiguous()
+    # kv_cache is paged and may be unsqueezed/padded by the caller; the kernel
+    # consumes stride_kv_row + page_block_size, so we only require the innermost
+    # head-bytes dim to be contiguous (stride == 1).
+    assert kv_cache.stride(-1) == 1, (
+        f"kv_cache innermost dim must be contiguous; got strides {kv_cache.stride()}"
+    )
     assert indices.dtype == torch.int32 and indices.is_contiguous()
     assert num_tokens <= _DECODE_THRESHOLD
 
@@ -69,13 +87,27 @@ def sparse_mla_decode_fwd(
     _C.sparse_mla_splitkv_fwd(
         q, kv_cache, indices, partial_O, partial_LSE,
         sm_scale, topk, tiles_per_split, stride_kv_row, page_block_size,
+        KV_cache_extra=extra_kv_cache,
+        indices_extra=extra_indices,
+        topk_length=topk_length,
+        topk_length_extra=extra_topk_length,
+        attn_sink=attn_sink,
     )
 
-    # Combine
-    output = torch.empty(
-        (num_tokens, num_heads, d_v),
-        dtype=torch.bfloat16, device=q.device,
-    )
+    # Combine — write directly into caller-provided `out` when available.
+    if out is None:
+        output = torch.empty(
+            (num_tokens, num_heads, d_v),
+            dtype=torch.bfloat16, device=q.device,
+        )
+    else:
+        assert out.shape == (num_tokens, num_heads, d_v), (
+            f"out shape {tuple(out.shape)} != expected "
+            f"{(num_tokens, num_heads, d_v)}"
+        )
+        assert out.dtype == torch.bfloat16
+        assert out.is_contiguous()
+        output = out
     lse = torch.empty(
         (num_tokens, num_heads),
         dtype=torch.float32, device=q.device,
@@ -91,27 +123,52 @@ def sparse_mla_prefill_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    out: Optional[torch.Tensor] = None,
+    # Dual-cache extras (API-skin; currently no-op in kernel).
+    extra_kv_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     _C = _load_lib()
     num_tokens, num_heads, d_qk = q.shape
     topk = indices.shape[-1]
 
     assert q.is_contiguous()
-    assert kv_cache.is_contiguous()
+    # Same relaxation as decode: kernel takes explicit stride_kv_row, only
+    # requires innermost head-bytes dim contiguous.
+    assert kv_cache.stride(-1) == 1, (
+        f"kv_cache innermost dim must be contiguous; got strides {kv_cache.stride()}"
+    )
     assert indices.dtype == torch.int32 and indices.is_contiguous()
 
     stride_kv_row = kv_cache.stride(-2) * kv_cache.element_size()
     page_block_size = kv_cache.shape[-3] if kv_cache.dim() >= 3 else 1
 
-    output = torch.empty(
-        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=q.device
-    )
+    if out is None:
+        output = torch.empty(
+            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=q.device
+        )
+    else:
+        assert out.shape == (num_tokens, num_heads, d_v), (
+            f"out shape {tuple(out.shape)} != expected "
+            f"{(num_tokens, num_heads, d_v)}"
+        )
+        assert out.dtype == torch.bfloat16
+        assert out.is_contiguous()
+        output = out
     lse = torch.empty(
         (num_tokens, num_heads), dtype=torch.float32, device=q.device
     )
     _C.sparse_mla_prefill_fwd(
         q, kv_cache, indices, output, lse,
         sm_scale, topk, stride_kv_row, page_block_size,
+        KV_cache_extra=extra_kv_cache,
+        indices_extra=extra_indices,
+        topk_length=topk_length,
+        topk_length_extra=extra_topk_length,
+        attn_sink=attn_sink,
     )
     return output, lse
 
@@ -122,8 +179,26 @@ def sparse_mla_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    out: Optional[torch.Tensor] = None,
+    # Dual-cache extras (API-skin; currently no-op in kernel).
+    extra_kv_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
 ):
+    kwargs = dict(
+        extra_kv_cache=extra_kv_cache,
+        extra_indices=extra_indices,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+        attn_sink=attn_sink,
+    )
     num_tokens = q.shape[0]
     if num_tokens <= _DECODE_THRESHOLD:
-        return sparse_mla_decode_fwd(q, kv_cache, indices, sm_scale, d_v)
-    return sparse_mla_prefill_fwd(q, kv_cache, indices, sm_scale, d_v)
+        return sparse_mla_decode_fwd(
+            q, kv_cache, indices, sm_scale, d_v, out=out, **kwargs
+        )
+    return sparse_mla_prefill_fwd(
+        q, kv_cache, indices, sm_scale, d_v, out=out, **kwargs
+    )

@@ -56,8 +56,9 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from .ops import sparse_mla_decode_fwd
+    from .ops import _DECODE_THRESHOLD, sparse_mla_decode_fwd, sparse_mla_prefill_fwd
 
     sched_meta = tile_scheduler_metadata
     assert isinstance(sched_meta, FlashMLASchedMeta)
@@ -72,11 +73,43 @@ def flash_mla_with_kvcache(
     q_input = q.reshape(-1, q.shape[-2], q.shape[-1])  # [b*s_q, h_q, d_qk]
     idx_input = indices.reshape(q_input.shape[0], -1)   # [b*s_q, topk]
 
+    # If caller provided an output buffer, pass it through as a view that
+    # matches the underlying kernel's (num_tokens, num_heads, d_v) layout
+    # so the combine/prefill kernel writes directly into it (no copy).
+    out_view = None
+    if out is not None:
+        out_view = out.view(q_input.shape[0], q_input.shape[1], head_dim_v)
+
+    # Dispatch by num_tokens: the decode kernel is split-KV and capped at
+    # _DECODE_THRESHOLD queries; larger batches go to the prefill kernel.
+    # Dual-cache extras (API-skin; currently no-op in kernel — see
+    # sparse_mla_sm120/csrc/binding.cpp for the TORCH_WARN_ONCE that fires
+    # when these are provided). Plumb them through so the C++ layer sees them.
+    extra_idx_input = None
+    if extra_indices_in_kvcache is not None:
+        extra_idx_input = extra_indices_in_kvcache.reshape(q_input.shape[0], -1)
+
+    extra_kwargs = dict(
+        extra_kv_cache=extra_k_cache,
+        extra_indices=extra_idx_input,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+        attn_sink=attn_sink,
+    )
+
     # Do NOT reshape k_cache — preserve (num_blocks, page_block_size, 1, bpt)
     # for correct page_block_size derivation in ops.py (MODEL1 footer layout)
-    output, real_lse = sparse_mla_decode_fwd(
-        q_input, k_cache, idx_input, softmax_scale, head_dim_v
-    )
+    num_tokens = q_input.shape[0]
+    if num_tokens <= _DECODE_THRESHOLD:
+        output, real_lse = sparse_mla_decode_fwd(
+            q_input, k_cache, idx_input, softmax_scale, head_dim_v,
+            out=out_view, **extra_kwargs,
+        )
+    else:
+        output, real_lse = sparse_mla_prefill_fwd(
+            q_input, k_cache, idx_input, softmax_scale, head_dim_v,
+            out=out_view, **extra_kwargs,
+        )
 
     batch = q.shape[0]
     s_q = q.shape[1] if q.dim() == 4 else 1
@@ -96,20 +129,40 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    # Dual-cache extras (API-skin; currently no-op in kernel).
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from .ops import sparse_mla_fwd
 
+    extra_idx = None
+    if extra_indices_in_kvcache is not None:
+        # Match the squeeze-on-dim-3 convention applied to `indices`.
+        extra_idx = (extra_indices_in_kvcache.squeeze(1)
+                     if extra_indices_in_kvcache.dim() == 3
+                     else extra_indices_in_kvcache)
+
+    # Caller may pass `out` with shape (num_tokens, h_q, d_v) — the kernel's
+    # native output layout — so forward it directly with no view gymnastics.
     result = sparse_mla_fwd(
         q, kv, indices.squeeze(1) if indices.dim() == 3 else indices,
-        sm_scale, d_v)
+        sm_scale, d_v, out=out,
+        extra_kv_cache=extra_k_cache,
+        extra_indices=extra_idx,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+        attn_sink=attn_sink,
+    )
 
     if isinstance(result, tuple):
-        out, lse = result
+        output, lse = result
     else:
-        out, lse = result, None
+        output, lse = result, None
 
     if lse is None:
         lse = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
     max_logits = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
 
-    return out, max_logits, lse
+    return output, max_logits, lse

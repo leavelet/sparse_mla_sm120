@@ -131,7 +131,13 @@ void sparse_mla_prefill_launch_model1(
             Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, \
             sm_scale, num_tokens, stride_kv_block, stream)
 
-    if (topk == 512) {
+    if (topk == 128) {
+        switch (num_heads) {
+        case 64:  DISPATCH_MG(64, 128); break;
+        case 128: DISPATCH_MG(128, 128); break;
+        default:  TORCH_CHECK(false, "MODEL1 prefill: unsupported num_heads=", num_heads);
+        }
+    } else if (topk == 512) {
         switch (num_heads) {
         case 64:  DISPATCH_MG(64, 512); break;
         case 128: DISPATCH_MG(128, 512); break;
