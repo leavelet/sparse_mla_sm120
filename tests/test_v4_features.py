@@ -15,7 +15,7 @@ sys.path.insert(0, 'tests')
 from flash_mla_sm120.cuda import (
     get_decode_metadata,
     sparse_mla_splitkv_v2_fwd,
-    sparse_mla_combine_fwd,
+    sparse_mla_combine_v2_fwd,
 )
 from test_decode import quantize_kv_model1, dequantize_kv_model1
 
@@ -199,20 +199,13 @@ def run_v4_decode_test(num_heads, topk, batch_size,
         extra_topk_length)
     torch.cuda.synchronize()
 
-    # Combine for split batches
-    ns_cpu = num_splits.cpu().tolist()
-    for i in range(batch_size):
-        my_splits = ns_cpu[i + 1] - ns_cpu[i]
-        if my_splits <= 1:
-            continue
-        start = ns_cpu[i]
-        po = o_accum[start:start + my_splits, 0:1, :, :].squeeze(1).unsqueeze(0)
-        pl = lse_accum[start:start + my_splits, 0:1, :].squeeze(1).unsqueeze(0)
-        o_i = torch.empty(1, num_heads, d_v, dtype=torch.bfloat16, device="cuda")
-        l_i = torch.empty(1, num_heads, dtype=torch.float32, device="cuda")
-        sparse_mla_combine_fwd(po, pl, o_i, l_i, my_splits, attn_sink)
-        output[i] = o_i[0]
-        out_lse[i] = l_i[0]
+    # V2 combine: single launch for all batches
+    ns_cpu = num_splits.cpu()
+    max_nsplits = max((ns_cpu[i+1] - ns_cpu[i]).item() for i in range(batch_size))
+    if max_nsplits > 1:
+        sparse_mla_combine_v2_fwd(
+            o_accum, lse_accum, output, out_lse,
+            num_splits, batch_size, max_nsplits, attn_sink)
 
     out_view = output.view_as(ref_out)
     err = (out_view.float() - ref_out.float()).abs()

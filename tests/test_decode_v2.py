@@ -16,7 +16,7 @@ import flash_mla_sm120
 from flash_mla_sm120.cuda import (
     get_decode_metadata,
     sparse_mla_splitkv_v2_fwd,
-    sparse_mla_combine_fwd,
+    sparse_mla_combine_v2_fwd,
 )
 from test_decode import (
     quantize_kv_v32, dequantize_kv_v32,
@@ -98,38 +98,13 @@ def run_decode_v2_test(model_type, d_qk, d_v, topk, num_heads, batch_size,
         num_sm_parts, attn_sink)
     torch.cuda.synchronize()
 
-    # For batches that got is_no_split, output is already final.
-    # For split batches, need combine.
-    # For simplicity in v2 testing: always run combine on o_accum/lse_accum
-    # (is_no_split path writes directly to output, so combine is harmless
-    #  as long as we read from the right place)
-    #
-    # Actually, we need to check: for is_no_split batches, output is already
-    # correct. For split batches, we need to combine. Let's just check output
-    # directly — the v2 kernel writes final bf16 for is_no_split, and combine
-    # handles the rest.
-
-    # Run combine for split batches
-    ns_cpu = num_splits.cpu().tolist()
-    # Check if any batch has > 1 split
-    needs_combine = any(ns_cpu[i+1] - ns_cpu[i] > 1 for i in range(batch_size))
-    if needs_combine:
-        # Run combine per-batch — for now use the v1 combine with max splits
-        max_splits = max(ns_cpu[i+1] - ns_cpu[i] for i in range(batch_size))
-        for i in range(batch_size):
-            my_splits = ns_cpu[i+1] - ns_cpu[i]
-            if my_splits <= 1:
-                continue  # is_no_split, already written by v2 kernel
-            start = ns_cpu[i]
-            po = o_accum[start:start+my_splits, 0:1, :, :]  # [splits, 1, heads, dv]
-            po = po.squeeze(1).unsqueeze(0)  # [1, splits, heads, dv]
-            pl = lse_accum[start:start+my_splits, 0:1, :]  # [splits, 1, heads]
-            pl = pl.squeeze(1).unsqueeze(0)  # [1, splits, heads]
-            o_i = torch.empty(1, num_heads, d_v, dtype=torch.bfloat16, device="cuda")
-            l_i = torch.empty(1, num_heads, dtype=torch.float32, device="cuda")
-            sparse_mla_combine_fwd(po, pl, o_i, l_i, my_splits, attn_sink)
-            output[i] = o_i[0]
-            out_lse[i] = l_i[0]
+    # V2 combine: single launch for all batches
+    ns_cpu = num_splits.cpu()
+    max_nsplits = max((ns_cpu[i+1] - ns_cpu[i]).item() for i in range(batch_size))
+    if max_nsplits > 1:
+        sparse_mla_combine_v2_fwd(
+            o_accum, lse_accum, output, out_lse,
+            num_splits, batch_size, max_nsplits, attn_sink)
 
     out_view = output.view_as(ref_out)
     err = (out_view.float() - ref_out.float()).abs()
