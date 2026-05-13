@@ -64,6 +64,17 @@ void sparse_mla_prefill_launch_model1(
     int page_block_size, int stride_kv_row,
     cudaStream_t stream);
 
+void sparse_mla_prefill_launch_model1_dual(
+    torch::Tensor Q,
+    torch::Tensor KV_cache, torch::Tensor indices,
+    torch::Tensor KV_cache_extra, torch::Tensor indices_extra,
+    torch::Tensor output, torch::Tensor out_lse,
+    float sm_scale, int num_heads, int num_tokens,
+    int topk, int topk_extra,
+    int page_block_size, int stride_kv_row,
+    int page_block_size_extra, int stride_kv_row_extra,
+    cudaStream_t stream);
+
 // ── Python-facing functions ─────────────────────────────────────────
 
 static constexpr int HPB = 16;
@@ -198,19 +209,42 @@ void sparse_mla_prefill_fwd(
     TORCH_CHECK(num_heads % HPB == 0);
     TORCH_CHECK(page_block_size > 0, "page_block_size must be > 0");
 
-    if (KV_cache_extra.has_value() || indices_extra.has_value()
-        || topk_length.has_value() || topk_length_extra.has_value()
+    if (topk_length.has_value() || topk_length_extra.has_value()
         || attn_sink.has_value()) {
         TORCH_WARN_ONCE(
-            "sparse_mla_prefill_fwd: extras (KV_cache_extra/indices_extra/"
-            "topk_length/topk_length_extra/attn_sink) are accepted by the "
-            "binding but not yet plumbed to the kernel. Single-cache "
-            "softmax/output is being computed; second-cache contribution is "
-            "currently DROPPED. Tracking: dual-cache kernel work staged.");
+            "sparse_mla_prefill_fwd: topk_length / topk_length_extra / "
+            "attn_sink are accepted but not yet plumbed to the kernel. "
+            "Pad indices with -1 beyond the valid range; attn_sink is "
+            "currently dropped.");
     }
 
     ModelType mt = infer_model_type(d_qk);
     const cudaStream_t stream = get_current_stream(Q);
+
+    // Dual-cache path: routed when both KV_cache_extra and indices_extra
+    // are provided. Only MODEL1 is supported in this slice.
+    if (KV_cache_extra.has_value() && indices_extra.has_value()) {
+        TORCH_CHECK(mt == ModelType::MODEL1,
+            "Dual-cache prefill is only implemented for MODEL1 currently; "
+            "got d_qk=", d_qk);
+        torch::Tensor KV_extra = KV_cache_extra.value();
+        torch::Tensor idx_extra = indices_extra.value();
+        TORCH_CHECK(KV_extra.is_cuda() && idx_extra.is_cuda(),
+            "KV_cache_extra and indices_extra must be CUDA tensors");
+        int page_block_size_extra = (int)KV_extra.size(-3);
+        int stride_kv_row_extra = (int)(KV_extra.stride(-2) * KV_extra.element_size());
+        int topk_extra = (int)idx_extra.size(-1);
+
+        sparse_mla_prefill_launch_model1_dual(
+            Q, KV_cache, indices, KV_extra, idx_extra,
+            output, out_lse,
+            sm_scale, num_heads, num_tokens,
+            topk, topk_extra,
+            page_block_size, stride_kv_row,
+            page_block_size_extra, stride_kv_row_extra,
+            stream);
+        return;
+    }
 
     switch (mt) {
     case ModelType::V32:
