@@ -14,6 +14,33 @@
 //
 // Template on ModelType to get correct Q_NOPE_STRIDE and NUM_SCALES.
 
+// BF16 Q load: simple cooperative copy from global to smem (no quantization).
+// Used when USE_BF16_QK=true (MODEL1). Eliminates atomicMax, FP8 conversion, scale computation.
+template <ModelType MT, int _MATH_THREADS>
+__device__ __forceinline__ void load_q_bf16_to_smem(
+    bf16* q_nope_bf16,
+    bf16* q_rope,
+    const bf16* q_base,
+    int valid_hpb = HPB)
+{
+    using KV = KVCacheTraits<MT>;
+    constexpr int D_NOPE = KV::D_NOPE;
+    constexpr int DIM = KV::D_QK;
+    constexpr int BF16_STRIDE = KV::Q_NOPE_BF16_STRIDE;
+
+    for (int idx = threadIdx.x; idx < HPB * D_NOPE; idx += _MATH_THREADS) {
+        int h = idx / D_NOPE, d = idx % D_NOPE;
+        q_nope_bf16[h * BF16_STRIDE + d] = (h < valid_hpb)
+            ? q_base[h * DIM + d] : __float2bfloat16(0.f);
+    }
+    for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
+        int h = i / D_ROPE, d = i % D_ROPE;
+        q_rope[h * D_ROPE + d] = (h < valid_hpb)
+            ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
+    }
+    bar_sync_t<2, _MATH_THREADS>();
+}
+
 template <ModelType MT, int _MATH_THREADS>
 __device__ __forceinline__ void quantize_q_to_smem(
     uint8_t* q_nope_fp8,

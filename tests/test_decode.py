@@ -179,7 +179,7 @@ def ref_sparse_attn_decode(q, kv_dequant, indices, sm_scale, d_v):
 # ── Helper to run decode and compare ────────────────────────────────
 
 def run_decode_test(model_type, d_qk, d_v, topk, num_heads, batch_size,
-                    block_size=64, num_blocks=64, atol=0.01):
+                    block_size=64, num_blocks=64, bf16_qk=True):
     torch.manual_seed(42)
     sm_scale = d_qk ** -0.5
     s_kv = num_blocks * block_size
@@ -206,7 +206,7 @@ def run_decode_test(model_type, d_qk, d_v, topk, num_heads, batch_size,
     idx_flat = indices.view(-1, topk)
 
     out, lse = flash_mla_sm120.sparse_mla_decode_fwd(
-        q_flat, kv_packed, idx_flat, sm_scale, d_v)
+        q_flat, kv_packed, idx_flat, sm_scale, d_v, bf16_qk=bf16_qk)
     out = out.view_as(ref_out)
 
     err = (out.float() - ref_out.float()).abs()
@@ -245,13 +245,17 @@ class TestMODEL1Decode:
         (16, 1024, 1), (16, 1024, 4),   # V4 Pro TP8
         (128, 1024, 1), (128, 1024, 4),  # V4 Pro TP1
     ])
-    def test_correctness(self, num_heads, topk, batch_size):
+    @pytest.mark.parametrize("bf16_qk", [True, False], ids=["bf16qk", "fp8qk"])
+    def test_correctness(self, num_heads, topk, batch_size, bf16_qk):
         max_err, mean_err = run_decode_test(
             "MODEL1", d_qk=512, d_v=512, topk=topk,
-            num_heads=num_heads, batch_size=batch_size)
-        print(f"\n  MODEL1 h={num_heads} topk={topk} bs={batch_size}: "
+            num_heads=num_heads, batch_size=batch_size, bf16_qk=bf16_qk)
+        tag = "BF16" if bf16_qk else "FP8"
+        threshold = 0.001 if bf16_qk else 0.002
+        print(f"\n  MODEL1[{tag}] h={num_heads} topk={topk} bs={batch_size}: "
               f"max_err={max_err:.6f} mean_err={mean_err:.6f}")
-        assert max_err < 0.001, f"MODEL1 decode failed: max_err={max_err}"
+        assert max_err < threshold, (
+            f"MODEL1 decode [{tag}] failed: max_err={max_err} > {threshold}")
 
 
 # ── attn_sink Tests (MODEL1 only) ───────────────────────────────────

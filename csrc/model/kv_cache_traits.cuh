@@ -52,6 +52,10 @@ struct KVCacheTraits<ModelType::V32> {
     __device__ static __forceinline__ uint8_t scale_to_ue8m0(float scale) {
         return static_cast<uint8_t>((__float_as_uint(scale) >> 23) & 0xFF);
     }
+
+    // V32: stays FP8 QK (Q quantized to FP8, block-scaled MMA)
+    static constexpr bool USE_BF16_QK = false;
+    static constexpr int Q_NOPE_BF16_STRIDE = D_NOPE + 8;  // 520 bf16 elements (unused for V32)
 };
 
 template <>
@@ -100,6 +104,10 @@ struct KVCacheTraits<ModelType::MODEL1> {
     __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale) {
         return scale;
     }
+
+    // MODEL1: BF16 QK (Q stays BF16, K dequanted online from FP8)
+    static constexpr bool USE_BF16_QK = true;
+    static constexpr int Q_NOPE_BF16_STRIDE = D_NOPE + 8;  // 456 bf16 elements (912 bytes, 4-way bank conflict)
 };
 
 // ============================================================================

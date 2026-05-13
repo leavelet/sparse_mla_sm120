@@ -7,7 +7,8 @@
 // MG (multi-group, 32 heads/CTA) for h>16 — 2x KV reuse + deferred row_sum.
 // ============================================================================
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 void launch_prefill_sg(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     bf16* output, float* out_lse,
@@ -17,12 +18,12 @@ void launch_prefill_sg(
     const int* topk_length_ptr,
     cudaStream_t stream)
 {
-    constexpr size_t smem_bytes = SmemLayout<MT, CM>::TOTAL;
+    constexpr size_t smem_bytes = SmemLayout<MT, CM, BF16_QK>::TOTAL;
     constexpr int REPLICATE_H = NUM_HEADS / HPB;
     dim3 grid(num_tokens * REPLICATE_H);
     dim3 block(BLOCK_THREADS);
 
-    auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
+    auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, BF16_QK>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -38,7 +39,8 @@ void launch_prefill_sg(
     CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 void launch_prefill_mg(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     bf16* output, float* out_lse,
@@ -48,12 +50,12 @@ void launch_prefill_mg(
     const int* topk_length_ptr,
     cudaStream_t stream)
 {
-    constexpr size_t smem_bytes = SmemLayoutMG<MT, CM>::TOTAL;
+    constexpr size_t smem_bytes = SmemLayoutMG<MT, CM, BF16_QK>::TOTAL;
     constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA;
     dim3 grid(num_tokens * REPLICATE_H);
     dim3 block(BLOCK_THREADS);
 
-    auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
+    auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, BF16_QK>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -122,6 +124,7 @@ void sparse_mla_prefill_launch_model1(
     int page_block_size, int stride_kv_row,
     const float* attn_sink_ptr,
     const int* topk_length_ptr,
+    bool bf16_qk,
     cudaStream_t stream)
 {
     auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
@@ -133,11 +136,16 @@ void sparse_mla_prefill_launch_model1(
 
     TORCH_CHECK(page_block_size == 64, "MODEL1 prefill: page_block_size must be 64, got ", page_block_size);
 
-    // MODEL1 always uses MG (h=64 or h=128, both > HPB)
     #define DISPATCH_MG(NH, TK) \
-        launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64>( \
-            Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, \
-            sm_scale, num_tokens, stride_kv_block, attn_sink_ptr, topk_length_ptr, stream)
+        if (bf16_qk) { \
+            launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, true>( \
+                Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, \
+                sm_scale, num_tokens, stride_kv_block, attn_sink_ptr, topk_length_ptr, stream); \
+        } else { \
+            launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, false>( \
+                Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, \
+                sm_scale, num_tokens, stride_kv_block, attn_sink_ptr, topk_length_ptr, stream); \
+        }
 
     if (topk == 512) {
         switch (num_heads) {

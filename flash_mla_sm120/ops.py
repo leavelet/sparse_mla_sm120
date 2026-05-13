@@ -36,13 +36,8 @@ def sparse_mla_decode_fwd(
     sm_scale: float,
     d_v: int = 512,
     attn_sink: torch.Tensor = None,
+    bf16_qk: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Sparse MLA decode forward: splitkv + combine.
-
-    Returns:
-        output: [num_tokens, num_heads, d_v] bfloat16
-        lse: [num_tokens, num_heads] float32
-    """
     _C = _load_lib()
     num_tokens, num_heads, d_qk = q.shape
     topk = indices.shape[-1]
@@ -56,7 +51,6 @@ def sparse_mla_decode_fwd(
     page_block_size = kv_cache.shape[-3] if kv_cache.dim() >= 3 else 1
     nsplits, tiles_per_split = _compute_decode_splits(num_tokens, num_heads, topk)
 
-    # Allocate workspace (float32 for combine precision)
     partial_O = torch.empty(
         (num_tokens, nsplits, num_heads, d_v),
         dtype=torch.float32, device=q.device,
@@ -66,13 +60,12 @@ def sparse_mla_decode_fwd(
         dtype=torch.float32, device=q.device,
     )
 
-    # Split-KV decode
     _C.sparse_mla_splitkv_fwd(
         q, kv_cache, indices, partial_O, partial_LSE,
         sm_scale, topk, tiles_per_split, stride_kv_row, page_block_size,
+        bf16_qk,
     )
 
-    # Combine
     output = torch.empty(
         (num_tokens, num_heads, d_v),
         dtype=torch.bfloat16, device=q.device,
@@ -94,6 +87,7 @@ def sparse_mla_prefill_fwd(
     d_v: int = 512,
     attn_sink: torch.Tensor = None,
     topk_length: torch.Tensor = None,
+    bf16_qk: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     _C = _load_lib()
     num_tokens, num_heads, d_qk = q.shape
@@ -115,7 +109,7 @@ def sparse_mla_prefill_fwd(
     _C.sparse_mla_prefill_fwd(
         q, kv_cache, indices, output, lse,
         sm_scale, topk, stride_kv_row, page_block_size,
-        attn_sink, topk_length,
+        attn_sink, topk_length, bf16_qk,
     )
     return output, lse
 
@@ -128,8 +122,9 @@ def sparse_mla_fwd(
     d_v: int = 512,
     attn_sink: torch.Tensor = None,
     topk_length: torch.Tensor = None,
+    bf16_qk: bool = True,
 ):
     num_tokens = q.shape[0]
     if num_tokens <= _DECODE_THRESHOLD:
-        return sparse_mla_decode_fwd(q, kv_cache, indices, sm_scale, d_v, attn_sink)
-    return sparse_mla_prefill_fwd(q, kv_cache, indices, sm_scale, d_v, attn_sink, topk_length)
+        return sparse_mla_decode_fwd(q, kv_cache, indices, sm_scale, d_v, attn_sink, bf16_qk)
+    return sparse_mla_prefill_fwd(q, kv_cache, indices, sm_scale, d_v, attn_sink, topk_length, bf16_qk)

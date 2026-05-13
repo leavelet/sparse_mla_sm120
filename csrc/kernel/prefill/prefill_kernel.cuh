@@ -39,7 +39,8 @@ struct PrefillColdParams {
     const int* topk_length;  // [num_tokens] int32, nullptr = uniform TOPK.
 };
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_kernel(
     const bf16* __restrict__ Q,
@@ -55,7 +56,7 @@ sparse_mla_prefill_kernel(
     const size_t stride_kv_block = cold.stride_kv_block;
     using KV = KVCacheTraits<MT>;
     using CT = ComputeTraits<MT, CM>;
-    using L = SmemLayout<MT, CM>;
+    using L = SmemLayout<MT, CM, BF16_QK>;
     using IO = KVIOTraits<MT>;
 
     static constexpr int NI = TOPK / BI;
@@ -74,7 +75,7 @@ sparse_mla_prefill_kernel(
     const int wy = warp_rank / 4;
 
     extern __shared__ char smem_raw[];
-    auto sm = SmemPtrs<MT, CM>::init(smem_raw);
+    auto sm = SmemPtrs<MT, CM, BF16_QK>::init(smem_raw);
 
     if (threadIdx.x == 0) {
         mbarrier_init(sm.mbar_kv + 0, 1);
@@ -127,8 +128,13 @@ sparse_mla_prefill_kernel(
         const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
         const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
-        quantize_q_to_smem<MT, MATH_THREADS>(
-            sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, sm.reduce_buf);
+        if constexpr (BF16_QK) {
+            load_q_bf16_to_smem<MT, MATH_THREADS>(
+                sm.q_nope_bf16, sm.q_rope, q_base);
+        } else {
+            quantize_q_to_smem<MT, MATH_THREADS>(
+                sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, sm.reduce_buf);
+        }
         QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
         for (int h = threadIdx.x; h < HPB; h += MATH_THREADS)
@@ -176,9 +182,40 @@ sparse_mla_prefill_kernel(
             KVRopePrefetch rope_pf = prefetch_kv_rope(
                 reinterpret_cast<const bf16*>(entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET), lane);
 
-            // ── QK nope (block-scaled FP8 MMA) ─────────────────────
+            // ── QK nope ─────────────────────────────────────────────
             float qk[4] = {0.f, 0.f, 0.f, 0.f};
             const uint8_t* kv_gid_base = kv_warp_base + gid * KV::KV_SMEM_STRIDE;
+
+            if constexpr (BF16_QK) {
+            #pragma unroll
+            for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
+                float scale_f = ue8m0_to_fp32(
+                    sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk]);
+                #pragma unroll
+                for (int ks = 0; ks < KV::QUANT_TILE / 16; ks++) {
+                    int ko = blk * KV::QUANT_TILE + ks * 16;
+                    uint32_t a0, a1, a2, a3;
+                    ldmatrix_load_A_bf16(a0, a1, a2, a3,
+                        sm.q_nope_bf16 + ko, KV::Q_NOPE_BF16_STRIDE, lane);
+                    uint16_t p0 = *reinterpret_cast<const uint16_t*>(kv_gid_base + ko + 2 * tid);
+                    uint16_t p1 = *reinterpret_cast<const uint16_t*>(kv_gid_base + ko + 2 * tid + 8);
+                    uint32_t f16x2_0, f16x2_1;
+                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16x2_0) : "h"(p0));
+                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16x2_1) : "h"(p1));
+                    __half2 h2_0 = *reinterpret_cast<__half2*>(&f16x2_0);
+                    __half2 h2_1 = *reinterpret_cast<__half2*>(&f16x2_1);
+                    float fk0 = __low2float(h2_0) * scale_f, fk1 = __high2float(h2_0) * scale_f;
+                    float fk2 = __low2float(h2_1) * scale_f, fk3 = __high2float(h2_1) * scale_f;
+                    uint32_t b0, b1;
+                    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(b0) : "f"(fk1), "f"(fk0));
+                    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(b1) : "f"(fk3), "f"(fk2));
+                    MmaBf16Result r = mma_bf16_m16n8k16(
+                        a0, a1, a2, a3, b0, b1,
+                        qk[0], qk[1], qk[2], qk[3]);
+                    qk[0] = r.d0; qk[1] = r.d1; qk[2] = r.d2; qk[3] = r.d3;
+                }
+            }
+            } else {
             #pragma unroll
             for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
                 uint8_t sfa = fp32_to_ue8m0(
@@ -190,7 +227,6 @@ sparse_mla_prefill_kernel(
                 } else {
                     sfb = sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk];
                 }
-
                 #pragma unroll
                 for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
                     int ko = blk * KV::QUANT_TILE + ks * 32;
@@ -204,6 +240,7 @@ sparse_mla_prefill_kernel(
                         qk[0], qk[1], qk[2], qk[3], sfa, sfb);
                     qk[0] = r.d0; qk[1] = r.d1; qk[2] = r.d2; qk[3] = r.d3;
                 }
+            }
             }
 
             // ── QK rope (BF16 MMA, uses prefetched B operands) ──────
@@ -477,7 +514,8 @@ sparse_mla_prefill_kernel(
 static constexpr int MG_N_HG = 2;
 static constexpr int MG_HEADS_PER_CTA = MG_N_HG * HPB;  // 32
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_mg_kernel(
     const bf16* __restrict__ Q,
@@ -493,9 +531,9 @@ sparse_mla_prefill_mg_kernel(
     const size_t stride_kv_block = cold.stride_kv_block;
     using KV = KVCacheTraits<MT>;
     using CT = ComputeTraits<MT, CM>;
-    using LMG = SmemLayoutMG<MT, CM>;
+    using LMG = SmemLayoutMG<MT, CM, BF16_QK>;
     using IO = KVIOTraits<MT>;
-    using SMG = SmemPtrsMG<MT, CM>;
+    using SMG = SmemPtrsMG<MT, CM, BF16_QK>;
 
     static constexpr int NI = TOPK / BI;
     static constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA;
@@ -568,10 +606,15 @@ sparse_mla_prefill_mg_kernel(
         for (int g = 0; g < MG_N_HG; g++) {
             const bf16* q_base_g = Q + (size_t)s_i * NUM_HEADS * KV::D_QK
                                      + (size_t)(h_start + g * HPB) * KV::D_QK;
-            quantize_q_to_smem<MT, MATH_THREADS>(
-                sm.q_nope_fp8[g], sm.q_nope_sc[g],
-                sm.q_rope + g * HPB * D_ROPE,
-                q_base_g, sm.reduce_buf);
+            if constexpr (BF16_QK) {
+                load_q_bf16_to_smem<MT, MATH_THREADS>(
+                    sm.q_nope_bf16[g], sm.q_rope + g * HPB * D_ROPE, q_base_g);
+            } else {
+                quantize_q_to_smem<MT, MATH_THREADS>(
+                    sm.q_nope_fp8[g], sm.q_nope_sc[g],
+                    sm.q_rope + g * HPB * D_ROPE,
+                    q_base_g, sm.reduce_buf);
+            }
         }
 
         // Preload Q rope to registers for both groups
@@ -640,8 +683,39 @@ sparse_mla_prefill_mg_kernel(
             for (int g = 0; g < MG_N_HG; g++) {
                 const uint8_t* kv_gid_base = kv_warp_base + gid * KV::KV_SMEM_STRIDE;
 
-                // QK nope (block-scaled FP8 MMA)
+                // QK nope
                 float qk[4] = {0.f, 0.f, 0.f, 0.f};
+
+                if constexpr (BF16_QK) {
+                #pragma unroll
+                for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
+                    float scale_f = ue8m0_to_fp32(
+                        sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk]);
+                    #pragma unroll
+                    for (int ks = 0; ks < KV::QUANT_TILE / 16; ks++) {
+                        int ko = blk * KV::QUANT_TILE + ks * 16;
+                        uint32_t a0, a1, a2, a3;
+                        ldmatrix_load_A_bf16(a0, a1, a2, a3,
+                            sm.q_nope_bf16[g] + ko, KV::Q_NOPE_BF16_STRIDE, lane);
+                        uint16_t p0 = *reinterpret_cast<const uint16_t*>(kv_gid_base + ko + 2 * tid);
+                        uint16_t p1 = *reinterpret_cast<const uint16_t*>(kv_gid_base + ko + 2 * tid + 8);
+                        uint32_t f16x2_0, f16x2_1;
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16x2_0) : "h"(p0));
+                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16x2_1) : "h"(p1));
+                        __half2 h2_0 = *reinterpret_cast<__half2*>(&f16x2_0);
+                        __half2 h2_1 = *reinterpret_cast<__half2*>(&f16x2_1);
+                        float fk0 = __low2float(h2_0) * scale_f, fk1 = __high2float(h2_0) * scale_f;
+                        float fk2 = __low2float(h2_1) * scale_f, fk3 = __high2float(h2_1) * scale_f;
+                        uint32_t b0, b1;
+                        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(b0) : "f"(fk1), "f"(fk0));
+                        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(b1) : "f"(fk3), "f"(fk2));
+                        MmaBf16Result r = mma_bf16_m16n8k16(
+                            a0, a1, a2, a3, b0, b1,
+                            qk[0], qk[1], qk[2], qk[3]);
+                        qk[0] = r.d0; qk[1] = r.d1; qk[2] = r.d2; qk[3] = r.d3;
+                    }
+                }
+                } else {
                 #pragma unroll
                 for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
                     uint8_t sfa = fp32_to_ue8m0(
@@ -666,6 +740,7 @@ sparse_mla_prefill_mg_kernel(
                             qk[0], qk[1], qk[2], qk[3], sfa, sfb);
                         qk[0] = r.d0; qk[1] = r.d1; qk[2] = r.d2; qk[3] = r.d3;
                     }
+                }
                 }
 
                 // QK rope (reuses prefetched B operands)

@@ -17,7 +17,7 @@ from test_decode import (
 
 
 def run_prefill_test(model_type, d_qk, d_v, topk, num_heads, num_tokens,
-                     block_size=64, num_blocks=64, atol=0.01):
+                     block_size=64, num_blocks=64, bf16_qk=True):
     torch.manual_seed(42)
     sm_scale = d_qk ** -0.5
     s_kv = num_blocks * block_size
@@ -44,7 +44,7 @@ def run_prefill_test(model_type, d_qk, d_v, topk, num_heads, num_tokens,
     idx_flat = indices.view(-1, topk)
 
     out, lse = flash_mla_sm120.sparse_mla_prefill_fwd(
-        q_flat, kv_packed, idx_flat, sm_scale, d_v)
+        q_flat, kv_packed, idx_flat, sm_scale, d_v, bf16_qk=bf16_qk)
     out = out.view_as(ref_out)
 
     err = (out.float() - ref_out.float()).abs()
@@ -79,13 +79,17 @@ class TestMODEL1Prefill:
         (128, 1024, 65),   # V4 Pro TP1
         (128, 1024, 100),  # V4 Pro TP1, larger batch
     ])
-    def test_correctness(self, num_heads, topk, num_tokens):
+    @pytest.mark.parametrize("bf16_qk", [True, False], ids=["bf16qk", "fp8qk"])
+    def test_correctness(self, num_heads, topk, num_tokens, bf16_qk):
         max_err, mean_err = run_prefill_test(
             "MODEL1", d_qk=512, d_v=512, topk=topk,
-            num_heads=num_heads, num_tokens=num_tokens)
-        print(f"\n  MODEL1 prefill h={num_heads} topk={topk} tokens={num_tokens}: "
+            num_heads=num_heads, num_tokens=num_tokens, bf16_qk=bf16_qk)
+        tag = "BF16" if bf16_qk else "FP8"
+        threshold = 0.001 if bf16_qk else 0.002
+        print(f"\n  MODEL1 prefill [{tag}] h={num_heads} topk={topk} tokens={num_tokens}: "
               f"max_err={max_err:.6f} mean_err={mean_err:.6f}")
-        assert max_err < 0.001, f"MODEL1 prefill failed: max_err={max_err}"
+        assert max_err < threshold, (
+            f"MODEL1 prefill [{tag}] failed: max_err={max_err} > {threshold}")
 
 
 # ── attn_sink Prefill Tests (MODEL1 only) ───────────────────────────

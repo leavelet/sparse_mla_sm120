@@ -6,7 +6,8 @@
 // Split-KV decode: launch helpers and dispatch.
 // ============================================================================
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int TILES_PER_SPLIT, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int TILES_PER_SPLIT, int PAGE_BLOCK_SIZE,
+          bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 void launch_decode(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     float* partial_O, float* partial_LSE,
@@ -14,14 +15,14 @@ void launch_decode(
     size_t stride_kv_block,
     cudaStream_t stream)
 {
-    constexpr size_t smem_bytes = SmemLayout<MT, CM>::TOTAL;
+    constexpr size_t smem_bytes = SmemLayout<MT, CM, BF16_QK>::TOTAL;
     constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
     constexpr int NI = TOPK / BI;
     constexpr int NSPLITS = NI / TILES_PER_SPLIT;
     dim3 grid(num_tokens * REPLICATE_H, NSPLITS);
     dim3 block(BLOCK_THREADS);
 
-    auto kernel = sparse_mla_decode_kernel<MT, CM, NUM_HEADS, TOPK, TILES_PER_SPLIT, PAGE_BLOCK_SIZE>;
+    auto kernel = sparse_mla_decode_kernel<MT, CM, NUM_HEADS, TOPK, TILES_PER_SPLIT, PAGE_BLOCK_SIZE, BF16_QK>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -41,7 +42,8 @@ void launch_decode(
     CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 void dispatch_tiles(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     float* partial_O, float* partial_LSE,
@@ -54,7 +56,7 @@ void dispatch_tiles(
     #define CASE(TPS) \
         case TPS: \
             if constexpr (NI >= TPS && NI % TPS == 0) { \
-                launch_decode<MT, CM, NUM_HEADS, TOPK, TPS, PAGE_BLOCK_SIZE>( \
+                launch_decode<MT, CM, NUM_HEADS, TOPK, TPS, PAGE_BLOCK_SIZE, BF16_QK>( \
                     Q, KV_cache, indices, partial_O, partial_LSE, \
                     sm_scale, num_tokens, stride_kv_block, stream); \
             } else { \
@@ -115,6 +117,7 @@ void sparse_mla_splitkv_launch_model1(
     torch::Tensor partial_O, torch::Tensor partial_LSE,
     float sm_scale, int num_heads, int num_tokens, int topk,
     int tiles_per_split, int page_block_size, int stride_kv_row,
+    bool bf16_qk,
     cudaStream_t stream)
 {
     auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
@@ -124,14 +127,20 @@ void sparse_mla_splitkv_launch_model1(
     auto LSE_ptr = partial_LSE.data_ptr<float>();
     size_t stride_kv_block = (size_t)page_block_size * stride_kv_row;
 
-    // MODEL1: page_block_size=64 (power-of-2, compiles to shift+mask)
     TORCH_CHECK(page_block_size == 64, "MODEL1 decode: page_block_size must be 64, got ", page_block_size);
 
     #define DISPATCH(NH, TK) \
-        dispatch_tiles<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64>( \
-            Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, \
-            sm_scale, num_tokens, tiles_per_split, \
-            stride_kv_block, stream)
+        if (bf16_qk) { \
+            dispatch_tiles<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, true>( \
+                Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, \
+                sm_scale, num_tokens, tiles_per_split, \
+                stride_kv_block, stream); \
+        } else { \
+            dispatch_tiles<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, false>( \
+                Q_ptr, KV_ptr, idx_ptr, PO_ptr, LSE_ptr, \
+                sm_scale, num_tokens, tiles_per_split, \
+                stride_kv_block, stream); \
+        }
 
     if (topk == 512) {
         switch (num_heads) {
@@ -157,7 +166,8 @@ void sparse_mla_splitkv_launch_model1(
 // V2 decode: scheduler-driven launch (FlashMLA-compatible)
 // ============================================================================
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 void launch_decode_v2(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     const uint8_t* extra_KV_cache, const int32_t* extra_indices,
@@ -173,10 +183,10 @@ void launch_decode_v2(
     size_t stride_extra_kv_block,
     cudaStream_t stream)
 {
-    constexpr size_t smem_bytes = SmemLayout<MT, CM>::TOTAL;
+    constexpr size_t smem_bytes = SmemLayout<MT, CM, BF16_QK>::TOTAL;
     constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
 
-    auto kernel = sparse_mla_decode_v2_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
+    auto kernel = sparse_mla_decode_v2_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, BF16_QK>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -271,6 +281,7 @@ void sparse_mla_splitkv_v2_launch_model1(
     const uint8_t* extra_kv, const int32_t* extra_idx,
     const int* topk_length_ptr, int extra_topk, const int* extra_topk_length_ptr,
     int extra_page_block_size, int extra_stride_kv_row,
+    bool bf16_qk,
     cudaStream_t stream)
 {
     auto Q_ptr = reinterpret_cast<const bf16*>(Q.data_ptr());
@@ -294,14 +305,25 @@ void sparse_mla_splitkv_v2_launch_model1(
     TORCH_CHECK(page_block_size == 64, "MODEL1 decode v2: page_block_size must be 64");
 
     #define DISPATCH_V2(NH, TK) \
-        launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64>( \
-            Q_ptr, KV_ptr, idx_ptr, extra_kv, extra_idx, \
-            OA_ptr, LA_ptr, O_ptr, LSE_ptr, \
-            meta_ptr, ns_ptr, sm_scale, num_batches, s_q, topk, \
-            stride_kv_block, num_sm_parts, \
-            stride_oa_split, stride_oa_sq, stride_la_split, stride_la_sq, \
-            attn_sink, topk_length_ptr, extra_topk, extra_topk_length_ptr, \
-            stride_extra, stream)
+        if (bf16_qk) { \
+            launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, true>( \
+                Q_ptr, KV_ptr, idx_ptr, extra_kv, extra_idx, \
+                OA_ptr, LA_ptr, O_ptr, LSE_ptr, \
+                meta_ptr, ns_ptr, sm_scale, num_batches, s_q, topk, \
+                stride_kv_block, num_sm_parts, \
+                stride_oa_split, stride_oa_sq, stride_la_split, stride_la_sq, \
+                attn_sink, topk_length_ptr, extra_topk, extra_topk_length_ptr, \
+                stride_extra, stream); \
+        } else { \
+            launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, false>( \
+                Q_ptr, KV_ptr, idx_ptr, extra_kv, extra_idx, \
+                OA_ptr, LA_ptr, O_ptr, LSE_ptr, \
+                meta_ptr, ns_ptr, sm_scale, num_batches, s_q, topk, \
+                stride_kv_block, num_sm_parts, \
+                stride_oa_split, stride_oa_sq, stride_la_split, stride_la_sq, \
+                attn_sink, topk_length_ptr, extra_topk, extra_topk_length_ptr, \
+                stride_extra, stream); \
+        }
 
     if (topk == 512) {
         switch (num_heads) {

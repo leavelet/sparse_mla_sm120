@@ -30,6 +30,7 @@ void sparse_mla_splitkv_launch_model1(
     torch::Tensor partial_O, torch::Tensor partial_LSE,
     float sm_scale, int num_heads, int num_tokens, int topk,
     int tiles_per_split, int page_block_size, int stride_kv_row,
+    bool bf16_qk,
     cudaStream_t stream);
 
 // Forward declarations — combine
@@ -72,6 +73,7 @@ void sparse_mla_splitkv_v2_launch_model1(
     const uint8_t* extra_kv, const int32_t* extra_idx,
     const int* topk_length_ptr, int extra_topk, const int* extra_topk_length_ptr,
     int extra_page_block_size, int extra_stride_kv_row,
+    bool bf16_qk,
     cudaStream_t stream);
 
 // Forward declarations — scheduler
@@ -100,6 +102,7 @@ void sparse_mla_prefill_launch_model1(
     int page_block_size, int stride_kv_row,
     const float* attn_sink_ptr,
     const int* topk_length_ptr,
+    bool bf16_qk,
     cudaStream_t stream);
 
 // ── Python-facing functions ─────────────────────────────────────────
@@ -116,7 +119,8 @@ void sparse_mla_splitkv_fwd(
     int topk,
     int tiles_per_split,
     int stride_kv_row,
-    int page_block_size)
+    int page_block_size,
+    bool bf16_qk)
 {
     TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Q must be bf16");
     TORCH_CHECK(Q.is_cuda() && KV_cache.is_cuda() && indices.is_cuda());
@@ -144,7 +148,7 @@ void sparse_mla_splitkv_fwd(
         sparse_mla_splitkv_launch_model1(
             Q, KV_cache, indices, partial_O, partial_LSE,
             sm_scale, num_heads, num_tokens, topk,
-            tiles_per_split, page_block_size, stride_kv_row, stream);
+            tiles_per_split, page_block_size, stride_kv_row, bf16_qk, stream);
         break;
     }
 }
@@ -169,7 +173,8 @@ void sparse_mla_splitkv_v2_fwd(
     c10::optional<torch::Tensor> extra_indices_t,
     c10::optional<torch::Tensor> topk_length_t,
     int extra_topk,
-    c10::optional<torch::Tensor> extra_topk_length_t)
+    c10::optional<torch::Tensor> extra_topk_length_t,
+    bool bf16_qk)
 {
     TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Q must be bf16");
     TORCH_CHECK(Q.is_cuda() && KV_cache.is_cuda() && indices.is_cuda());
@@ -213,7 +218,7 @@ void sparse_mla_splitkv_v2_fwd(
             sm_scale, num_heads, num_batches, s_q, topk,
             page_block_size, stride_kv_row, num_sm_parts, sink_ptr,
             extra_kv, extra_idx, tl_ptr, extra_topk, etl_ptr,
-            extra_pbs, extra_stride, stream);
+            extra_pbs, extra_stride, bf16_qk, stream);
         break;
     }
 }
@@ -265,7 +270,8 @@ void sparse_mla_prefill_fwd(
     int stride_kv_row,
     int page_block_size,
     c10::optional<torch::Tensor> attn_sink,
-    c10::optional<torch::Tensor> topk_length)
+    c10::optional<torch::Tensor> topk_length,
+    bool bf16_qk)
 {
     TORCH_CHECK(Q.dtype() == torch::kBFloat16, "Q must be bf16");
     TORCH_CHECK(Q.is_cuda() && KV_cache.is_cuda() && indices.is_cuda());
@@ -298,14 +304,19 @@ void sparse_mla_prefill_fwd(
         sparse_mla_prefill_launch_model1(
             Q, KV_cache, indices, output, out_lse,
             sm_scale, num_heads, num_tokens, topk,
-            page_block_size, stride_kv_row, sink_ptr, tl_ptr, stream);
+            page_block_size, stride_kv_row, sink_ptr, tl_ptr, bf16_qk, stream);
         break;
     }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_mla_splitkv_fwd", &sparse_mla_splitkv_fwd,
-          "Split-KV decode forward (SM120, V32+MODEL1)");
+          "Split-KV decode forward (SM120, V32+MODEL1)",
+          py::arg("Q"), py::arg("KV_cache"), py::arg("indices"),
+          py::arg("partial_O"), py::arg("partial_LSE"),
+          py::arg("sm_scale"), py::arg("topk"),
+          py::arg("tiles_per_split"), py::arg("stride_kv_row"),
+          py::arg("page_block_size"), py::arg("bf16_qk") = true);
     m.def("sparse_mla_splitkv_v2_fwd", &sparse_mla_splitkv_v2_fwd,
           "Split-KV decode v2 forward (scheduler-driven, V4-compatible)",
           py::arg("Q"), py::arg("KV_cache"), py::arg("indices"),
@@ -320,7 +331,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("extra_indices") = py::none(),
           py::arg("topk_length") = py::none(),
           py::arg("extra_topk") = 0,
-          py::arg("extra_topk_length") = py::none());
+          py::arg("extra_topk_length") = py::none(),
+          py::arg("bf16_qk") = true);
     m.def("sparse_mla_combine_fwd", &sparse_mla_combine_fwd,
           "Combine partial outputs from split-KV decode",
           py::arg("partial_O"), py::arg("partial_LSE"),
@@ -347,5 +359,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("sm_scale"), py::arg("topk"),
           py::arg("stride_kv_row"), py::arg("page_block_size"),
           py::arg("attn_sink") = py::none(),
-          py::arg("topk_length") = py::none());
+          py::arg("topk_length") = py::none(),
+          py::arg("bf16_qk") = true);
 }
