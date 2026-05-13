@@ -28,6 +28,8 @@ class FlashMLASchedMeta:
     config: Optional[Config] = None
     tile_scheduler_metadata: Optional[torch.Tensor] = None
     num_splits: Optional[torch.Tensor] = None
+    num_sm_parts: int = 0
+    max_nsplits: int = 0
 
 
 def get_mla_metadata(*args, **kwargs) -> Tuple[FlashMLASchedMeta, None]:
@@ -53,8 +55,9 @@ def flash_mla_with_kvcache(
     extra_topk_length: Optional[torch.Tensor] = None,
     bf16_qk: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from .ops import sparse_mla_decode_fwd
+    from .ops import _load_lib, _effective_stride_kv_row, _get_num_sms, _HPB, _FIXED_OVERHEAD, _BI
 
+    _C = _load_lib()
     sched_meta = tile_scheduler_metadata
     assert isinstance(sched_meta, FlashMLASchedMeta)
     assert num_splits is None
@@ -73,12 +76,23 @@ def flash_mla_with_kvcache(
     if extra_k_cache is not None:
         extra_k_page_block_size = extra_k_cache.shape[1]
 
+    q_input = q.reshape(-1, q.shape[-2], q.shape[-1])
+    num_tokens, num_heads, d_qk = q_input.shape
+    idx_input = indices.reshape(num_tokens, -1)
+
+    extra_idx_input = None
+    if extra_indices_in_kvcache is not None:
+        extra_idx_input = extra_indices_in_kvcache.reshape(num_tokens, -1)
+
+    stride_kv_row = _effective_stride_kv_row(k_cache)
+    page_block_size = k_cache.shape[-3] if k_cache.dim() >= 3 else 1
+
     if not sched_meta.have_initialized:
         sched_meta.have_initialized = True
         sched_meta.config = FlashMLASchedMeta.Config(
             b=q.shape[0],
             s_q=q.shape[1] if q.dim() == 4 else 1,
-            h_q=q.shape[-2],
+            h_q=num_heads,
             page_block_size=k_cache.shape[1],
             h_k=k_cache.shape[2],
             causal=causal,
@@ -87,11 +101,26 @@ def flash_mla_with_kvcache(
             extra_page_block_size=extra_k_page_block_size,
             extra_topk=extra_topk if extra_topk > 0 else None,
         )
+        replicate_h = (num_heads + _HPB - 1) // _HPB
+        sched_meta.num_sm_parts = max(_get_num_sms() // (num_tokens * replicate_h), 1)
+        ni = topk // _BI
+        if extra_topk > 0:
+            ni += (extra_topk + _BI - 1) // _BI
+        sched_meta.max_nsplits = min(ni, sched_meta.num_sm_parts)
+
+        sched_meta.tile_scheduler_metadata = torch.empty(
+            sched_meta.num_sm_parts * 8, dtype=torch.int32, device=q.device)
+        sched_meta.num_splits = torch.empty(
+            num_tokens + 1, dtype=torch.int32, device=q.device)
+        _C.get_decode_metadata(
+            num_tokens, topk, extra_topk, sched_meta.num_sm_parts, _FIXED_OVERHEAD,
+            topk_length, extra_topk_length,
+            sched_meta.tile_scheduler_metadata, sched_meta.num_splits)
     else:
         c = sched_meta.config
         assert c.b == q.shape[0]
         assert c.s_q == (q.shape[1] if q.dim() == 4 else 1)
-        assert c.h_q == q.shape[-2]
+        assert c.h_q == num_heads
         assert c.page_block_size == k_cache.shape[1]
         assert c.h_k == k_cache.shape[2]
         assert c.causal == causal
@@ -100,26 +129,40 @@ def flash_mla_with_kvcache(
         assert c.extra_page_block_size == extra_k_page_block_size
         assert c.extra_topk == (extra_topk if extra_topk > 0 else None)
 
-    q_input = q.reshape(-1, q.shape[-2], q.shape[-1])
-    idx_input = indices.reshape(q_input.shape[0], -1)
+    num_sm_parts = sched_meta.num_sm_parts
+    total_splits_bound = num_tokens + num_sm_parts
+    s_q = 1
 
-    extra_idx_input = None
-    if extra_indices_in_kvcache is not None:
-        extra_idx_input = extra_indices_in_kvcache.reshape(q_input.shape[0], -1)
+    o_accum = torch.empty(
+        (total_splits_bound, s_q, num_heads, head_dim_v),
+        dtype=torch.float32, device=q.device)
+    lse_accum = torch.empty(
+        (total_splits_bound, s_q, num_heads),
+        dtype=torch.float32, device=q.device)
+    output = torch.empty(
+        (num_tokens, num_heads, head_dim_v),
+        dtype=torch.bfloat16, device=q.device)
+    out_lse = torch.empty(
+        (num_tokens, num_heads),
+        dtype=torch.float32, device=q.device)
 
-    output, real_lse = sparse_mla_decode_fwd(
-        q_input, k_cache, idx_input, softmax_scale, head_dim_v,
-        attn_sink=attn_sink, bf16_qk=bf16_qk,
-        extra_k_cache=extra_k_cache, extra_indices=extra_idx_input,
-        topk_length=topk_length, extra_topk_length=extra_topk_length,
-        extra_topk=extra_topk,
-    )
+    _C.sparse_mla_splitkv_v2_fwd(
+        q_input, k_cache, idx_input,
+        o_accum, lse_accum, output, out_lse,
+        sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
+        softmax_scale, topk, stride_kv_row, page_block_size,
+        num_sm_parts, attn_sink,
+        extra_k_cache, extra_idx_input, topk_length,
+        extra_topk, extra_topk_length, bf16_qk)
+
+    _C.sparse_mla_combine_v2_fwd(
+        o_accum, lse_accum, output, out_lse,
+        sched_meta.num_splits, num_tokens, sched_meta.max_nsplits, attn_sink)
 
     batch = q.shape[0]
-    s_q = q.shape[1] if q.dim() == 4 else 1
-    h_q = q.shape[-2]
-    output = output.reshape(batch, s_q, h_q, head_dim_v)
-    lse = real_lse.reshape(batch, s_q, h_q).permute(0, 2, 1).contiguous()
+    s_q_dim = q.shape[1] if q.dim() == 4 else 1
+    output = output.reshape(batch, s_q_dim, num_heads, head_dim_v)
+    lse = out_lse.reshape(batch, s_q_dim, num_heads).permute(0, 2, 1).contiguous()
 
     return output, lse
 
