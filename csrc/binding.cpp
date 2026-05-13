@@ -39,6 +39,14 @@ void sparse_mla_combine_launch(
     int nsplits, c10::optional<torch::Tensor> attn_sink,
     cudaStream_t stream);
 
+void sparse_mla_combine_v2_launch(
+    torch::Tensor o_accum, torch::Tensor lse_accum,
+    torch::Tensor output, torch::Tensor out_lse,
+    torch::Tensor num_splits_ptr,
+    int batch, int s_q, int num_heads, int max_nsplits,
+    c10::optional<torch::Tensor> attn_sink,
+    cudaStream_t stream);
+
 // Forward declarations — split-KV decode v2 (scheduler-driven)
 void sparse_mla_splitkv_v2_launch_v32(
     torch::Tensor Q, torch::Tensor KV_cache, torch::Tensor indices,
@@ -227,6 +235,25 @@ void sparse_mla_combine_fwd(
     sparse_mla_combine_launch(partial_O, partial_LSE, output, out_lse, nsplits, attn_sink, stream);
 }
 
+void sparse_mla_combine_v2_fwd(
+    torch::Tensor o_accum,
+    torch::Tensor lse_accum,
+    torch::Tensor output,
+    torch::Tensor out_lse,
+    torch::Tensor num_splits_ptr,
+    int batch,
+    int max_nsplits,
+    c10::optional<torch::Tensor> attn_sink)
+{
+    TORCH_CHECK(o_accum.is_cuda() && output.is_cuda());
+    int s_q = 1;
+    int num_heads = o_accum.size(2);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream(o_accum.get_device()).stream();
+    sparse_mla_combine_v2_launch(
+        o_accum, lse_accum, output, out_lse, num_splits_ptr,
+        batch, s_q, num_heads, max_nsplits, attn_sink, stream);
+}
+
 void sparse_mla_prefill_fwd(
     torch::Tensor Q,
     torch::Tensor KV_cache,
@@ -299,6 +326,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("partial_O"), py::arg("partial_LSE"),
           py::arg("output"), py::arg("out_lse"),
           py::arg("nsplits"), py::arg("attn_sink") = py::none());
+    m.def("sparse_mla_combine_v2_fwd", &sparse_mla_combine_v2_fwd,
+          "Combine v2: per-batch split indexing via num_splits_ptr",
+          py::arg("o_accum"), py::arg("lse_accum"),
+          py::arg("output"), py::arg("out_lse"),
+          py::arg("num_splits_ptr"), py::arg("batch"),
+          py::arg("max_nsplits"),
+          py::arg("attn_sink") = py::none());
     m.def("get_decode_metadata", &get_decode_metadata,
           "Compute decode scheduler metadata (GPU, 1 warp)",
           py::arg("b"), py::arg("topk"), py::arg("extra_topk"),
