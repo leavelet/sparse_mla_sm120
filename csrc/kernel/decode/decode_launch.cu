@@ -6,7 +6,7 @@
 // TOPK is runtime (passed via DecodeV2ColdParams), not a template parameter.
 // ============================================================================
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS,
           bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 void launch_decode_v2(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
@@ -15,18 +15,18 @@ void launch_decode_v2(
     bf16* output, float* out_lse,
     const DecodingSchedMeta* sched_meta, const int* num_splits_ptr,
     float sm_scale, int num_batches, int s_q, int topk,
-    size_t stride_kv_block, int num_sm_parts,
+    size_t stride_kv_block, int page_block_size, int num_sm_parts,
     size_t stride_oa_split, size_t stride_oa_sq,
     size_t stride_la_split, size_t stride_la_sq,
     const float* attn_sink,
     const int* topk_length, int extra_topk, const int* extra_topk_length,
-    size_t stride_extra_kv_block,
+    size_t stride_extra_kv_block, int extra_page_block_size,
     cudaStream_t stream)
 {
     constexpr size_t smem_bytes = SmemLayout<MT, CM, BF16_QK>::TOTAL;
     constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
 
-    auto kernel = sparse_mla_decode_v2_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE, BF16_QK>;
+    auto kernel = sparse_mla_decode_v2_kernel<MT, CM, NUM_HEADS, BF16_QK>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -40,7 +40,8 @@ void launch_decode_v2(
                             stride_oa_split, stride_oa_sq,
                             stride_la_split, stride_la_sq, attn_sink,
                             topk_length, extra_topk, extra_topk_length,
-                            stride_extra_kv_block};
+                            stride_extra_kv_block,
+                            page_block_size, extra_page_block_size};
 
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -89,14 +90,14 @@ void sparse_mla_splitkv_v2_launch_v32(
     size_t stride_la_sq = (size_t)num_heads;
 
     #define DISPATCH_V2(NH) \
-        launch_decode_v2<ModelType::V32, ComputeMode::FP8, NH, 1>( \
+        launch_decode_v2<ModelType::V32, ComputeMode::FP8, NH>( \
             Q_ptr, KV_ptr, idx_ptr, extra_kv, extra_idx, \
             OA_ptr, LA_ptr, O_ptr, LSE_ptr, \
             meta_ptr, ns_ptr, sm_scale, num_batches, s_q, topk, \
-            stride_kv_block, num_sm_parts, \
+            stride_kv_block, page_block_size, num_sm_parts, \
             stride_oa_split, stride_oa_sq, stride_la_split, stride_la_sq, \
             attn_sink, topk_length_ptr, extra_topk, extra_topk_length_ptr, \
-            stride_extra, stream)
+            stride_extra, extra_page_block_size, stream)
 
     switch (num_heads) {
     case 8:   DISPATCH_V2(8); break;
@@ -140,27 +141,25 @@ void sparse_mla_splitkv_v2_launch_model1(
     size_t stride_la_split = (size_t)s_q * num_heads;
     size_t stride_la_sq = (size_t)num_heads;
 
-    TORCH_CHECK(page_block_size == 64, "MODEL1 decode v2: page_block_size must be 64");
-
     #define DISPATCH_V2(NH) \
         if (bf16_qk) { \
-            launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, 64, true>( \
+            launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, true>( \
                 Q_ptr, KV_ptr, idx_ptr, extra_kv, extra_idx, \
                 OA_ptr, LA_ptr, O_ptr, LSE_ptr, \
                 meta_ptr, ns_ptr, sm_scale, num_batches, s_q, topk, \
-                stride_kv_block, num_sm_parts, \
+                stride_kv_block, page_block_size, num_sm_parts, \
                 stride_oa_split, stride_oa_sq, stride_la_split, stride_la_sq, \
                 attn_sink, topk_length_ptr, extra_topk, extra_topk_length_ptr, \
-                stride_extra, stream); \
+                stride_extra, extra_page_block_size, stream); \
         } else { \
-            launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, 64, false>( \
+            launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, false>( \
                 Q_ptr, KV_ptr, idx_ptr, extra_kv, extra_idx, \
                 OA_ptr, LA_ptr, O_ptr, LSE_ptr, \
                 meta_ptr, ns_ptr, sm_scale, num_batches, s_q, topk, \
-                stride_kv_block, num_sm_parts, \
+                stride_kv_block, page_block_size, num_sm_parts, \
                 stride_oa_split, stride_oa_sq, stride_la_split, stride_la_sq, \
                 attn_sink, topk_length_ptr, extra_topk, extra_topk_length_ptr, \
-                stride_extra, stream); \
+                stride_extra, extra_page_block_size, stream); \
         }
 
     switch (num_heads) {

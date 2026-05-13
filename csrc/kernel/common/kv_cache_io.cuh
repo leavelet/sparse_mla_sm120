@@ -8,31 +8,29 @@
 //
 // FlashMLA ABI: stride_kv_row = bytes_per_token (V32: 656, MODEL1: 584).
 // The IO stride used for address calculation is the DATA stride:
-//   V32:    656 (nope+scale+rope all contiguous, 656 % 16 = 0 ✓)
+//   V32:    656 (nope+scale+rope all contiguous, 656 % 16 = 0)
 //   MODEL1: 576 (nope+rope only, footer scales excluded)
-//           576 % 16 = 0 ✓ for cp.async.bulk
+//           576 % 16 = 0 for cp.async.bulk
 //
 // V32 uses flat addressing: kv_ptr + global_idx * 656.
 // MODEL1 uses block-structured addressing (footer layout):
 //   data:  kv_ptr + block_idx * stride_kv_block + local_idx * 576
 //   scale: kv_ptr + block_idx * stride_kv_block + page_block_size * 576 + local_idx * 8
 //
-// Reference: FlashMLA SM90 splitkv_mla.cuh L538-555, SM100 kernel.cuh L657-714.
+// page_block_size is a runtime parameter (not compile-time) to support
+// dual-cache with different block sizes (e.g. C4A pbs=64, C128A pbs=2).
+// FlashMLA convention: use (unsigned) cast for div/mod performance.
 
 template <ModelType MT>
 struct KVIOTraits {
     using KV = KVCacheTraits<MT>;
-    // V32: IO_STRIDE = KV_GMEM_STRIDE = 656 (inline, bulk copy includes scale)
-    // MODEL1: IO_STRIDE = D_NOPE + D_ROPE*2 = 576 (footer, data portion only)
     static constexpr int IO_STRIDE = KV::SCALE_IN_KV_SMEM
         ? KV::KV_GMEM_STRIDE
         : (KV::D_NOPE + D_ROPE * sizeof(bf16));
     static_assert(IO_STRIDE % 16 == 0, "IO stride must be 16B aligned for cp.async.bulk");
 };
 
-// Bulk gather token nope data (and inline scales for V32) from global to smem.
-// V32: flat addressing (idx * 656). MODEL1: block-structured (footer layout).
-template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false>
+template <ModelType MT, bool USE_L2_HINT = false>
 __device__ __forceinline__ void io_bulk_gather_tile(
     uint8_t* dst,
     const int32_t* indices,
@@ -40,6 +38,7 @@ __device__ __forceinline__ void io_bulk_gather_tile(
     uint64_t* mbar,
     int io_tid,
     size_t stride_kv_block,
+    int page_block_size,
     uint64_t cache_policy = 0)
 {
     using KV = KVCacheTraits<MT>;
@@ -59,9 +58,9 @@ __device__ __forceinline__ void io_bulk_gather_tile(
         if constexpr (KV::SCALE_IN_KV_SMEM) {
             src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
         } else {
-            constexpr int pbs = PAGE_BLOCK_SIZE;
-            int block_idx = idx / pbs;
-            int local_idx = idx % pbs;
+            const unsigned pbs = (unsigned)page_block_size;
+            unsigned block_idx = (unsigned)idx / pbs;
+            unsigned local_idx = (unsigned)idx % pbs;
             src = kv_ptr + (size_t)block_idx * stride_kv_block
                          + (size_t)local_idx * IO::IO_STRIDE;
         }
@@ -72,27 +71,28 @@ __device__ __forceinline__ void io_bulk_gather_tile(
     }
 }
 
-template <ModelType MT, int PAGE_BLOCK_SIZE>
+template <ModelType MT>
 __device__ __forceinline__ void io_gather_scales(
     uint8_t* scale_dst,
     const int32_t* indices,
     const uint8_t* __restrict__ kv_ptr,
     int io_tid,
-    size_t stride_kv_block)
+    size_t stride_kv_block,
+    int page_block_size)
 {
     using KV = KVCacheTraits<MT>;
     using IO = KVIOTraits<MT>;
     if constexpr (KV::SCALE_IN_KV_SMEM) return;
 
-    constexpr int pbs = PAGE_BLOCK_SIZE;
+    const unsigned pbs = (unsigned)page_block_size;
     constexpr int SCALE_BYTES = KV::SCALE_BYTES_PER_TOKEN;
 
     for (int bi = io_tid; bi < BI; bi += IO_THREADS) {
         int idx = indices[bi];
         idx = (idx >= 0) ? idx : 0;
 
-        int block_idx = idx / pbs;
-        int local_idx = idx % pbs;
+        unsigned block_idx = (unsigned)idx / pbs;
+        unsigned local_idx = (unsigned)idx % pbs;
         const uint8_t* src = kv_ptr + (size_t)block_idx * stride_kv_block
                                      + (size_t)pbs * IO::IO_STRIDE
                                      + (size_t)local_idx * SCALE_BYTES;

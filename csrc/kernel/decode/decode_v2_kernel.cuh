@@ -47,9 +47,11 @@ struct DecodeV2ColdParams {
     int extra_topk;                // 0 = no extra cache
     const int* extra_topk_length;  // [num_batches] int32, nullptr = uniform extra_topk
     size_t stride_extra_kv_block;  // extra cache block stride
+    int page_block_size;
+    int extra_page_block_size;
 };
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS,
           bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_decode_v2_kernel(
@@ -69,7 +71,7 @@ sparse_mla_decode_v2_kernel(
     const float sm_scale = cold.sm_scale;
     const int num_batches = cold.num_batches;
     const int s_q = cold.s_q;
-    constexpr int page_block_size = PAGE_BLOCK_SIZE;
+    const int page_block_size = cold.page_block_size;
     const size_t stride_kv_block = cold.stride_kv_block;
     const int topk = cold.topk;
     using KV = KVCacheTraits<MT>;
@@ -147,19 +149,21 @@ sparse_mla_decode_v2_kernel(
             const int32_t* idx_ptr;
             const uint8_t* kv_ptr;
             size_t kv_str;
+            int pbs;
             if (global_blk < num_orig_blocks) {
                 idx_ptr = indices + (size_t)s_i * topk + (size_t)global_blk * BI;
-                kv_ptr = KV_cache; kv_str = stride_kv_block;
+                kv_ptr = KV_cache; kv_str = stride_kv_block; pbs = page_block_size;
             } else {
                 int eb = global_blk - num_orig_blocks;
                 idx_ptr = extra_indices + (size_t)s_i * cold.extra_topk + (size_t)eb * BI;
                 kv_ptr = extra_KV_cache; kv_str = cold.stride_extra_kv_block;
+                pbs = cold.extra_page_block_size;
             }
-            io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+            io_bulk_gather_tile<MT, true>(
                 sm.kv_bufs[buf_idx], idx_ptr, kv_ptr,
-                sm.mbar_kv + buf_idx, io_tid, kv_str, kv_l2_policy);
-            io_gather_scales<MT, PAGE_BLOCK_SIZE>(
-                sm.kv_scale_bufs[buf_idx], idx_ptr, kv_ptr, io_tid, kv_str);
+                sm.mbar_kv + buf_idx, io_tid, kv_str, pbs, kv_l2_policy);
+            io_gather_scales<MT>(
+                sm.kv_scale_bufs[buf_idx], idx_ptr, kv_ptr, io_tid, kv_str, pbs);
         };
 
         // Prologue: gather tile 0
@@ -236,12 +240,13 @@ sparse_mla_decode_v2_kernel(
 
             const uint8_t* entry_base[ENTRIES_PER_WARP];
             if constexpr (KV::V_HAS_ROPE) {
+                const unsigned tile_pbs = (unsigned)(is_extra_tile ? cold.extra_page_block_size : page_block_size);
                 #pragma unroll
                 for (int e = 0; e < ENTRIES_PER_WARP; e++) {
                     int idx = ib[qk_nb + e];
                     idx = (idx >= 0) ? idx : 0;
-                    int bi_e = idx / page_block_size;
-                    int li_e = idx % page_block_size;
+                    unsigned bi_e = (unsigned)idx / tile_pbs;
+                    unsigned li_e = (unsigned)idx % tile_pbs;
                     entry_base[e] = tile_kv_cache + (size_t)bi_e * tile_stride
                                                   + (size_t)li_e * IO::IO_STRIDE;
                 }
@@ -490,9 +495,10 @@ sparse_mla_decode_v2_kernel(
             // XV rope
             if constexpr (KV::V_HAS_ROPE) {
                 bar_sync_t<2, MATH_THREADS>();
-                xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
+                const int tile_pbs_rope = is_extra_tile ? cold.extra_page_block_size : page_block_size;
+                xv_rope_mma<MT>(acc_rope, w0, w1, w2, w3,
                     ib, tile_kv_cache, mwarp, lane,
-                    tile_stride,
+                    tile_stride, tile_pbs_rope,
                     reinterpret_cast<bf16*>(sm.w_fp8));
             }
 

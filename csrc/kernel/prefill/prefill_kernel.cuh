@@ -23,12 +23,13 @@
 //   - Writes direct BF16 output (no partial_O + combine)
 //   - No PDL (no dependent kernel)
 //
-// Template params (all constexpr):
-//   MT:              ModelType (V32 / MODEL1)
-//   CM:              ComputeMode (FP8 / BF16) — currently FP8 only
-//   NUM_HEADS:       16, 64, 128
-//   TOPK:            512, 1024, 2048
-//   PAGE_BLOCK_SIZE: 1 (V32) or 64 (MODEL1)
+// Template params (constexpr):
+//   MT:        ModelType (V32 / MODEL1)
+//   CM:        ComputeMode (FP8 / BF16)
+//   NUM_HEADS: 16, 64, 128
+//   BF16_QK:   true (MODEL1 default) / false (V32)
+// Runtime params (via PrefillColdParams):
+//   topk, page_block_size
 // ============================================================================
 
 struct PrefillColdParams {
@@ -36,11 +37,12 @@ struct PrefillColdParams {
     int num_tokens;
     int topk;
     size_t stride_kv_block;
+    int page_block_size;
     const float* attn_sink;
     const int* topk_length;
 };
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS,
           bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_kernel(
@@ -55,7 +57,7 @@ sparse_mla_prefill_kernel(
     const float sm_scale = cold.sm_scale;
     const int num_tokens = cold.num_tokens;
     const int topk = cold.topk;
-    constexpr int page_block_size = PAGE_BLOCK_SIZE;
+    const int page_block_size = cold.page_block_size;
     const size_t stride_kv_block = cold.stride_kv_block;
     using KV = KVCacheTraits<MT>;
     using CT = ComputeTraits<MT, CM>;
@@ -93,26 +95,26 @@ sparse_mla_prefill_kernel(
         const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
         // Prologue: gather tile 0
-        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+        io_bulk_gather_tile<MT, true>(
             sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid,
-            stride_kv_block, kv_l2_policy);
-        io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+            stride_kv_block, page_block_size, kv_l2_policy);
+        io_gather_scales<MT>(
             sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid,
-            stride_kv_block);
+            stride_kv_block, page_block_size);
         __threadfence_block();
 
         #pragma unroll 1
         for (int ti = 0; ti < actual_ni; ti++) {
             if (ti + 1 < actual_ni) {
-                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+                io_bulk_gather_tile<MT, true>(
                     sm.kv_bufs[(ti + 1) & 1],
                     idx_base + (ti + 1) * BI, KV_cache,
                     sm.mbar_kv + ((ti + 1) & 1), io_tid,
-                    stride_kv_block, kv_l2_policy);
-                io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                    stride_kv_block, page_block_size, kv_l2_policy);
+                io_gather_scales<MT>(
                     sm.kv_scale_bufs[(ti + 1) & 1],
                     idx_base + (ti + 1) * BI, KV_cache, io_tid,
-                    stride_kv_block);
+                    stride_kv_block, page_block_size);
                 __threadfence_block();
             }
             bar_sync_t<1, BLOCK_THREADS>();
@@ -162,12 +164,13 @@ sparse_mla_prefill_kernel(
 
             const uint8_t* entry_base[ENTRIES_PER_WARP];
             if constexpr (KV::V_HAS_ROPE) {
+                const unsigned pbs = (unsigned)page_block_size;
                 #pragma unroll
                 for (int e = 0; e < ENTRIES_PER_WARP; e++) {
                     int idx = ib[qk_nb + e];
                     idx = (idx >= 0) ? idx : 0;
-                    int bi_e = idx / page_block_size;
-                    int li_e = idx % page_block_size;
+                    unsigned bi_e = (unsigned)idx / pbs;
+                    unsigned li_e = (unsigned)idx % pbs;
                     entry_base[e] = KV_cache + (size_t)bi_e * stride_kv_block
                                              + (size_t)li_e * IO::IO_STRIDE;
                 }
@@ -416,9 +419,9 @@ sparse_mla_prefill_kernel(
             // ── XV rope BF16 MMA (MODEL1 only) ─────────────────────
             if constexpr (KV::V_HAS_ROPE) {
                 bar_sync_t<2, MATH_THREADS>();
-                xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3,
+                xv_rope_mma<MT>(acc_rope, w0, w1, w2, w3,
                     ib, KV_cache, mwarp, lane,
-                    stride_kv_block,
+                    stride_kv_block, page_block_size,
                     reinterpret_cast<bf16*>(sm.w_fp8));
             }
 
@@ -534,7 +537,7 @@ sparse_mla_prefill_kernel(
 static constexpr int MG_N_HG = 2;
 static constexpr int MG_HEADS_PER_CTA = MG_N_HG * HPB;  // 32
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS,
           bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_mg_kernel(
@@ -549,7 +552,7 @@ sparse_mla_prefill_mg_kernel(
     const float sm_scale = cold.sm_scale;
     const int num_tokens = cold.num_tokens;
     const int topk = cold.topk;
-    constexpr int page_block_size = PAGE_BLOCK_SIZE;
+    const int page_block_size = cold.page_block_size;
     const size_t stride_kv_block = cold.stride_kv_block;
     using KV = KVCacheTraits<MT>;
     using CT = ComputeTraits<MT, CM>;
@@ -587,25 +590,26 @@ sparse_mla_prefill_mg_kernel(
         const int32_t* idx_base = indices + (size_t)s_i * topk;
         const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
-        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+        io_bulk_gather_tile<MT, true>(
             sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid,
-            stride_kv_block, kv_l2_policy);
-        io_gather_scales<MT, PAGE_BLOCK_SIZE>(
-            sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid, stride_kv_block);
+            stride_kv_block, page_block_size, kv_l2_policy);
+        io_gather_scales<MT>(
+            sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid,
+            stride_kv_block, page_block_size);
         __threadfence_block();
 
         #pragma unroll 1
         for (int ti = 0; ti < actual_ni; ti++) {
             if (ti + 1 < actual_ni) {
-                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+                io_bulk_gather_tile<MT, true>(
                     sm.kv_bufs[(ti + 1) & 1],
                     idx_base + (ti + 1) * BI, KV_cache,
                     sm.mbar_kv + ((ti + 1) & 1), io_tid,
-                    stride_kv_block, kv_l2_policy);
-                io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                    stride_kv_block, page_block_size, kv_l2_policy);
+                io_gather_scales<MT>(
                     sm.kv_scale_bufs[(ti + 1) & 1],
                     idx_base + (ti + 1) * BI, KV_cache, io_tid,
-                    stride_kv_block);
+                    stride_kv_block, page_block_size);
                 __threadfence_block();
             }
             bar_sync_t<1, BLOCK_THREADS>();
@@ -673,14 +677,14 @@ sparse_mla_prefill_mg_kernel(
             const int qk_nb = mwarp * ENTRIES_PER_WARP;
             uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
-            // Entry base: only gid's entry needed (rope prefetch + QK rope)
             const uint8_t* entry_base_gid;
             {
                 int idx = ib[qk_nb + gid];
                 idx = (idx >= 0) ? idx : 0;
                 if constexpr (KV::V_HAS_ROPE) {
-                    int bi_e = idx / page_block_size;
-                    int li_e = idx % page_block_size;
+                    const unsigned pbs = (unsigned)page_block_size;
+                    unsigned bi_e = (unsigned)idx / pbs;
+                    unsigned li_e = (unsigned)idx % pbs;
                     entry_base_gid = KV_cache + (size_t)bi_e * stride_kv_block
                                               + (size_t)li_e * IO::IO_STRIDE;
                 } else {
@@ -949,9 +953,9 @@ sparse_mla_prefill_mg_kernel(
             if constexpr (KV::V_HAS_ROPE) {
                 #pragma unroll
                 for (int g = 0; g < MG_N_HG; g++) {
-                    xv_rope_mma<MT, PAGE_BLOCK_SIZE>(
+                    xv_rope_mma<MT>(
                         acc_rope[g], w_grp[g][0], w_grp[g][1], w_grp[g][2], w_grp[g][3],
-                        ib, KV_cache, mwarp, lane, stride_kv_block,
+                        ib, KV_cache, mwarp, lane, stride_kv_block, page_block_size,
                         reinterpret_cast<bf16*>(sm.w_fp8));
                 }
             }

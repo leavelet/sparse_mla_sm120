@@ -5,15 +5,15 @@
 // Sparse MLA prefill: launch helpers and dispatch.
 // SG (single-group, 16 heads/CTA) for h<=16.
 // MG (multi-group, 32 heads/CTA) for h>16 — 2x KV reuse + deferred row_sum.
-// TOPK is runtime (passed via PrefillColdParams), not a template parameter.
+// TOPK and PAGE_BLOCK_SIZE are runtime (via PrefillColdParams).
 // ============================================================================
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS,
           bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 void launch_prefill_sg(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     bf16* output, float* out_lse, float* out_max_logits,
-    float sm_scale, int num_tokens, int topk,
+    float sm_scale, int num_tokens, int topk, int page_block_size,
     size_t stride_kv_block,
     const float* attn_sink,
     const int* topk_length_ptr,
@@ -24,14 +24,15 @@ void launch_prefill_sg(
     dim3 grid(num_tokens * REPLICATE_H);
     dim3 block(BLOCK_THREADS);
 
-    auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE, BF16_QK>;
+    auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, BF16_QK>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         configured = true;
     }
 
-    PrefillColdParams cold{sm_scale, num_tokens, topk, stride_kv_block, attn_sink, topk_length_ptr};
+    PrefillColdParams cold{sm_scale, num_tokens, topk, stride_kv_block, page_block_size,
+                           attn_sink, topk_length_ptr};
     cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
     void* args[] = {
         (void*)&Q, (void*)&KV_cache, (void*)&indices,
@@ -40,12 +41,12 @@ void launch_prefill_sg(
     CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS,
           bool BF16_QK = KVCacheTraits<MT>::USE_BF16_QK>
 void launch_prefill_mg(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     bf16* output, float* out_lse, float* out_max_logits,
-    float sm_scale, int num_tokens, int topk,
+    float sm_scale, int num_tokens, int topk, int page_block_size,
     size_t stride_kv_block,
     const float* attn_sink,
     const int* topk_length_ptr,
@@ -56,14 +57,15 @@ void launch_prefill_mg(
     dim3 grid(num_tokens * REPLICATE_H);
     dim3 block(BLOCK_THREADS);
 
-    auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE, BF16_QK>;
+    auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, BF16_QK>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         configured = true;
     }
 
-    PrefillColdParams cold{sm_scale, num_tokens, topk, stride_kv_block, attn_sink, topk_length_ptr};
+    PrefillColdParams cold{sm_scale, num_tokens, topk, stride_kv_block, page_block_size,
+                           attn_sink, topk_length_ptr};
     cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
     void* args[] = {
         (void*)&Q, (void*)&KV_cache, (void*)&indices,
@@ -95,9 +97,10 @@ void sparse_mla_prefill_launch_v32(
 
     if (num_heads <= HPB) {
         #define DISPATCH_SG(NH) \
-            launch_prefill_sg<ModelType::V32, ComputeMode::FP8, NH, 1>( \
+            launch_prefill_sg<ModelType::V32, ComputeMode::FP8, NH>( \
                 Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, out_max_logits_ptr, \
-                sm_scale, num_tokens, topk, stride_kv_block, attn_sink_ptr, topk_length_ptr, stream)
+                sm_scale, num_tokens, topk, page_block_size, stride_kv_block, \
+                attn_sink_ptr, topk_length_ptr, stream)
         switch (num_heads) {
         case 16:  DISPATCH_SG(16); break;
         default:  TORCH_CHECK(false, "V32 prefill SG: unsupported num_heads=", num_heads);
@@ -105,9 +108,10 @@ void sparse_mla_prefill_launch_v32(
         #undef DISPATCH_SG
     } else {
         #define DISPATCH_MG(NH) \
-            launch_prefill_mg<ModelType::V32, ComputeMode::FP8, NH, 1>( \
+            launch_prefill_mg<ModelType::V32, ComputeMode::FP8, NH>( \
                 Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, out_max_logits_ptr, \
-                sm_scale, num_tokens, topk, stride_kv_block, attn_sink_ptr, topk_length_ptr, stream)
+                sm_scale, num_tokens, topk, page_block_size, stride_kv_block, \
+                attn_sink_ptr, topk_length_ptr, stream)
         switch (num_heads) {
         case 64:  DISPATCH_MG(64); break;
         case 128: DISPATCH_MG(128); break;
@@ -135,17 +139,17 @@ void sparse_mla_prefill_launch_model1(
     auto LSE_ptr = out_lse.data_ptr<float>();
     size_t stride_kv_block = (size_t)page_block_size * stride_kv_row;
 
-    TORCH_CHECK(page_block_size == 64, "MODEL1 prefill: page_block_size must be 64, got ", page_block_size);
-
     #define DISPATCH_MG(NH) \
         if (bf16_qk) { \
-            launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, 64, true>( \
+            launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, true>( \
                 Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, out_max_logits_ptr, \
-                sm_scale, num_tokens, topk, stride_kv_block, attn_sink_ptr, topk_length_ptr, stream); \
+                sm_scale, num_tokens, topk, page_block_size, stride_kv_block, \
+                attn_sink_ptr, topk_length_ptr, stream); \
         } else { \
-            launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, 64, false>( \
+            launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, false>( \
                 Q_ptr, KV_ptr, idx_ptr, O_ptr, LSE_ptr, out_max_logits_ptr, \
-                sm_scale, num_tokens, topk, stride_kv_block, attn_sink_ptr, topk_length_ptr, stream); \
+                sm_scale, num_tokens, topk, page_block_size, stride_kv_block, \
+                attn_sink_ptr, topk_length_ptr, stream); \
         }
 
     switch (num_heads) {
