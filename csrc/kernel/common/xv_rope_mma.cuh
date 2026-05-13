@@ -62,10 +62,12 @@ __device__ __forceinline__ void xv_rope_mma(
         ldmatrix_load_A_bf16(a0, a1, a2, a3,
             weight_smem + k_base, BI, lane);
 
-        // B operand: 4 scalar loads from global (L2 cached)
-        auto get_rope_ptr = [&](int entry_offset) -> const bf16* {
+        // B operand: 4 scalar loads from global (L2 cached).
+        // Returns 0 for invalid entries (idx < 0) to avoid 0 × NaN = NaN
+        // when slot 0 contains garbage BF16 (NaN/inf from prior workload).
+        auto load_rope_v = [&](int entry_offset) -> uint16_t {
             int idx = tile_indices[entry_offset];
-            idx = (idx >= 0) ? idx : 0;
+            if (idx < 0) return 0;
             const uint8_t* base;
             if constexpr (KV::SCALE_IN_KV_SMEM) {
                 base = KV_cache + (size_t)idx * IO::IO_STRIDE;
@@ -76,18 +78,14 @@ __device__ __forceinline__ void xv_rope_mma(
                 base = KV_cache + (size_t)bi * stride_kv_block
                                 + (size_t)li * IO::IO_STRIDE;
             }
-            return reinterpret_cast<const bf16*>(base + KV::KV_ROPE_GMEM_OFFSET);
+            const bf16* rp = reinterpret_cast<const bf16*>(base + KV::KV_ROPE_GMEM_OFFSET);
+            return *reinterpret_cast<const uint16_t*>(&rp[dim_n]);
         };
 
-        const bf16* rp0 = get_rope_ptr(k_base + tid * 2);
-        const bf16* rp1 = get_rope_ptr(k_base + tid * 2 + 1);
-        const bf16* rp8 = get_rope_ptr(k_base + tid * 2 + 8);
-        const bf16* rp9 = get_rope_ptr(k_base + tid * 2 + 9);
-
-        uint16_t v0 = *reinterpret_cast<const uint16_t*>(&rp0[dim_n]);
-        uint16_t v1 = *reinterpret_cast<const uint16_t*>(&rp1[dim_n]);
-        uint16_t v8 = *reinterpret_cast<const uint16_t*>(&rp8[dim_n]);
-        uint16_t v9 = *reinterpret_cast<const uint16_t*>(&rp9[dim_n]);
+        uint16_t v0 = load_rope_v(k_base + tid * 2);
+        uint16_t v1 = load_rope_v(k_base + tid * 2 + 1);
+        uint16_t v8 = load_rope_v(k_base + tid * 2 + 8);
+        uint16_t v9 = load_rope_v(k_base + tid * 2 + 9);
 
         uint32_t b0 = (uint32_t)v0 | ((uint32_t)v1 << 16);
         uint32_t b1 = (uint32_t)v8 | ((uint32_t)v9 << 16);

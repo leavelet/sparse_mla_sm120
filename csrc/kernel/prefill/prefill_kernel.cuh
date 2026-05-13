@@ -179,6 +179,23 @@ sparse_mla_prefill_kernel(
             for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = 0.f;
 
+            // Zero kv_smem rows for invalid (-1) entries (0 × fp8_NaN = NaN fix)
+            {
+                constexpr int BYTES_PER_LANE = (KV::KV_SMEM_COPY_BYTES + 31) / 32;
+                #pragma unroll
+                for (int e = 0; e < ENTRIES_PER_WARP; e++) {
+                    if (ib[qk_nb + e] < 0) {
+                        uint8_t* row = kv_smem + (qk_nb + e) * KV::KV_SMEM_STRIDE;
+                        #pragma unroll
+                        for (int b = 0; b < BYTES_PER_LANE; b++) {
+                            int off = lane * BYTES_PER_LANE + b;
+                            if (off < KV::KV_SMEM_COPY_BYTES) row[off] = 0;
+                        }
+                    }
+                }
+                bar_sync_t<2, MATH_THREADS>();
+            }
+
             KVRopePrefetch rope_pf = prefetch_kv_rope(
                 reinterpret_cast<const bf16*>(entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET), lane);
 
@@ -674,6 +691,23 @@ sparse_mla_prefill_mg_kernel(
             // Init per-group w_head_sc_all
             for (int i = threadIdx.x; i < MG_N_HG * CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
                 sm.w_head_sc_all[i] = 0.f;
+
+            // Zero kv_smem rows for invalid (-1) entries (0 × fp8_NaN = NaN fix)
+            {
+                constexpr int BYTES_PER_LANE = (KV::KV_SMEM_COPY_BYTES + 31) / 32;
+                #pragma unroll
+                for (int e = 0; e < ENTRIES_PER_WARP; e++) {
+                    if (ib[qk_nb + e] < 0) {
+                        uint8_t* row = kv_smem + (qk_nb + e) * KV::KV_SMEM_STRIDE;
+                        #pragma unroll
+                        for (int b = 0; b < BYTES_PER_LANE; b++) {
+                            int off = lane * BYTES_PER_LANE + b;
+                            if (off < KV::KV_SMEM_COPY_BYTES) row[off] = 0;
+                        }
+                    }
+                }
+                bar_sync_t<2, MATH_THREADS>();
+            }
 
             // ── QK + softmax for both groups ────────────────────────
             float w_grp[MG_N_HG][4];

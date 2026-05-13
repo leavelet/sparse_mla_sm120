@@ -10,6 +10,31 @@ def _load_lib():
 _DECODE_THRESHOLD = 64
 
 
+def _effective_stride_kv_row(kv_cache: torch.Tensor) -> int:
+    """Return the per-token byte stride the kernel should use.
+
+    The kernel computes stride_kv_block = page_block_size * stride_kv_row.
+    Some callers (e.g. vLLM) pad the block stride for alignment, so
+    page_block_size * per_token_stride != actual block-to-block stride.
+    We detect this and override stride_kv_row so the formula comes out
+    to the correct block byte stride. The kernel uses IO::IO_STRIDE
+    (a model constant) for per-token offsets within a block, so this
+    override is safe.
+    """
+    if kv_cache.dim() < 3:
+        return kv_cache.stride(-2) * kv_cache.element_size()
+    page_block_size = kv_cache.shape[-3]
+    natural_row_bytes = kv_cache.stride(-2) * kv_cache.element_size()
+    block_stride_bytes = kv_cache.stride(0) * kv_cache.element_size()
+    if block_stride_bytes == page_block_size * natural_row_bytes:
+        return natural_row_bytes
+    assert block_stride_bytes % page_block_size == 0, (
+        f"kv_cache block stride {block_stride_bytes} not divisible by "
+        f"page_block_size {page_block_size}"
+    )
+    return block_stride_bytes // page_block_size
+
+
 def _compute_decode_splits(num_tokens, num_heads, topk):
     hpb = 16
     bi = 64
@@ -47,7 +72,7 @@ def sparse_mla_decode_fwd(
     assert indices.dtype == torch.int32 and indices.is_contiguous()
     assert num_tokens <= _DECODE_THRESHOLD
 
-    stride_kv_row = kv_cache.stride(-2) * kv_cache.element_size()
+    stride_kv_row = _effective_stride_kv_row(kv_cache)
     page_block_size = kv_cache.shape[-3] if kv_cache.dim() >= 3 else 1
     nsplits, tiles_per_split = _compute_decode_splits(num_tokens, num_heads, topk)
 
@@ -97,7 +122,7 @@ def sparse_mla_prefill_fwd(
     assert kv_cache.is_contiguous()
     assert indices.dtype == torch.int32 and indices.is_contiguous()
 
-    stride_kv_row = kv_cache.stride(-2) * kv_cache.element_size()
+    stride_kv_row = _effective_stride_kv_row(kv_cache)
     page_block_size = kv_cache.shape[-3] if kv_cache.dim() >= 3 else 1
 
     output = torch.empty(
