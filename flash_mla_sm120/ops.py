@@ -226,13 +226,12 @@ def sparse_mla_decode_v2_fwd(
 
     # combine_v2 — always launched (CUDA-graph friendly). Per-batch early-exits
     # for is_no_split batches (those wrote bf16 directly in decode_v2).
-    ns_cpu = num_splits.cpu()
-    max_nsplits = max(
-        (ns_cpu[i + 1] - ns_cpu[i]).item() for i in range(num_tokens)
-    ) if num_tokens > 0 else 1
+    # max_nsplits is a static upper bound (num_sm_parts) so we can select the
+    # right MAX_SPLITS dispatch template without GPU→CPU sync — required for
+    # CUDA graph capture. Per-batch nsplits cannot exceed num_sm_parts.
     _C.sparse_mla_combine_v2_fwd(
         o_accum, lse_accum, output, out_lse, num_splits,
-        num_tokens, max_nsplits,
+        num_tokens, num_sm_parts,
         attn_sink=attn_sink,
     )
 
