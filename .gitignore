@@ -16,3 +16,6 @@ microbench/
 docs_internal/
 tests/csrc/
 archive/
+profiles/
+scripts/
+CLAUDE.md
