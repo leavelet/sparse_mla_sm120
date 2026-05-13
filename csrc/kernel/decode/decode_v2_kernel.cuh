@@ -523,8 +523,8 @@ sparse_mla_decode_v2_kernel(
         // ── Epilogue ────────────────────────────────────────────────
         float il0, il1;
         if (is_no_split && cold.attn_sink != nullptr) {
-            float s0 = __ldg(cold.attn_sink + h_start + gid) * LOG2E;
-            float s1 = __ldg(cold.attn_sink + h_start + gid + 8) * LOG2E;
+            float s0 = (gid < VALID_HPB) ? (__ldg(cold.attn_sink + h_start + gid) * LOG2E) : -1e30f;
+            float s1 = (gid + 8 < VALID_HPB) ? (__ldg(cold.attn_sink + h_start + gid + 8) * LOG2E) : -1e30f;
             float d0 = sm.l_smem[gid] + exp2f(s0 - sm.m_smem[gid]);
             float d1 = sm.l_smem[gid + 8] + exp2f(s1 - sm.m_smem[gid + 8]);
             il0 = (d0 > 0.f) ? (1.f / d0) : 0.f;
