@@ -58,6 +58,7 @@ def sparse_mla_decode_fwd(
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     extra_topk: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     _C = _load_lib()
     num_tokens, num_heads, d_qk = q.shape
@@ -87,9 +88,12 @@ def sparse_mla_decode_fwd(
     lse_accum = torch.empty(
         (total_splits_bound, s_q, num_heads),
         dtype=torch.float32, device=q.device)
-    output = torch.empty(
-        (num_tokens, num_heads, d_v),
-        dtype=torch.bfloat16, device=q.device)
+    if out is not None:
+        output = out.view(num_tokens, num_heads, d_v)
+    else:
+        output = torch.empty(
+            (num_tokens, num_heads, d_v),
+            dtype=torch.bfloat16, device=q.device)
     out_lse = torch.empty(
         (num_tokens, num_heads),
         dtype=torch.float32, device=q.device)
@@ -124,6 +128,7 @@ def sparse_mla_prefill_fwd(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     bf16_qk: bool = True,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _C = _load_lib()
     num_tokens, num_heads, d_qk = q.shape
@@ -136,9 +141,12 @@ def sparse_mla_prefill_fwd(
     stride_kv_row = _effective_stride_kv_row(kv_cache)
     page_block_size = kv_cache.shape[-3] if kv_cache.dim() >= 3 else 1
 
-    output = torch.empty(
-        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=q.device
-    )
+    if out is not None:
+        output = out.view(num_tokens, num_heads, d_v)
+    else:
+        output = torch.empty(
+            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=q.device
+        )
     lse = torch.empty(
         (num_tokens, num_heads), dtype=torch.float32, device=q.device
     )

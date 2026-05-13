@@ -54,6 +54,7 @@ def flash_mla_with_kvcache(
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     bf16_qk: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from .ops import _load_lib, _effective_stride_kv_row, _get_num_sms, _HPB, _FIXED_OVERHEAD, _BI
 
@@ -139,9 +140,12 @@ def flash_mla_with_kvcache(
     lse_accum = torch.empty(
         (total_splits_bound, s_q, num_heads),
         dtype=torch.float32, device=q.device)
-    output = torch.empty(
-        (num_tokens, num_heads, head_dim_v),
-        dtype=torch.bfloat16, device=q.device)
+    if out is not None:
+        output = out.view(num_tokens, num_heads, head_dim_v)
+    else:
+        output = torch.empty(
+            (num_tokens, num_heads, head_dim_v),
+            dtype=torch.bfloat16, device=q.device)
     out_lse = torch.empty(
         (num_tokens, num_heads),
         dtype=torch.float32, device=q.device)
@@ -175,12 +179,14 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from .ops import sparse_mla_prefill_fwd
 
     idx = indices.squeeze(1) if indices.dim() == 3 else indices
-    out, max_logits, lse = sparse_mla_prefill_fwd(
+    result = sparse_mla_prefill_fwd(
         q, kv, idx, sm_scale, d_v,
-        attn_sink=attn_sink, topk_length=topk_length)
+        attn_sink=attn_sink, topk_length=topk_length, out=out)
 
-    return out, max_logits, lse
+    return result
