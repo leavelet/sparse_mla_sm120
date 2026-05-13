@@ -51,9 +51,14 @@ __device__ __forceinline__ void quantize_q_to_smem(
     }
     bar_sync_t<2, _MATH_THREADS>();
 
-    // Step 3: compute scale (all HPB — invalid heads have amax=0, scale=1e-4/FP8_MAX)
-    for (int i = threadIdx.x; i < HPB * NUM_SCALES; i += _MATH_THREADS)
-        q_nope_sc[i] = fmaxf(amax[i], 1e-4f) / FP8_MAX;
+    // Step 3: compute scale, rounded up to power-of-2 for exact UE8M0 block-scaled MMA
+    for (int i = threadIdx.x; i < HPB * NUM_SCALES; i += _MATH_THREADS) {
+        float raw = fmaxf(amax[i], 1e-4f) / FP8_MAX;
+        uint32_t bits = __float_as_uint(raw);
+        if (bits & 0x007FFFFF)
+            bits = (bits + 0x00800000) & 0x7F800000;
+        q_nope_sc[i] = __uint_as_float(bits);
+    }
     bar_sync_t<2, _MATH_THREADS>();
 
     // Step 4: quantize (valid heads from gmem; zero-fill rest)
