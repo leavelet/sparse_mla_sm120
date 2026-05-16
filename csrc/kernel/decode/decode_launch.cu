@@ -139,6 +139,7 @@ void sparse_mla_splitkv_launch_v32(
     switch (num_heads) {
     case 8:   DISPATCH(8); break;
     case 16:  DISPATCH(16); break;
+    case 32:  DISPATCH(32); break;
     case 64:  DISPATCH(64); break;
     case 128: DISPATCH(128); break;
     default:  TORCH_CHECK(false, "V32 decode: unsupported num_heads=", num_heads);
@@ -171,6 +172,8 @@ void sparse_mla_splitkv_launch_model1(
 
     if (topk == 128) {
         switch (num_heads) {
+        case 16:  DISPATCH(16, 128); break;
+        case 32:  DISPATCH(32, 128); break;
         case 64:  DISPATCH(64, 128); break;
         case 128: DISPATCH(128, 128); break;
         default:  TORCH_CHECK(false, "MODEL1 decode: unsupported num_heads=", num_heads);
@@ -178,6 +181,8 @@ void sparse_mla_splitkv_launch_model1(
     } else if (topk == 512) {
         switch (num_heads) {
         case 8:   DISPATCH(8, 512); break;
+        case 16:  DISPATCH(16, 512); break;
+        case 32:  DISPATCH(32, 512); break;
         case 64:  DISPATCH(64, 512); break;
         case 128: DISPATCH(128, 512); break;
         default:  TORCH_CHECK(false, "MODEL1 decode: unsupported num_heads=", num_heads);
@@ -185,6 +190,7 @@ void sparse_mla_splitkv_launch_model1(
     } else if (topk == 1024) {
         switch (num_heads) {
         case 16:  DISPATCH(16, 1024); break;
+        case 32:  DISPATCH(32, 1024); break;
         case 64:  DISPATCH(64, 1024); break;
         case 128: DISPATCH(128, 1024); break;
         default:  TORCH_CHECK(false, "MODEL1 decode: unsupported num_heads=", num_heads);
@@ -368,6 +374,7 @@ void sparse_mla_splitkv_v2_launch_v32(
     switch (num_heads) {
     case 8:   DISPATCH_V2(8); break;
     case 16:  DISPATCH_V2(16); break;
+    case 32:  DISPATCH_V2(32); break;
     case 64:  DISPATCH_V2(64); break;
     case 128: DISPATCH_V2(128); break;
     default:  TORCH_CHECK(false, "V32 decode v2: unsupported num_heads=", num_heads);
@@ -435,6 +442,8 @@ void sparse_mla_splitkv_v2_launch_model1(
 
     if (topk == 128) {
         switch (num_heads) {
+        case 16:  DISPATCH_V2_BY_PBSX(16, 128); break;
+        case 32:  DISPATCH_V2_BY_PBSX(32, 128); break;
         case 64:  DISPATCH_V2_BY_PBSX(64, 128); break;
         case 128: DISPATCH_V2_BY_PBSX(128, 128); break;
         default:  TORCH_CHECK(false, "MODEL1 decode v2: unsupported num_heads=", num_heads);
@@ -442,6 +451,8 @@ void sparse_mla_splitkv_v2_launch_model1(
     } else if (topk == 512) {
         switch (num_heads) {
         case 8:   DISPATCH_V2_BY_PBSX(8, 512); break;
+        case 16:  DISPATCH_V2_BY_PBSX(16, 512); break;
+        case 32:  DISPATCH_V2_BY_PBSX(32, 512); break;
         case 64:  DISPATCH_V2_BY_PBSX(64, 512); break;
         case 128: DISPATCH_V2_BY_PBSX(128, 512); break;
         default:  TORCH_CHECK(false, "MODEL1 decode v2: unsupported num_heads=", num_heads);
@@ -449,6 +460,7 @@ void sparse_mla_splitkv_v2_launch_model1(
     } else if (topk == 1024) {
         switch (num_heads) {
         case 16:  DISPATCH_V2_BY_PBSX(16, 1024); break;
+        case 32:  DISPATCH_V2_BY_PBSX(32, 1024); break;
         case 64:  DISPATCH_V2_BY_PBSX(64, 1024); break;
         case 128: DISPATCH_V2_BY_PBSX(128, 1024); break;
         default:  TORCH_CHECK(false, "MODEL1 decode v2: unsupported num_heads=", num_heads);

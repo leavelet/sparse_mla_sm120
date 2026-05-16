@@ -126,6 +126,7 @@ void sparse_mla_prefill_launch_v32(
                 stride_kv_block, /*stride_kv_block_extra=*/(size_t)0, \
                 topk_length_ptr, /*topk_length_extra=*/nullptr, stream)
         switch (num_heads) {
+        case 32:  DISPATCH_MG(32); break;
         case 64:  DISPATCH_MG(64); break;
         case 128: DISPATCH_MG(128); break;
         default:  TORCH_CHECK(false, "V32 prefill MG: unsupported num_heads=", num_heads);
@@ -152,7 +153,14 @@ void sparse_mla_prefill_launch_model1(
 
     TORCH_CHECK(page_block_size == 64, "MODEL1 prefill: page_block_size must be 64, got ", page_block_size);
 
-    // MODEL1 always uses MG (h=64 or h=128, both > HPB)
+    // SG (single-group, HPB=16 heads/CTA) for h<=16; MG (2*HPB=32 heads/CTA) for h>16.
+    // Adding SG=16 lets vLLM stop padding small head counts (TP4: 16 heads;
+    // TP8: 8 heads padded to 16) all the way up to 64, eliminating ~75% of the
+    // wasted compute that came from `NUM_HEADS=64` instantiation in the MG path.
+    #define DISPATCH_SG(NH, TK) \
+        launch_prefill_sg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64>( \
+            Q_ptr, KV_ptr, idx_ptr, attn_sink_ptr, O_ptr, LSE_ptr, \
+            sm_scale, num_tokens, stride_kv_block, topk_length_ptr, stream)
     #define DISPATCH_MG(NH, TK) \
         launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64>( \
             Q_ptr, KV_ptr, idx_ptr, \
@@ -164,18 +172,24 @@ void sparse_mla_prefill_launch_model1(
 
     if (topk == 128) {
         switch (num_heads) {
+        case 16:  DISPATCH_SG(16, 128); break;
+        case 32:  DISPATCH_MG(32, 128); break;
         case 64:  DISPATCH_MG(64, 128); break;
         case 128: DISPATCH_MG(128, 128); break;
         default:  TORCH_CHECK(false, "MODEL1 prefill: unsupported num_heads=", num_heads);
         }
     } else if (topk == 512) {
         switch (num_heads) {
+        case 16:  DISPATCH_SG(16, 512); break;
+        case 32:  DISPATCH_MG(32, 512); break;
         case 64:  DISPATCH_MG(64, 512); break;
         case 128: DISPATCH_MG(128, 512); break;
         default:  TORCH_CHECK(false, "MODEL1 prefill: unsupported num_heads=", num_heads);
         }
     } else if (topk == 1024) {
         switch (num_heads) {
+        case 16:  DISPATCH_SG(16, 1024); break;
+        case 32:  DISPATCH_MG(32, 1024); break;
         case 64:  DISPATCH_MG(64, 1024); break;
         case 128: DISPATCH_MG(128, 1024); break;
         default:  TORCH_CHECK(false, "MODEL1 prefill: unsupported num_heads=", num_heads);
@@ -183,6 +197,7 @@ void sparse_mla_prefill_launch_model1(
     } else {
         TORCH_CHECK(false, "MODEL1 prefill: unsupported topk=", topk);
     }
+    #undef DISPATCH_SG
     #undef DISPATCH_MG
 }
 
@@ -228,6 +243,7 @@ void sparse_mla_prefill_launch_model1_dual(
 
     if (topk == 128 && topk_extra == 128 && page_block_size_extra == 64) {
         switch (num_heads) {
+        case 32:  DISPATCH_DUAL_MG(32, 128, 128, 64); break;
         case 64:  DISPATCH_DUAL_MG(64, 128, 128, 64); break;
         case 128: DISPATCH_DUAL_MG(128, 128, 128, 64); break;
         default:
@@ -236,6 +252,7 @@ void sparse_mla_prefill_launch_model1_dual(
     } else if (topk == 128 && topk_extra == 512 && page_block_size_extra == 64) {
         // DSv4-Flash C4A: SWA window=128, indexer top_k=512, compress_ratio=4.
         switch (num_heads) {
+        case 32:  DISPATCH_DUAL_MG(32, 128, 512, 64); break;
         case 64:  DISPATCH_DUAL_MG(64, 128, 512, 64); break;
         case 128: DISPATCH_DUAL_MG(128, 128, 512, 64); break;
         default:
@@ -244,6 +261,7 @@ void sparse_mla_prefill_launch_model1_dual(
     } else if (topk == 128 && topk_extra == 512 && page_block_size_extra == 2) {
         // DSv4-Flash C128A: SWA window=128, indexer top_k=512, compress_ratio=128.
         switch (num_heads) {
+        case 32:  DISPATCH_DUAL_MG(32, 128, 512, 2); break;
         case 64:  DISPATCH_DUAL_MG(64, 128, 512, 2); break;
         case 128: DISPATCH_DUAL_MG(128, 128, 512, 2); break;
         default:
