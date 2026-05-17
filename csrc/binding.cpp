@@ -15,6 +15,26 @@ ModelType infer_model_type(int d_qk) {
     TORCH_CHECK(false, "Unsupported d_qk=", d_qk, "; expected 576 (V32) or 512 (MODEL1)");
 }
 
+// Returns the per-token byte stride to pass to the kernel so that
+// `page_block_size * stride == block byte stride`. Mirrors the Python
+// `_effective_stride_kv_row` helper: when callers (e.g., vLLM) pad the
+// *block* stride for alignment, the natural per-token stride times
+// page_block_size doesn't equal the actual block-to-block stride, so we
+// encode the padding into the per-row override.
+int effective_stride_kv_row(const torch::Tensor& kv) {
+    const int natural_row_bytes = (int)(kv.stride(-2) * kv.element_size());
+    const int block_stride_bytes = (int)(kv.stride(0) * kv.element_size());
+    const int page_block_size = (int)kv.size(-3);
+    if (block_stride_bytes == page_block_size * natural_row_bytes) {
+        return natural_row_bytes;
+    }
+    TORCH_CHECK(block_stride_bytes % page_block_size == 0,
+        "kv_cache block stride ", block_stride_bytes,
+        " not divisible by page_block_size ", page_block_size,
+        "; cannot encode padding via stride_kv_row override");
+    return block_stride_bytes / page_block_size;
+}
+
 }  // namespace
 
 // Forward declarations — split-KV decode (v1)
@@ -186,7 +206,7 @@ void sparse_mla_splitkv_fwd(
         TORCH_CHECK(KV_extra.is_cuda() && idx_extra.is_cuda(),
             "KV_cache_extra and indices_extra must be CUDA tensors");
         int page_block_size_extra = (int)KV_extra.size(-3);
-        int stride_kv_row_extra = (int)(KV_extra.stride(-2) * KV_extra.element_size());
+        int stride_kv_row_extra = effective_stride_kv_row(KV_extra);
         int topk_extra = (int)idx_extra.size(-1);
 
         sparse_mla_splitkv_launch_model1_dual(
@@ -258,7 +278,7 @@ void sparse_mla_splitkv_v2_fwd(
         ? extra_topk_length_t->data_ptr<int>() : nullptr;
     int extra_pbs = extra_k_cache.has_value() ? extra_k_cache->size(-3) : 1;
     int extra_stride = extra_k_cache.has_value()
-        ? (int)(extra_k_cache->stride(-2) * extra_k_cache->element_size()) : 0;
+        ? effective_stride_kv_row(extra_k_cache.value()) : 0;
 
     ModelType mt = infer_model_type(d_qk);
     const cudaStream_t stream = get_current_stream(Q);
@@ -383,7 +403,7 @@ void sparse_mla_prefill_fwd(
         TORCH_CHECK(KV_extra.is_cuda() && idx_extra.is_cuda(),
             "KV_cache_extra and indices_extra must be CUDA tensors");
         int page_block_size_extra = (int)KV_extra.size(-3);
-        int stride_kv_row_extra = (int)(KV_extra.stride(-2) * KV_extra.element_size());
+        int stride_kv_row_extra = effective_stride_kv_row(KV_extra);
         int topk_extra = (int)idx_extra.size(-1);
 
         sparse_mla_prefill_launch_model1_dual(
